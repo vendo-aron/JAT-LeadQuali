@@ -21,6 +21,7 @@ worth a salesperson's time, and routes it accordingly — with no human triaging
 | Deployment target | AWS Lambda + API Gateway (serverless) |
 | Lead source (v1) | Website form POST |
 | Routing action (v1) | Email to sales via Amazon SES |
+| Datastore | Postgres — RDS `db.t4g.micro` or Aurora Serverless v2 *(decided 2026-09-01)* |
 | Commercial goal | Use internally first; resell as a multi-tenant service later |
 
 ---
@@ -165,21 +166,27 @@ Notes:
 - Token counts and cost are stored per assessment. Per-tenant usage metering for billing is then a
   `SUM`, not a later migration.
 
-### Storage choice: Postgres
+### Storage choice: Postgres — DECIDED
 
-Recommended: **Postgres** (local: Docker; AWS: RDS `db.t4g.micro`, or Aurora Serverless v2 with a
-0-ACU floor).
+**Decision (2026-09-01, owner approved): Postgres.** Local: Docker. AWS: RDS `db.t4g.micro`, or
+Aurora Serverless v2 with a 0-ACU floor. DynamoDB was considered and rejected; see the tradeoff
+below, which is now an accepted cost rather than an open option.
 
 Rationale: the rubric-tuning feedback loop is the product's moat, and it is relational analytics —
 "show me every lead scored hot last month that the rep marked bad, grouped by industry". That is
 one SQL query in Postgres and a data pipeline in DynamoDB.
 
-Tradeoff to be explicit about: Lambda + RDS means a VPC and connection management (use RDS Proxy,
-or keep the worker's concurrency capped low and open one connection per container). If you would
-rather avoid VPC entirely, DynamoDB single-table is the alternative — cheaper and zero-ops, but
-budget for streaming to S3 + Athena when you want the analytics back. **Recommendation: Postgres.**
-The volume here is hundreds of leads/day, not millions; the operational cost is small and the
-analytical payoff is immediate.
+Accepted tradeoff: Lambda + RDS means a VPC and connection management (use RDS Proxy,
+or keep the worker's concurrency capped low and open one connection per container). DynamoDB single-table would
+have avoided the VPC — cheaper and zero-ops — at the cost of streaming to S3 + Athena to get the
+analytics back. At hundreds of leads/day rather than millions, the operational cost of Postgres is
+small and the analytical payoff is immediate, so Postgres wins.
+
+**Consequences now locked in for Phase 4:** the worker Lambda runs in a VPC with private subnets and
+a NAT gateway or VPC endpoints for SES/Secrets Manager egress (a real, recurring AWS cost — budget
+for it), reserved concurrency is capped on the worker to bound the connection count, and RDS Proxy
+goes in front of the database. Phase 2 uses Postgres in Docker locally so dev and prod stay on the
+same engine.
 
 ---
 
@@ -569,6 +576,7 @@ Then **restart Visual Studio** so it inherits the new environment variable. Conf
 | Anthropic vendor lock-in | Blocks an enterprise deal requiring in-account inference | Single adapter file; Bedrock swap is one file |
 | VS 2026 Python tooling friction | Works on your machine, breaks in CI | `pyproject.toml` canonical, no `.pyproj` committed, CI is the source of truth |
 | Multi-tenancy retrofitted later | Effectively a rewrite | `tenant_id` on every table and every repository call from the first migration |
+| Lambda-in-VPC connection exhaustion *(accepted, from the Postgres decision)* | Worker fails under burst; leads pile up in SQS | RDS Proxy, reserved concurrency cap on the worker, alarm on DB connection count |
 
 ---
 
@@ -579,9 +587,7 @@ Then **restart Visual Studio** so it inherits the new environment variable. Conf
 2. **Is there historical lead data with outcomes?** If yes, the golden set can be built in Phase 1
    instead of Phase 3, and the rubric can be calibrated rather than guessed — this would be the
    single biggest quality improvement available.
-3. **Postgres vs DynamoDB** — §4 recommends Postgres for the analytics loop, at the cost of a VPC.
-   Worth an explicit review decision.
-4. **Does v1 need a CRM write-back?** Email-only was chosen for v1; if the sales team lives in a
+3. **Does v1 need a CRM write-back?** Email-only was chosen for v1; if the sales team lives in a
    CRM, the routing email may just get ignored, which would undermine the feedback loop.
-5. **Who owns the ICP definition?** The rubric's quality is bounded by how well the ICP is
+4. **Who owns the ICP definition?** The rubric's quality is bounded by how well the ICP is
    articulated. This needs a named human, not an engineering task.
