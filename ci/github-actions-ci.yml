@@ -1,0 +1,74 @@
+# ACTIVATION REQUIRED — this file must live at .github/workflows/ci.yml to run.
+#
+#     git mv ci/github-actions-ci.yml .github/workflows/ci.yml && git commit -m "Activate CI"
+#
+# It is staged here only because the automation that authored it pushes over a
+# credential without GitHub's `workflow` scope, which rejects any push that touches
+# .github/workflows/. The content below is final; the move is the whole activation.
+# tests/unit/test_ci_workflow.py finds the file at either path, so the move needs no
+# test change.
+#
+# The single source of truth for "it builds" (plan §11): the developer's machine is not.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Deliberately unfiltered by branch. The repository has no `main` yet, so a
+# `branches: [main]` filter would silently disable CI on every branch that exists
+# today; running everywhere stays correct once `main` does exist.
+
+# Read-only by default: this job only needs the source it is checking.
+permissions:
+  contents: read
+
+# One in-flight run per ref. A new push supersedes the old one, which is then cancelled
+# rather than left burning minutes on a diff nobody will read.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, type-check and test
+    runs-on: ubuntu-latest
+    # Lint + type-check + offline unit tests; the target is well under 3 minutes, so a
+    # run past this is hung, not slow.
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          # Dependencies are declared in pyproject.toml (no lockfile), so it is the
+          # only correct cache key: the cache invalidates exactly when they change.
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the project and its dev dependencies
+        run: pip install -e ".[dev]"
+
+      # Each gate is its own step so a red run names the thing that broke.
+      - name: Lint (ruff check)
+        run: ruff check .
+
+      - name: Format check (ruff format)
+        run: ruff format --check .
+
+      # No path argument: pyproject pins `files = ["src", "tests"]` under strict mode,
+      # so the config decides the scope and CI cannot drift from the local command.
+      - name: Type check (mypy strict)
+        run: mypy
+
+      # Paths exclude tests/evals, which makes billable Anthropic calls and gets its own
+      # manually dispatched workflow. The marker filter is the belt to that braces: even
+      # if a `live_api` or `integration` test is added under tests/unit or tests/contract,
+      # it cannot spend money or reach a database from here. This job is given no
+      # ANTHROPIC_API_KEY and no AWS credentials, so such a test would fail, not skip.
+      - name: Test (pytest, offline suite only)
+        run: pytest tests/unit tests/contract -m "not live_api and not integration"
