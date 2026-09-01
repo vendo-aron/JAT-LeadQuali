@@ -22,3 +22,9 @@ venv/
 # AWS SAM
 .aws-sam/
 samconfig.toml
+
+# Local tooling
+.venv*/
+*.log
+.coverage
+htmlcov/
