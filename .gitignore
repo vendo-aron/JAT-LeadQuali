@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Visual Studio
+.vs/
+*.pyproj
+*.pyproj.user
+*.sln
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
