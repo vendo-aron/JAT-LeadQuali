@@ -35,7 +35,9 @@ adapter's job (``adapters/tenant_config_json.py``), behind
 from __future__ import annotations
 
 import math
+import unicodedata
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Final, Self
 
 from annotated_types import Le
@@ -44,6 +46,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -104,6 +107,19 @@ DEFAULT_PROMPT_VERSION: Final[str] = "rubric_v1"
 
 #: Tenant ids double as filenames and as jsonb keys, so they are constrained to a slug.
 TENANT_ID_PATTERN: Final[str] = r"^[a-z0-9][a-z0-9_-]{0,62}$"
+
+#: A pinned rubric revision names a file on disk (``rubric_v1.md``) and is interpolated
+#: into the system prompt's tenant envelope. Constraining it to a slug does both jobs:
+#: it cannot escape a filename, and it cannot forge an XML-ish attribute or tag.
+PROMPT_VERSION_PATTERN: Final[str] = r"^[a-z0-9][a-z0-9._-]*$"
+
+#: Substrings a tenant must not be able to place in free text. ``icp_block()`` wraps the
+#: tenant's own words in a ``<tenant_profile>`` envelope inside the *system* prompt; text
+#: that closes or reopens that envelope would let a tenant's stored config plant
+#: instructions in the trusted prefix. Today the config is a repo file, but #8 exists so
+#: that in P5.1 it becomes a tenant-editable ``jsonb`` column - so the guard goes in now,
+#: while it is a one-line validator rather than an incident.
+FORBIDDEN_TEXT_FRAGMENTS: Final[tuple[str, ...]] = ("<tenant_profile", "</tenant_profile")
 
 _ACTIONS_NEEDING_A_DESTINATION: Final[frozenset[Action]] = frozenset(
     {Action.EMAIL_SALES, Action.ESCALATE_HUMAN}
@@ -215,8 +231,11 @@ class TenantConfig(BaseModel):
         max_length=8000,
         description="Free-text ideal customer profile, injected into the prompt.",
     )
-    weights: dict[str, float] = Field(
+    weights: Mapping[str, float] = Field(
         default_factory=lambda: dict(DEFAULT_WEIGHTS),
+        # Without this the default skips every field validator, so a config that omits
+        # `weights` would carry a plain, mutable dict while an explicit one is frozen.
+        validate_default=True,
         description="Per-dimension multiplier; must cover exactly the assessment's dimensions.",
     )
     thresholds: TierThresholds = Field(
@@ -230,17 +249,72 @@ class TenantConfig(BaseModel):
         allow_inf_nan=False,
         description="Below this model confidence the lead escalates to a human.",
     )
-    routing_rules: dict[Tier, RoutingRule] = Field(
+    routing_rules: Mapping[Tier, RoutingRule] = Field(
         description="Action and destination for every tier; all four are required."
     )
     prompt_version: str = Field(
         default=DEFAULT_PROMPT_VERSION,
+        pattern=PROMPT_VERSION_PATTERN,
         min_length=1,
         max_length=64,
         description="Rubric revision this tenant is pinned to; recorded per assessment.",
     )
 
     # ------------------------------------------------------------------ validation
+
+    @field_serializer("weights")
+    def _serialise_weights(self, value: Mapping[str, float]) -> dict[str, float]:
+        """Emit a plain dict: the stored mapping is a ``mappingproxy``, which pydantic
+        cannot serialise, and ``icp_config`` is written to a ``jsonb`` column."""
+        return dict(value)
+
+    @field_serializer("routing_rules")
+    def _serialise_routing_rules(
+        self, value: Mapping[Tier, RoutingRule]
+    ) -> dict[Tier, RoutingRule]:
+        """Plain dict, for the same reason as :meth:`_serialise_weights`."""
+        return dict(value)
+
+    @field_validator("weights", mode="after")
+    @classmethod
+    def _freeze_weights(cls, value: Mapping[str, float]) -> Mapping[str, float]:
+        """Normalise negative zero, then make the mapping immutable.
+
+        Two separate traps. ``-0.0`` passes a ``weight < 0.0`` check, survives a JSON
+        round-trip, and renders as ``-0.00`` in :meth:`icp_block` - so two configs that
+        compare equal would produce different prompt bytes and silently halve the cache
+        hit rate. Adding ``0.0`` maps it to ``+0.0`` (IEEE-754) and leaves every other
+        value alone.
+
+        And ``frozen=True`` only blocks attribute *reassignment*: without this,
+        ``cfg.weights["icp_fit"] = 99.0`` succeeds on a validated config, changing both
+        the prompt and the scoring scale after every validator has passed.
+        """
+        return MappingProxyType({name: weight + 0.0 for name, weight in value.items()})
+
+    @field_validator("routing_rules", mode="after")
+    @classmethod
+    def _freeze_routing_rules(cls, value: Mapping[Tier, RoutingRule]) -> Mapping[Tier, RoutingRule]:
+        """Same immutability argument as :meth:`_freeze_weights`; ``RoutingRule`` is frozen."""
+        return MappingProxyType(dict(value))
+
+    @field_validator("name", "icp_description", mode="after")
+    @classmethod
+    def _reject_envelope_forgery(cls, value: str) -> str:
+        """Refuse text that could break out of the prompt's tenant envelope.
+
+        Only the literal delimiter is rejected, not ``<`` in general: an ICP genuinely
+        says things like "companies with <200 employees", and refusing that would make
+        the validator the tenant's enemy.
+        """
+        lowered = value.lower()
+        for fragment in FORBIDDEN_TEXT_FRAGMENTS:
+            if fragment in lowered:
+                raise ValueError(
+                    f"text may not contain {fragment!r}: it would break out of the "
+                    "tenant envelope in the system prompt"
+                )
+        return value
 
     @field_validator("name", "icp_description", mode="after")
     @classmethod
@@ -404,7 +478,10 @@ def _normalise_text(text: str) -> str:
     blank lines go entirely. Without this, saving ``tenants/default.json`` from a Windows
     editor would change the prompt prefix and silently halve the cache hit rate.
     """
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # NFC first: the same visible text in decomposed form is a different byte string,
+    # which is an operator-invisible way to lose the prompt cache.
+    normalised = unicodedata.normalize("NFC", text)
+    lines = normalised.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     return "\n".join(line.rstrip() for line in lines).strip()
 
 
@@ -415,6 +492,8 @@ __all__ = [
     "DEFAULT_WEIGHTS",
     "DIMENSION_MAXIMA",
     "DIMENSION_NAMES",
+    "FORBIDDEN_TEXT_FRAGMENTS",
+    "PROMPT_VERSION_PATTERN",
     "TENANT_ID_PATTERN",
     "RoutingRule",
     "TenantConfig",
