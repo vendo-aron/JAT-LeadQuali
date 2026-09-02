@@ -7,12 +7,23 @@ from pydantic import ValidationError
 
 from leadquali.config import Environment, Settings, get_settings
 
+# Variables Settings reads. Tests that assert a value is *absent* must clear these, or
+# they pass or fail depending on the developer's shell — and DATABASE_URL is routinely
+# exported for the Postgres integration suite (see docs/local-database.md).
+CONFIGURED_VARIABLES = ("ENV", "LOG_LEVEL", "ANTHROPIC_API_KEY", "DATABASE_URL")
+
 
 def _settings(**overrides: object) -> Settings:
     return Settings(**overrides)  # type: ignore[arg-type]
 
 
-def test_defaults_are_local_and_safe() -> None:
+def _with_a_clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in CONFIGURED_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_defaults_are_local_and_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_a_clean_environment(monkeypatch)
     settings = _settings(_env_file=None)
     assert settings.env is Environment.LOCAL
     assert settings.log_level == "INFO"
@@ -38,6 +49,7 @@ def test_reads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_api_key_is_not_exposed_by_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_a_clean_environment(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-super-secret")
     settings = _settings(_env_file=None)
     assert "sk-ant-super-secret" not in repr(settings)
@@ -56,7 +68,8 @@ def test_invalid_env_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
         _settings(_env_file=None)
 
 
-def test_require_helpers_raise_with_actionable_message() -> None:
+def test_require_helpers_raise_with_actionable_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    _with_a_clean_environment(monkeypatch)
     settings = _settings(_env_file=None)
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         settings.require_anthropic_api_key()

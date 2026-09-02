@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings",
     "sqlalchemy>=2",
     "psycopg[binary]",
+    "alembic>=1.16",
     "boto3",
     "mangum",
 ]

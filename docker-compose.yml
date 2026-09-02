@@ -1,0 +1,37 @@
+# Local development database. Dev runs the same engine as prod (RDS in AWS), so nothing
+# about Postgres is discovered at deploy time.
+#
+#   docker compose up -d          # wait for the healthcheck, then:
+#   alembic upgrade head
+#
+# Credentials deliberately match .env.example's DATABASE_URL:
+#   postgresql+psycopg://leadquali:leadquali@localhost:5432/leadquali
+# They are local-only throwaways; real credentials come from Secrets Manager.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: leadquali-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: leadquali
+      POSTGRES_PASSWORD: leadquali
+      POSTGRES_DB: leadquali
+      # Deterministic collation so index ordering matches RDS.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume: `docker compose down` keeps the data, `down -v` throws it away.
+      - leadquali-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `alembic upgrade head` immediately after `up -d` fails against a Postgres that is
+      # still initialising, so the readiness signal has to be real, not a sleep.
+      test: ["CMD-SHELL", "pg_isready -U leadquali -d leadquali"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  leadquali-pgdata:
