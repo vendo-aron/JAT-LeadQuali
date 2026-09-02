@@ -1,0 +1,27 @@
+{
+  "id": "msg_01LqA9pR7sVn3kYd2mWb8TfE",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "ErUBCkYIBRgCIkDq3s0lWnJHb2xkZW5TZXQ="
+    },
+    {
+      "type": "text",
+      "text": "{\"dimension_scores\": {\"icp_fit\": 26, \"intent\": 21, \"authority\": 12, \"urgency\": 11, \"budget_signal\": 9}, \"extracted\": {\"company_name\": \"Northwind Tooling\", \"industry\": \"Industrial manufacturing\", \"company_size_estimate\": \"250-400 employees\", \"role_seniority\": \"vp\", \"stated_use_case\": \"Automate weld seam inspection on two production lines\", \"stated_timeline\": \"Pilot before the end of the quarter\"}, \"reasoning\": \"Mid-market industrial manufacturer squarely inside the ICP. The contact is a VP of Operations, which carries budget influence, and they name a quarter-end pilot deadline. No budget range was stated, so budget_signal is held back.\", \"confidence\": 0.82, \"missing_information\": [\"Approved budget range\", \"Whether procurement is involved\"], \"suggested_first_question\": \"Which of the two lines would you want to pilot on first?\", \"spam_or_test_submission\": false}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 612,
+    "output_tokens": 431,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 1984,
+    "service_tier": "standard"
+  }
+}
