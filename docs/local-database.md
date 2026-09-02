@@ -89,15 +89,80 @@ reads columns the database does not have, and production is where you find out.
 `tests/integration/test_migrations.py::test_autogenerate_against_head_produces_an_empty_diff`
 asserts this, so CI catches the drift if you forget.
 
-## 4. Run the integration tests
+A freshly migrated database is not yet a usable one — continue to step 4.
+
+### What the schema will not let you do
+
+Three refusals are deliberate, and worth recognising before you assume something is broken:
+
+- **`DELETE FROM tenants` fails while the tenant has leads.** The tenant foreign key is
+  `ON DELETE RESTRICT`. Cascading from a tenant would let one over-broad `WHERE` destroy
+  every lead, assessment, routing event and feedback row a customer ever had — including
+  the audit trail that exists to prove no lead was dropped. To remove a tenant, delete its
+  leads first (that *does* cascade to the child tables), then the tenant. #37's erasure
+  routine is the supported way to do it.
+- **An `assessments` row must be wholly a success or wholly a failure.** `status = 'ok'`
+  requires `dimension_scores`, `extracted`, `reasoning`, `confidence`, `tier` and
+  `total_score`; `status = 'failed'` requires all of them to be absent and an
+  `escalation_reason` to be present. A failed run is a real, recordable outcome — a lead
+  the system could not assess is escalated, never dropped — but a half-written one is not.
+  Note that `escalation_reason = 'low_confidence'` accompanies a *successful* assessment:
+  the model answered, code did not trust the answer.
+- **`INSERT INTO tenants` fails without `icp_config`.** See step 4.
+
+`feedback.rater` deserves a mention here too, because the database cannot enforce it: it is
+an **opaque subject id** — an internal user id, or a hash of one. Not an email address and
+not a display name. It is grouped by and joined in the plan §4 analytics and is retained
+for as long as the feedback is useful, which outlives the raw lead payload, so putting a
+person's address in it would place personal data outside `leads.raw_payload` — the one
+place CLAUDE.md invariant 5 allows it to live.
+
+## 4. Seed the default tenant
+
+```bash
+python scripts/seed.py
+```
+
+`alembic upgrade head` gives you five empty tables and nothing that can accept a lead. Every
+row in the system hangs off a tenant, and `tenants.icp_config` — the rubric — has **no
+server default**, precisely so that a tenant cannot exist without one. Seeding is therefore
+not a convenience step: it is the second half of creating the database.
+
+The script reads `tenants/default.json` (issue #8's file, which is also what the Phase 1
+config loader reads) and upserts it as the internal tenant:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--config PATH` | `tenants/default.json` | The tenant config JSON to seed from. |
+| `--database-url URL` | `$DATABASE_URL` | Where to write. Same source Alembic reads. |
+
+It is **idempotent**. The tenant's primary key is derived from the config's `tenant_id`
+slug (a UUID5), so re-running the script updates the tenant it created last time instead of
+adding a second one — and the default tenant has the same id in every developer's database,
+which is what makes a fixture or a support query portable. Run it again after editing
+`tenants/default.json` to push the change into the database.
+
+If `tenants/default.json` is not in your checkout yet, the script says so and exits 1
+rather than seeding something half-formed; pass `--config` to point at a file you do have.
+
+> **Note on validation.** `scripts/seed.py` checks the file's *structure* — the rubric keys
+> are present and roughly the right kind — rather than validating it against `TenantConfig`.
+> `TenantConfig` lives on issue #8's branch and cannot be imported here yet. Once #8 and #15
+> are both on the default branch, that check should be replaced by a single
+> `TenantConfig.model_validate(document)` call, so there is one validator rather than two
+> that can disagree. `leadquali.adapters.seed` says the same thing in its module docstring.
+
+## 5. Run the integration tests
 
 ```bash
 pytest -m integration
 ```
 
 These are the tests that need a real server: every table and column exists, the
-`(tenant_id, submission_id)` unique constraint really rejects a redelivered submission, the
-foreign keys cascade, and `downgrade base` → `upgrade head` round-trips.
+`(tenant_id, submission_id)` unique constraint really rejects a redelivered submission, a
+child row whose `tenant_id` disagrees with its lead's owner is rejected, a failed assessment
+can be recorded while a half-written one cannot, seeding is idempotent, the foreign keys
+cascade and restrict as intended, and `downgrade base` → `upgrade head` round-trips.
 
 Two things worth knowing about how they run:
 
@@ -120,7 +185,7 @@ The offline half of the schema tests — multi-tenancy on every table, the idemp
 no raw-email column, index coverage — is in `tests/unit/test_db_schema.py` and needs
 nothing running.
 
-## 5. Poke at it by hand
+## 6. Poke at it by hand
 
 ```bash
 docker compose exec postgres psql -U leadquali -d leadquali
@@ -132,7 +197,7 @@ docker compose exec postgres psql -U leadquali -d leadquali
 \di              -- every index
 ```
 
-## 6. Stop it
+## 7. Stop it
 
 ```bash
 docker compose down       # stop the container, keep the data
@@ -158,3 +223,19 @@ default that silently migrates the wrong database.
 
 **`connection refused` right after `up -d`** — the healthcheck has not passed yet. Wait for
 it (step 1) instead of retrying by hand.
+
+**`null value in column "icp_config" ... violates not-null constraint`** — a tenant is being
+created without a rubric. That is the constraint working; supply one, or seed with
+`python scripts/seed.py` (step 4).
+
+**`update or delete on table "tenants" violates foreign key constraint
+"fk_leads_tenant_id_tenants"`** — the tenant still owns leads and the foreign key restricts.
+Delete the leads first, then the tenant. See "What the schema will not let you do".
+
+**`new row ... violates check constraint "ck_assessments_output_present_iff_ok"`** — the
+assessment being written is neither a complete success nor a clean failure. Either supply
+every model-output column with `status = 'ok'`, or none of them with `status = 'failed'`
+and an `escalation_reason`.
+
+**`seed: tenant config file not found`** — `tenants/default.json` ships with issue #8. Pass
+`--config` to point the seed script at a config you do have.

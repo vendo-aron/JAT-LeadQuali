@@ -70,14 +70,44 @@ def test_unique_and_foreign_key_constraints_survive_the_migration(migrated_engin
     inspector = inspect(migrated_engine)
 
     unique_columns = {tuple(c["column_names"]) for c in inspector.get_unique_constraints("leads")}
+    # The idempotency key...
     assert ("tenant_id", "submission_id") in unique_columns
+    # ...and the target the composite ownership keys below need to exist at all.
+    assert ("tenant_id", "id") in unique_columns
 
-    for table_name in EXPECTED_TABLES - {"tenants"}:
+    lead_fks = {
+        (tuple(fk["constrained_columns"]), fk["referred_table"], tuple(fk["referred_columns"]))
+        for fk in inspector.get_foreign_keys("leads")
+    }
+    assert (("tenant_id",), "tenants", ("id",)) in lead_fks, "leads lost its tenant FK"
+
+    for table_name in EXPECTED_TABLES - {"tenants", "leads"}:
         referred = {
-            (tuple(fk["constrained_columns"]), fk["referred_table"])
+            (tuple(fk["constrained_columns"]), fk["referred_table"], tuple(fk["referred_columns"]))
             for fk in inspector.get_foreign_keys(table_name)
         }
-        assert (("tenant_id",), "tenants") in referred, f"{table_name} lost its tenant FK"
+        # One composite key, not two independent ones — Postgres, not just the models,
+        # has to be the thing that refuses a row whose tenant does not own its lead.
+        assert (
+            ("tenant_id", "lead_id"),
+            "leads",
+            ("tenant_id", "id"),
+        ) in referred, f"{table_name} lost its composite tenant/lead ownership FK"
+
+
+def test_the_deletion_policy_survives_the_migration(migrated_engine: Engine) -> None:
+    """CASCADE from a lead, RESTRICT from a tenant — asserted against the server, because
+    an ``ondelete`` that only exists in the models protects nothing."""
+    inspector = inspect(migrated_engine)
+
+    (tenant_fk,) = [
+        fk for fk in inspector.get_foreign_keys("leads") if fk["referred_table"] == "tenants"
+    ]
+    assert tenant_fk["options"].get("ondelete") == "RESTRICT"
+
+    for table_name in EXPECTED_TABLES - {"tenants", "leads"}:
+        (lead_fk,) = inspector.get_foreign_keys(table_name)
+        assert lead_fk["options"].get("ondelete") == "CASCADE"
 
 
 def test_downgrade_base_then_upgrade_head_round_trips(_database_url: URL) -> None:

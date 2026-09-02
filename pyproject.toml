@@ -62,7 +62,8 @@ ignore = ["S101"]
 python_version = "3.13"
 strict = true
 mypy_path = "src"
-files = ["src", "tests"]
+# `scripts` is in here so the seed entry point is type-checked like the rest of the code.
+files = ["src", "tests", "scripts"]
 
 [[tool.mypy.overrides]]
 module = ["tests.*"]

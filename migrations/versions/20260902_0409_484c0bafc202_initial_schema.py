@@ -9,18 +9,39 @@ purpose: re-running autogenerate after ``upgrade head`` must produce an empty di
 ``tests/integration/test_migrations.py`` asserts exactly that. Hand-editing the DDL here
 without the matching model change is how a schema and its application quietly diverge.
 
-Two things this revision establishes that are expensive to add later:
+This revision is edited **in place** rather than superseded by a follow-up. Nothing has
+been deployed and no row exists anywhere, so there is no data to migrate and no installed
+copy to stay compatible with; a second revision correcting the first would be permanent
+archaeology in every future reader's way for no benefit.
 
-* ``tenant_id NOT NULL REFERENCES tenants(id)`` on every child table — including
-  ``routing_events`` and ``feedback``, where it is also reachable through ``lead_id``.
-  Plan section 4's sketch omits it there; carrying it anyway is what lets every repository
-  method filter by tenant without a join, and retrofitting multi-tenancy is a rewrite.
+Five things this revision establishes that are expensive to add later:
+
+* ``tenant_id NOT NULL`` on every child table — including ``routing_events`` and
+  ``feedback``, where it is also reachable through ``lead_id``. Plan section 4's sketch
+  omits it there; carrying it anyway is what lets every repository method filter by tenant
+  without a join, and retrofitting multi-tenancy is a rewrite.
+* ...and, because a denormalised discriminator is only as good as what keeps it honest,
+  ``UNIQUE (tenant_id, id)`` on ``leads`` plus a composite
+  ``FOREIGN KEY (tenant_id, lead_id) REFERENCES leads (tenant_id, id)`` on each child
+  table. Two independent foreign keys are each satisfiable while disagreeing with one
+  another, which lets a worker bug file tenant A's assessment under tenant B — and since
+  ``tenant_id`` is the only filter every query applies, the wrong row still comes back and
+  nothing ever surfaces it.
 * ``UNIQUE (tenant_id, submission_id)`` on ``leads`` — the idempotency key. SQS delivers at
   least once, so the worker will see the same submission twice; without this constraint the
   second delivery inserts a second lead and sales is emailed twice.
+* Nullable model-output columns on ``assessments``, gated by
+  ``ck_assessments_output_present_iff_ok``. Invariant 3 makes an API error, refusal,
+  timeout and parse error first-class outcomes; a schema with nowhere to record one turns
+  a failed assessment into a lead that was silently dropped.
+* ``icp_config`` with **no** server default, so a tenant cannot be created without a
+  rubric. ``scripts/seed.py`` is how the default tenant gets one.
 
-Every foreign key is ``ON DELETE CASCADE``, so deleting a tenant removes everything it
-owns — the shape a GDPR erasure request needs.
+Deletion policy: the ``tenants`` foreign key is ``ON DELETE RESTRICT`` and the ``leads``
+one ``ON DELETE CASCADE``. Removing a lead should take its assessment, routing and feedback
+rows with it. Removing a *tenant* should not be something a single mistyped ``WHERE`` can
+do — it would destroy the whole invariant-3 audit trail — so #37's erasure routine deletes
+the tenant's leads first and then the tenant, deliberately and auditably.
 
 Revision ID: 484c0bafc202
 Revises:
@@ -50,12 +71,7 @@ def upgrade() -> None:
         sa.Column(
             "status", sa.String(length=32), server_default=sa.text("'active'"), nullable=False
         ),
-        sa.Column(
-            "icp_config",
-            postgresql.JSONB(astext_type=sa.Text()),
-            server_default=sa.text("'{}'::jsonb"),
-            nullable=False,
-        ),
+        sa.Column("icp_config", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("api_key_hash", sa.Text(), nullable=True),
         sa.Column("hmac_secret_ref", sa.Text(), nullable=True),
         sa.Column(
@@ -92,14 +108,19 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        sa.CheckConstraint(
+            "status IN ('received', 'qualified', 'routed', 'failed')",
+            name=op.f("ck_leads_status_known"),
+        ),
         sa.CheckConstraint("submission_id <> ''", name=op.f("ck_leads_submission_id_not_blank")),
         sa.ForeignKeyConstraint(
             ["tenant_id"],
             ["tenants.id"],
             name=op.f("fk_leads_tenant_id_tenants"),
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_leads")),
+        sa.UniqueConstraint("tenant_id", "id", name="uq_leads_tenant_id_id"),
         sa.UniqueConstraint("tenant_id", "submission_id", name="uq_leads_tenant_id_submission_id"),
     )
     op.create_index(
@@ -116,12 +137,14 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.Column("tier", sa.String(length=16), nullable=False),
-        sa.Column("total_score", sa.Integer(), nullable=False),
-        sa.Column("dimension_scores", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("extracted", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("reasoning", sa.Text(), nullable=False),
-        sa.Column("confidence", sa.Numeric(precision=4, scale=3), nullable=False),
+        sa.Column("status", sa.String(length=16), server_default=sa.text("'ok'"), nullable=False),
+        sa.Column("escalation_reason", sa.String(length=32), nullable=True),
+        sa.Column("tier", sa.String(length=16), nullable=True),
+        sa.Column("total_score", sa.Numeric(precision=5, scale=2), nullable=True),
+        sa.Column("dimension_scores", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("extracted", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("reasoning", sa.Text(), nullable=True),
+        sa.Column("confidence", sa.Numeric(precision=4, scale=3), nullable=True),
         sa.Column(
             "missing_information",
             postgresql.JSONB(astext_type=sa.Text()),
@@ -145,6 +168,24 @@ def upgrade() -> None:
         ),
         sa.Column("latency_ms", sa.Integer(), server_default=sa.text("0"), nullable=False),
         sa.CheckConstraint(
+            "(status = 'ok'"
+            " AND dimension_scores IS NOT NULL AND extracted IS NOT NULL"
+            " AND reasoning IS NOT NULL AND confidence IS NOT NULL"
+            " AND tier IS NOT NULL AND total_score IS NOT NULL)"
+            " OR (status = 'failed'"
+            " AND dimension_scores IS NULL AND extracted IS NULL"
+            " AND reasoning IS NULL AND confidence IS NULL"
+            " AND tier IS NULL AND total_score IS NULL"
+            " AND escalation_reason IS NOT NULL)",
+            name=op.f("ck_assessments_output_present_iff_ok"),
+        ),
+        sa.CheckConstraint(
+            "escalation_reason IS NULL OR escalation_reason IN "
+            "('low_confidence', 'model_refusal', 'parse_error', 'api_error', 'timeout')",
+            name=op.f("ck_assessments_escalation_reason_known"),
+        ),
+        sa.CheckConstraint("status IN ('ok', 'failed')", name=op.f("ck_assessments_status_known")),
+        sa.CheckConstraint(
             "tier IN ('hot', 'warm', 'cold', 'disqualified')",
             name=op.f("ck_assessments_tier_known"),
         ),
@@ -157,18 +198,25 @@ def upgrade() -> None:
             "AND cache_creation_tokens >= 0 AND cost_usd >= 0 AND latency_ms >= 0",
             name=op.f("ck_assessments_usage_is_non_negative"),
         ),
-        sa.ForeignKeyConstraint(
-            ["lead_id"], ["leads.id"], name=op.f("fk_assessments_lead_id_leads"), ondelete="CASCADE"
+        sa.CheckConstraint(
+            "total_score >= 0 AND total_score <= 100",
+            name=op.f("ck_assessments_total_score_in_range"),
         ),
         sa.ForeignKeyConstraint(
-            ["tenant_id"],
-            ["tenants.id"],
-            name=op.f("fk_assessments_tenant_id_tenants"),
+            ["tenant_id", "lead_id"],
+            ["leads.tenant_id", "leads.id"],
+            name=op.f("fk_assessments_tenant_id_lead_id_leads"),
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_assessments")),
     )
     op.create_index("ix_assessments_lead_id", "assessments", ["lead_id"], unique=False)
+    op.create_index(
+        "ix_assessments_tenant_id_created_at",
+        "assessments",
+        ["tenant_id", "created_at"],
+        unique=False,
+    )
     op.create_index(
         "ix_assessments_tenant_id_tier_created_at",
         "assessments",
@@ -193,12 +241,9 @@ def upgrade() -> None:
             "verdict IN ('good', 'bad', 'unsure')", name=op.f("ck_feedback_verdict_known")
         ),
         sa.ForeignKeyConstraint(
-            ["lead_id"], ["leads.id"], name=op.f("fk_feedback_lead_id_leads"), ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(
-            ["tenant_id"],
-            ["tenants.id"],
-            name=op.f("fk_feedback_tenant_id_tenants"),
+            ["tenant_id", "lead_id"],
+            ["leads.tenant_id", "leads.id"],
+            name=op.f("fk_feedback_tenant_id_lead_id_leads"),
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_feedback")),
@@ -225,16 +270,14 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
-        sa.ForeignKeyConstraint(
-            ["lead_id"],
-            ["leads.id"],
-            name=op.f("fk_routing_events_lead_id_leads"),
-            ondelete="CASCADE",
+        sa.CheckConstraint(
+            "action IN ('email_sales', 'escalate_human', 'suppress')",
+            name=op.f("ck_routing_events_action_known"),
         ),
         sa.ForeignKeyConstraint(
-            ["tenant_id"],
-            ["tenants.id"],
-            name=op.f("fk_routing_events_tenant_id_tenants"),
+            ["tenant_id", "lead_id"],
+            ["leads.tenant_id", "leads.id"],
+            name=op.f("fk_routing_events_tenant_id_lead_id_leads"),
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_routing_events")),
@@ -257,6 +300,7 @@ def downgrade() -> None:
     op.drop_index("ix_feedback_lead_id", table_name="feedback")
     op.drop_table("feedback")
     op.drop_index("ix_assessments_tenant_id_tier_created_at", table_name="assessments")
+    op.drop_index("ix_assessments_tenant_id_created_at", table_name="assessments")
     op.drop_index("ix_assessments_lead_id", table_name="assessments")
     op.drop_table("assessments")
     op.drop_index("ix_leads_tenant_id_received_at", table_name="leads")
