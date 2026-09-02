@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -33,22 +34,66 @@ from leadquali.adapters.tenant_config_json import (
 from leadquali.app.assessment_result import (
     DEFAULT_EFFORT,
     EFFORT_LEVELS,
+    AssessmentFailed,
     AssessmentOutcome,
     AssessmentSucceeded,
+    CallMetering,
     Effort,
 )
 from leadquali.app.ports import LeadAssessorPort
 from leadquali.config import get_settings
-from leadquali.domain.models import RoutingDecision
+from leadquali.domain.models import EscalationReason, RoutingDecision
 from leadquali.domain.routing import decide, system_failure
 from leadquali.domain.tenant_config import TenantConfig, TenantConfigError
-from leadquali.prompts.lead import LeadSubmission, render_lead_detailed
+from leadquali.prompts.lead import LeadSubmission, RenderedLead, render_lead_detailed
 
 #: Exit code for a usage or input problem. Reserved so a caller can tell "you gave me a
 #: bad file" apart from "the model could not assess this lead", which exits 0.
 EXIT_INPUT_ERROR: Final[int] = 2
 
 AssessorFactory = Callable[[str], LeadAssessorPort]
+
+
+#: Matches an email address closely enough to redact one the model wrote back into its
+#: prose. Deliberately greedy about what counts as an address: a false redaction costs a
+#: reader one lookup in `--json`, a missed one puts PII in a ticket.
+_EMAIL_RE: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.IGNORECASE
+)
+
+#: What replaces a redacted address in the human report.
+REDACTED_EMAIL: Final[str] = "[email redacted - see --json]"
+
+
+def _force_utf8_stdout() -> None:
+    """Make stdout able to carry the model's prose, whatever the console code page.
+
+    The model routinely emits em dashes, curly quotes and accented company names. On a
+    console that cannot encode them, ``print`` raises ``UnicodeEncodeError`` and the
+    process exits non-zero - which would be this command failing for a *lead* reason.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:  # pragma: no branch - always present on a real stream
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def redact_addresses(report: str, lead_email: str | None) -> str:
+    """Remove email addresses from the human report.
+
+    The report is meant to be pasted into a ticket or a chat, so invariant 5 applies to it
+    as it does to logs. Scrubbing has to happen here rather than at the boundary because
+    the leak is not in *our* text: the model quotes the lead's address back inside its
+    reasoning, its suggested question, its extracted facts. That is ordinary behaviour,
+    not an attack, and no amount of care in the formatter prevents it.
+
+    ``--json`` is unredacted on purpose - it is the machine path, and #23 needs the record
+    whole.
+    """
+    scrubbed = _EMAIL_RE.sub(REDACTED_EMAIL, report)
+    if lead_email:
+        scrubbed = scrubbed.replace(lead_email, REDACTED_EMAIL)
+    return scrubbed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,6 +135,11 @@ def main(
     argv: Sequence[str] | None = None, *, assessor_factory: AssessorFactory | None = None
 ) -> int:
     """Run the CLI. Returns the process exit code."""
+    # A legacy console code page turns one em dash in the model's prose into a
+    # UnicodeEncodeError and a non-zero exit - which would be this command exiting
+    # non-zero for a *lead* reason, exactly what it promises never to do.
+    _force_utf8_stdout()
+
     parser = build_parser()
     raw = list(sys.argv[1:] if argv is None else argv)
     # `score` is the only subcommand, so allow it to be omitted for everyday use.
@@ -115,13 +165,27 @@ def main(
         return EXIT_INPUT_ERROR
 
     rendered = render_lead_detailed(submission)
-    outcome = assessor.assess(config=config, rendered_lead=rendered.text)
+    try:
+        outcome = assessor.assess(config=config, rendered_lead=rendered.text)
+    except Exception as error:
+        # The adapter in #11 never raises, but `LeadAssessorPort` is a Protocol and any
+        # implementation may. Exit 0 with an escalation is this command's promise, and it
+        # must not depend on a guarantee that lives in someone else's docstring.
+        outcome = AssessmentFailed(
+            reason=EscalationReason.API_ERROR,
+            detail=f"{type(error).__name__}: {error}",
+            latency_ms=0,
+        )
     decision = decision_for(outcome, config)
 
     if args.as_json:
-        print(json.dumps(_json_record(args.lead_file, config, outcome, decision), indent=2))
+        record = _json_record(args.lead_file, config, outcome, decision, rendered)
+        print(json.dumps(record, indent=2))
     else:
-        print(render_report(lead_file=args.lead_file, config=config, outcome=outcome))
+        report = render_report(
+            lead_file=args.lead_file, config=config, outcome=outcome, rendered=rendered
+        )
+        print(redact_addresses(report, submission.email))
     return 0
 
 
@@ -164,35 +228,53 @@ def _checked_effort(effort: str) -> Effort:
     return effort
 
 
+#: Bumped whenever this record's shape changes. #23 consumes it and will outlive the
+#: current shape; a version key costs nothing now and saves a guessing game later.
+JSON_SCHEMA_VERSION: Final[int] = 1
+
+
 def _json_record(
     lead_file: Path,
     config: TenantConfig,
     outcome: AssessmentOutcome,
     decision: RoutingDecision,
+    rendered: RenderedLead | None = None,
 ) -> dict[str, Any]:
     """The machine-readable record. #23's eval harness consumes exactly this shape."""
     record: dict[str, Any] = {
+        "schema_version": JSON_SCHEMA_VERSION,
         "lead_file": str(lead_file),
         "tenant": config.tenant_id,
         "assessment": None,
         "decision": decision.model_dump(mode="json"),
         "metering": None,
         "failure": None,
+        "rendering": None,
     }
     if isinstance(outcome, AssessmentSucceeded):
         record["assessment"] = outcome.assessment.model_dump(mode="json")
-        record["metering"] = _metering_json(outcome)
     else:
         record["failure"] = {
             "reason": outcome.reason.value,
             "detail": outcome.detail,
             "latency_ms": outcome.latency_ms,
         }
+    # Metering is reported whenever the call was billed, success or not. A refusal is a
+    # billed HTTP 200 and a `max_tokens` truncation burns the whole output budget; an
+    # effort sweep that ignored them would under-count spend on exactly the traffic where
+    # cost surprises live.
+    if outcome.metering is not None:
+        record["metering"] = _metering_json(outcome.metering)
+    if rendered is not None:
+        record["rendering"] = {
+            "provided_fields": list(rendered.provided_fields),
+            "truncated_fields": dict(rendered.truncated_fields),
+            "dropped_extra_fields": rendered.dropped_extra_fields,
+        }
     return record
 
 
-def _metering_json(outcome: AssessmentSucceeded) -> dict[str, Any]:
-    metering = outcome.metering
+def _metering_json(metering: CallMetering) -> dict[str, Any]:
     return {
         "model_id": metering.model_id,
         "prompt_version": metering.prompt_version,
@@ -211,6 +293,7 @@ def render_report(
     lead_file: Path,
     config: TenantConfig,
     outcome: AssessmentOutcome,
+    rendered: RenderedLead | None = None,
     decision_note_only: bool = False,
 ) -> str:
     """The human-readable report.
@@ -237,6 +320,18 @@ def render_report(
         lines.append(f"ESCALATED: {decision.escalation_reason.value}")
     if decision_note_only:
         return "\n".join(lines)
+
+    if rendered is not None and (rendered.truncated_fields or rendered.dropped_extra_fields):
+        # The operator reading the phase-gate output must be able to tell that the model
+        # saw a cut-down lead. #12 records this precisely so it is never silent.
+        lines.append("")
+        lines.append("Lead was too large to send whole:")
+        lines.extend(
+            f"  {name}: {count} characters not sent"
+            for name, count in sorted(rendered.truncated_fields.items())
+        )
+        if rendered.dropped_extra_fields:
+            lines.append(f"  {rendered.dropped_extra_fields} extra form fields not sent")
 
     if isinstance(outcome, AssessmentSucceeded):
         lines.extend(_success_sections(outcome))

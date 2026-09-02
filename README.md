@@ -45,8 +45,10 @@ Two behaviours are deliberate and worth knowing before you read the output:
 - **A model failure exits `0` and prints an escalation.** A refusal, timeout or API error
   produces a lead routed to a human, because that is what production will do with it. Only
   a bad file or an unknown tenant exits non-zero.
-- **The human report never prints the lead's email address.** It is meant to be pasted
-  into a ticket. Use `--json` when you need the full record.
+- **The human report redacts email addresses.** It is meant to be pasted into a ticket,
+  and the model routinely quotes the lead's address back inside its own reasoning, so the
+  report is scrubbed before printing. Use `--json` when you need the full record — that is
+  the machine path and it is deliberately unredacted.
 
 If `cache_read` is `0` on a second run of the same tenant, the cacheable prompt prefix has
 moved — something volatile has leaked into it, and the cost model no longer holds.
