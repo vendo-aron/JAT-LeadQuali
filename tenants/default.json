@@ -1,0 +1,36 @@
+{
+  "tenant_id": "default",
+  "name": "JAT-LeadQuali (internal)",
+  "prompt_version": "rubric_v1",
+  "icp_description": "B2B software and professional-services companies in English-speaking markets, roughly 10-200 employees, that receive a meaningful volume of inbound web-form leads (dozens per month or more) and have at least one person whose job is to follow up on them. The best-fit contact owns or reports into sales or marketing leadership and is frustrated that good leads sit unanswered while the team works through the noise. Companies with no inbound volume, pure consumer businesses, and agencies looking to resell rather than use the product are poor fits.",
+  "weights": {
+    "authority": 1.0,
+    "budget_signal": 1.0,
+    "icp_fit": 1.0,
+    "intent": 1.0,
+    "urgency": 1.0
+  },
+  "thresholds": {
+    "hot": 80.0,
+    "warm": 55.0,
+    "cold": 30.0
+  },
+  "min_confidence": 0.6,
+  "routing_rules": {
+    "hot": {
+      "action": "email_sales",
+      "destination": "sales@example.invalid"
+    },
+    "warm": {
+      "action": "email_sales",
+      "destination": "sales@example.invalid"
+    },
+    "cold": {
+      "action": "email_sales",
+      "destination": "sales@example.invalid"
+    },
+    "disqualified": {
+      "action": "suppress"
+    }
+  }
+}
