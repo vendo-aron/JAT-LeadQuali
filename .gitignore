@@ -23,6 +23,11 @@ venv/
 .aws-sam/
 samconfig.toml
 
+# Eval runs. A result file is evidence attached to a pull request (#23), not source:
+# it is timestamped, it is regenerated on every run, and it would otherwise turn every
+# eval into a diff nobody reviews.
+tests/evals/results/
+
 # Local tooling
 .venv*/
 *.log

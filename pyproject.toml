@@ -26,6 +26,10 @@ dev = [
     # SES is mocked in-process: there are no AWS credentials in CI and a test that
     # needed them would simply never run.
     "moto[ses]",
+    # The CI and eval workflows are configuration, and configuration that spends money
+    # gets asserted rather than assumed: tests/unit/test_eval_workflow.py parses them.
+    "pyyaml",
+    "types-PyYAML",
 ]
 
 [build-system]
