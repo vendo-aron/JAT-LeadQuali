@@ -1,0 +1,72 @@
+[project]
+name = "leadquali"
+version = "0.1.0"
+description = "AI lead qualification agent: qualify inbound web-form leads and route them."
+requires-python = ">=3.13"
+dependencies = [
+    "anthropic",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sqlalchemy>=2",
+    "psycopg[binary]",
+    "boto3",
+    "mangum",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    # `httpx`, for FastAPI's TestClient. Not to be confused with `httpx2`, which the
+    # plan's dev list names: that is also a real package — it is the HTTP layer the
+    # `anthropic` SDK depends on, so it arrives transitively and contract tests import
+    # it directly to mock transports. Both exist; neither is a typo for the other.
+    "httpx",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+leadquali = ["prompts/*.md", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: requires external services (database, network)",
+    "live_api: makes billable Anthropic API calls; never runs in the default suite",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+# Markdown is documentation, not source: never reformatted by the Python formatter.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "N", "RUF", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S311"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src"
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = true
