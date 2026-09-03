@@ -22,7 +22,9 @@ policy is #9's. The adapter's job stops at "here is what happened at the API bou
 next to the judgment. Returning them together means #13 stores one value and per-tenant
 usage billing is a ``SUM``, not a later migration. Failures carry metering too whenever the
 call was billed — a refusal is an HTTP 200 and Anthropic charges for it, so a refusal that
-was not metered is money the business cannot see.
+was not metered is money the business cannot see. The same argument applies with more force
+to a truncation and a schema violation, which burn a whole output budget rather than a few
+tokens: every path that got a response records what it cost.
 
 No I/O and no SDK types: ``adapters`` fills this in, ``app`` and ``domain`` read it.
 """
@@ -127,7 +129,13 @@ class AssessmentFailed:
 
     latency_ms: int
     metering: CallMetering | None = None
-    """Present when the call was billed (a refusal); ``None`` when it never completed."""
+    """Present whenever a response came back; ``None`` when the call never completed.
+
+    Every HTTP 200 is metered, whatever it turned out to mean — a refusal, a ``max_tokens``
+    truncation and a schema violation are all billed, and the last two are billed at the
+    full output budget. ``None`` therefore means "no response, no bill": a timeout, a
+    connection error, a 4xx/5xx, or a misconfiguration caught before the call was made.
+    """
 
     ok: Literal[False] = False
 

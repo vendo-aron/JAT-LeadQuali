@@ -6,37 +6,49 @@ here. What earns the tests is everything that can go wrong, because invariant 3 
 comes back as a typed outcome a human can be routed on. So the assertions below are mostly
 about failure:
 
-* a refusal is read from ``stop_reason`` **before** ``.content`` is touched at all, and it
-  escalates rather than disqualifying;
+* a refusal is read from ``stop_reason`` **before** the content is validated, in all three
+  shapes a refusal arrives in, and it escalates rather than disqualifying;
 * every SDK exception class lands on exactly one :class:`EscalationReason`;
+* every failure that reached an HTTP 200 carries its metering, because a truncation and a
+  schema violation are billed in full and are the two most expensive ways to fail;
 * nothing — not a truncation, not a schema violation, not an exception the SDK has never
   raised before — can come back as a success carrying a low score.
 
 The request side is asserted just as tightly, because a silently wrong request is the
 expensive kind: block 0 must carry ``cache_control`` and block 1 must not (a breakpoint on
 the tenant block caches nothing while still paying the write premium), and the model,
-``max_tokens``, effort and ``output_format`` must be exactly what the plan says.
+``max_tokens``, effort and the output schema must be exactly what the plan says.
 
-No network, no key, no recorded payload: the fake client returns objects shaped like the
-SDK's, and the parse path against a realistic payload is ``tests/contract/``'s job.
+**How the gate order is proved.** The fake used to hand back an already-parsed object and
+a ``.content`` property that raised, so that reading content at all failed the test. That
+stopped being able to prove anything once the adapter took over validation — the whole
+point of the change is that it now reads content itself. The proof moved into the data:
+the refused response carries prose (:data:`REFUSAL_PROSE`) that cannot validate, so
+``MODEL_REFUSAL`` is reachable only by checking ``stop_reason`` first. ``FakeMessages``
+also raises if anything calls ``messages.parse``, the helper whose internal parse step
+caused the original defect.
+
+No network, no key: the fake client returns objects shaped like the SDK's. Whether the SDK
+agrees with that shape is ``tests/contract/``'s job.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 import anthropic
 import httpx2
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from leadquali.adapters.llm_anthropic import (
     CACHE_CONTROL_EPHEMERAL,
     CLAUDE_OPUS_5_PRICES,
     MAX_TOKENS,
     MODEL_ID,
+    OUTPUT_FORMAT,
     AnthropicLeadAssessor,
     TokenPrices,
     token_cost_usd,
@@ -111,22 +123,64 @@ class FakeUsage(BaseModel):
     cache_creation_input_tokens: int | None = 0
 
 
+@dataclass(frozen=True)
+class FakeTextBlock:
+    """Shaped like ``anthropic.types.TextBlock``."""
+
+    text: str
+    type: str = "text"
+
+
+@dataclass(frozen=True)
+class FakeThinkingBlock:
+    """Shaped like ``anthropic.types.ThinkingBlock``.
+
+    Present in every real ``claude-opus-5`` response — thinking is adaptive and on by
+    default — and it carries no ``.text``. A block-selection bug that reaches for
+    ``content[0].text`` crashes here rather than in production.
+    """
+
+    thinking: str = ""
+    signature: str = "ErUBCkYIBRgCIkZmYWtl"
+    type: str = "thinking"
+
+
+def blocks(payload: str | None, *, thinking: bool = True) -> list[object]:
+    """The content list of a realistic response: a thinking block, then the JSON text.
+
+    ``payload=None`` is the pathological response that carries no text block at all.
+    """
+    content: list[object] = [FakeThinkingBlock()] if thinking else []
+    if payload is not None:
+        content.append(FakeTextBlock(text=payload))
+    return content
+
+
+def assessment_json(assessment: LeadAssessment | None = None) -> str:
+    """A well-formed response body: what the model returns when everything works."""
+    return (assessment or make_assessment()).model_dump_json()
+
+
 @dataclass
 class FakeMessage:
-    """A response object whose ``.content`` explodes if anything reads it.
+    """A response object shaped like ``anthropic.types.Message``.
 
-    That is the point: the refusal check has to happen before content is touched, and the
-    cheapest way to prove a line of code never ran is to make running it fail.
+    The adapter now reads and validates ``.content`` itself, so — unlike the previous
+    fake, whose ``.content`` raised — this one hands back real blocks. Proving the gate
+    order therefore moves to :data:`REFUSAL_PROSE`: a refusal whose text block would fail
+    validation, so the only way to reach ``MODEL_REFUSAL`` is to check ``stop_reason``
+    first. That is the same shape the contract fixture replays through the real SDK.
     """
 
     stop_reason: str | None = "end_turn"
     stop_details: object | None = None
-    parsed_output: LeadAssessment | None = None
+    content: list[object] = field(default_factory=lambda: blocks(assessment_json()))
     usage: FakeUsage = field(default_factory=FakeUsage)
 
-    @property
-    def content(self) -> list[object]:
-        raise AssertionError("the adapter read .content; stop_reason must be checked first")
+
+#: A refusal's prose: valid content, and not a ``LeadAssessment``. Anthropic documents the
+#: classifier firing mid-stream, after output has already been emitted.
+REFUSAL_PROSE: Final[str] = "I can't help with this request."
 
 
 @dataclass
@@ -136,11 +190,24 @@ class FakeMessages:
     result: object
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def parse(self, **kwargs: Any) -> Any:
+    def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
+
+    def parse(self, **kwargs: Any) -> Any:
+        """The helper the adapter must *not* call.
+
+        ``messages.parse`` validates every text block inside the SDK before returning, so
+        a refusal carrying prose raises ``ValidationError`` from the call and never
+        reaches the ``stop_reason`` gate. The adapter went to some trouble to stop using
+        it; this makes a regression loud instead of silent.
+        """
+        raise AssertionError(
+            "the adapter called messages.parse; it must call messages.create and gate on "
+            "stop_reason before validating content"
+        )
 
 
 @dataclass
@@ -177,7 +244,7 @@ def test_block_zero_is_cacheable_and_block_one_is_not() -> None:
     nothing and costs the 1.25x write premium on every first request of every tenant.
     """
     config = make_config()
-    lead_assessor, messages = assessor(FakeMessage(parsed_output=make_assessment()))
+    lead_assessor, messages = assessor(FakeMessage())
 
     lead_assessor.assess(config=config, rendered_lead=LEAD)
 
@@ -193,15 +260,16 @@ def test_block_zero_is_cacheable_and_block_one_is_not() -> None:
 
 def test_request_parameters_are_exactly_as_intended() -> None:
     config = make_config()
-    lead_assessor, messages = assessor(FakeMessage(parsed_output=make_assessment()))
+    lead_assessor, messages = assessor(FakeMessage())
 
     lead_assessor.assess(config=config, rendered_lead=LEAD)
 
     call = messages.calls[0]
     assert call["model"] == MODEL_ID == "claude-opus-5"
     assert call["max_tokens"] == MAX_TOKENS == 8000
-    assert call["output_format"] is LeadAssessment
-    assert call["output_config"] == {"effort": DEFAULT_EFFORT}
+    # The schema goes on the request explicitly, because the adapter no longer lets the
+    # SDK derive it — and derive a parse of the response along with it.
+    assert call["output_config"] == {"effort": DEFAULT_EFFORT, "format": OUTPUT_FORMAT}
     assert call["messages"] == [{"role": "user", "content": LEAD}]
     # The lead is a user turn, never a system block: it is attacker-controlled text and it
     # must not sit inside the cached prefix.
@@ -213,11 +281,9 @@ def test_default_effort_is_medium_and_effort_is_a_parameter() -> None:
     assert DEFAULT_EFFORT == "medium"
     config = make_config()
     for effort in EFFORT_LEVELS:
-        lead_assessor, messages = assessor(
-            FakeMessage(parsed_output=make_assessment()), effort=effort
-        )
+        lead_assessor, messages = assessor(FakeMessage(), effort=effort)
         lead_assessor.assess(config=config, rendered_lead=LEAD)
-        assert messages.calls[0]["output_config"] == {"effort": effort}
+        assert messages.calls[0]["output_config"]["effort"] == effort
 
 
 def test_unknown_effort_is_rejected_at_construction() -> None:
@@ -237,7 +303,7 @@ def test_success_carries_the_assessment_and_full_provenance() -> None:
         cache_read_input_tokens=4_000,
         cache_creation_input_tokens=0,
     )
-    lead_assessor, _ = assessor(FakeMessage(parsed_output=expected, usage=usage))
+    lead_assessor, _ = assessor(FakeMessage(content=blocks(assessment_json(expected)), usage=usage))
 
     outcome = lead_assessor.assess(config=config, rendered_lead=LEAD)
 
@@ -263,7 +329,7 @@ def test_absent_cache_counters_read_as_zero_not_none() -> None:
         cache_read_input_tokens=None,
         cache_creation_input_tokens=None,
     )
-    lead_assessor, _ = assessor(FakeMessage(parsed_output=make_assessment(), usage=usage))
+    lead_assessor, _ = assessor(FakeMessage(usage=usage))
 
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
 
@@ -273,12 +339,12 @@ def test_absent_cache_counters_read_as_zero_not_none() -> None:
 
 
 def test_latency_is_recorded_on_success_and_on_failure() -> None:
-    slow = FakeMessage(parsed_output=make_assessment())
+    slow = FakeMessage()
     lead_assessor, messages = assessor(slow)
 
-    original = messages.parse
+    original = messages.create
 
-    def slow_parse(**kwargs: Any) -> Any:
+    def slow_create(**kwargs: Any) -> Any:
         # Busy-wait past a millisecond so the assertion is about the clock, not luck.
         import time
 
@@ -287,7 +353,7 @@ def test_latency_is_recorded_on_success_and_on_failure() -> None:
             pass
         return original(**kwargs)
 
-    messages.parse = slow_parse  # type: ignore[method-assign]
+    messages.create = slow_create  # type: ignore[method-assign]
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
     assert isinstance(outcome, AssessmentSucceeded)
     assert outcome.metering.latency_ms >= 1
@@ -301,16 +367,28 @@ def test_latency_is_recorded_on_success_and_on_failure() -> None:
 # ----------------------------------------------------------------------------- refusals
 
 
-def test_refusal_escalates_and_never_reads_content() -> None:
-    """Invariant 3: a refusal is a human's problem, not a score of zero.
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param([], id="pre-output"),
+        pytest.param(blocks(None), id="thinking-only"),
+        pytest.param(blocks(REFUSAL_PROSE), id="mid-stream-prose"),
+    ],
+)
+def test_every_documented_refusal_shape_escalates(content: list[object]) -> None:
+    """Invariant 3, across all three shapes a refusal actually arrives in.
 
-    ``FakeMessage.content`` raises, so this passes only if the adapter checks
-    ``stop_reason`` first and returns without ever looking at the blocks.
+    Anthropic documents the classifier firing *before any output* (empty ``content``) or
+    *mid-stream* after partial output. The third row is the one that used to be misfiled:
+    prose in a text block is not a ``LeadAssessment``, so any implementation that
+    validates content before consulting ``stop_reason`` reports it as a parse error and
+    the ``MODEL_REFUSAL`` signal is lost. All three must reach the same verdict.
     """
     lead_assessor, _ = assessor(
         FakeMessage(
             stop_reason="refusal",
             stop_details=None,
+            content=content,
             usage=FakeUsage(input_tokens=1_200, output_tokens=3),
         )
     )
@@ -323,11 +401,19 @@ def test_refusal_escalates_and_never_reads_content() -> None:
     assert not hasattr(outcome, "assessment")
 
 
-def test_refusal_still_meters_the_call() -> None:
-    """A refusal is an HTTP 200 and it is billed, so it must still be metered."""
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param([], id="pre-output"),
+        pytest.param(blocks(REFUSAL_PROSE), id="mid-stream-prose"),
+    ],
+)
+def test_refusal_still_meters_the_call(content: list[object]) -> None:
+    """A refusal is an HTTP 200 and a mid-stream one is billed, so it must be metered."""
     lead_assessor, _ = assessor(
         FakeMessage(
             stop_reason="refusal",
+            content=content,
             usage=FakeUsage(input_tokens=1_200, output_tokens=3),
         )
     )
@@ -349,12 +435,69 @@ def test_refusal_detail_carries_the_stop_details_category() -> None:
         category: str = "cyber"
         explanation: str = "declined"
 
-    lead_assessor, _ = assessor(FakeMessage(stop_reason="refusal", stop_details=Details()))
+    lead_assessor, _ = assessor(
+        FakeMessage(
+            stop_reason="refusal",
+            stop_details=Details(),
+            content=blocks(REFUSAL_PROSE),
+        )
+    )
 
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
 
     assert isinstance(outcome, AssessmentFailed)
     assert "cyber" in outcome.detail
+
+
+def test_refusal_detail_never_quotes_the_refused_content() -> None:
+    """Invariant 5: the refusal prose and ``explanation`` both describe the submission."""
+
+    @dataclass(frozen=True)
+    class Details:
+        type: str = "refusal"
+        category: str = "cyber"
+        explanation: str = "the submission asks about intrusion tooling"
+
+    lead_assessor, _ = assessor(
+        FakeMessage(
+            stop_reason="refusal",
+            stop_details=Details(),
+            content=blocks(REFUSAL_PROSE),
+        )
+    )
+
+    outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.detail == "model declined to answer (category=cyber)"
+    assert "intrusion" not in outcome.detail
+    assert REFUSAL_PROSE not in outcome.detail
+
+
+def test_a_refusal_is_never_read_as_a_schema_violation() -> None:
+    """The regression this whole change exists to prevent, stated as one assertion.
+
+    The refused response carries prose that cannot validate. If the gate order is ever
+    inverted — validate first, check ``stop_reason`` second — this comes back as
+    ``PARSE_ERROR`` with no metering, and the fact that a safety classifier is firing on
+    our traffic vanishes into the parse-error bucket.
+    """
+    lead_assessor, _ = assessor(
+        FakeMessage(
+            stop_reason="refusal",
+            content=blocks(REFUSAL_PROSE),
+            usage=FakeUsage(input_tokens=731, output_tokens=96),
+        )
+    )
+
+    outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    # Stated in the order the bug would break: not the parse-error bucket, and metered.
+    assert outcome.reason is not EscalationReason.PARSE_ERROR
+    assert outcome.reason is EscalationReason.MODEL_REFUSAL
+    assert outcome.metering is not None
+    assert outcome.metering.output_tokens == 96
 
 
 # ------------------------------------------------------------------- exception mapping
@@ -424,35 +567,90 @@ def test_timeout_is_distinguished_from_a_plain_connection_error() -> None:
     assert outcome.reason is EscalationReason.TIMEOUT
 
 
-def test_schema_violation_is_a_parse_error() -> None:
-    class Tiny(BaseModel):
-        n: int
+@pytest.mark.parametrize(
+    ("payload", "detail_fragment"),
+    [
+        pytest.param('{"dimension_scores": {"icp_fit": ', "<root>", id="truncated-json"),
+        pytest.param("Sure! Here is the assessment.", "<root>", id="prose-not-json"),
+        pytest.param("{}", "confidence", id="empty-object"),
+        pytest.param(
+            make_assessment().model_dump_json().replace('"icp_fit":24', '"icp_fit":999'),
+            "dimension_scores.icp_fit",
+            id="out-of-range-score",
+        ),
+    ],
+)
+def test_schema_violation_is_a_parse_error(payload: str, detail_fragment: str) -> None:
+    """Validation now happens here, so the failure is raised and handled here.
 
-    try:
-        Tiny.model_validate({"n": "not a number"})
-    except ValidationError as exc:
-        error: BaseException = exc
+    ``detail`` names field paths and never the offending value: a Pydantic message quotes
+    its input, and the input on this path is model output derived from lead text.
+    """
+    lead_assessor, _ = assessor(FakeMessage(content=blocks(payload)))
 
-    lead_assessor, _ = assessor(error)
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
 
     assert isinstance(outcome, AssessmentFailed)
     assert outcome.reason is EscalationReason.PARSE_ERROR
+    assert detail_fragment in outcome.detail
+    assert payload not in outcome.detail
 
 
-def test_missing_parsed_output_is_a_parse_error_not_a_crash() -> None:
-    lead_assessor, _ = assessor(FakeMessage(stop_reason="end_turn", parsed_output=None))
+def test_a_schema_violation_is_metered_because_a_whole_response_was_billed() -> None:
+    """A response that fails validation cost exactly as much as one that passes."""
+    lead_assessor, _ = assessor(
+        FakeMessage(
+            content=blocks("not an assessment"),
+            usage=FakeUsage(input_tokens=700, output_tokens=812),
+        )
+    )
+
+    outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.metering is not None
+    assert outcome.metering.output_tokens == 812
+    assert outcome.metering.cost_usd > Decimal(0)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param([], id="no-blocks"),
+        pytest.param(blocks(None), id="thinking-only"),
+    ],
+)
+def test_a_response_with_no_text_block_is_a_parse_error_not_a_crash(
+    content: list[object],
+) -> None:
+    """Unreachable given ``output_config.format`` — and still not worth routing a lead on."""
+    lead_assessor, _ = assessor(FakeMessage(stop_reason="end_turn", content=content))
 
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
 
     assert isinstance(outcome, AssessmentFailed)
     assert outcome.reason is EscalationReason.PARSE_ERROR
+    assert outcome.metering is not None
+
+
+def test_a_thinking_block_never_gets_mistaken_for_the_answer() -> None:
+    """Thinking is on by default, so block 0 is not the JSON — ``content[0]`` is a bug."""
+    lead_assessor, _ = assessor(FakeMessage(content=blocks(assessment_json())))
+
+    outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
+
+    assert isinstance(outcome, AssessmentSucceeded)
+    assert outcome.assessment == make_assessment()
 
 
 def test_truncated_response_is_a_parse_error() -> None:
-    """``max_tokens`` means thinking ate the budget; whatever came back is not an answer."""
+    """``max_tokens`` means thinking ate the budget; whatever came back is not an answer.
+
+    Note the content is *schema-valid* here: the gate is ``stop_reason``, not parseability.
+    A truncated response that happens to validate is still a fragment, not a judgment.
+    """
     lead_assessor, _ = assessor(
-        FakeMessage(stop_reason="max_tokens", parsed_output=make_assessment())
+        FakeMessage(stop_reason="max_tokens", content=blocks(assessment_json()))
     )
 
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
@@ -462,10 +660,29 @@ def test_truncated_response_is_a_parse_error() -> None:
     assert "max_tokens" in outcome.detail
 
 
+def test_a_truncation_is_metered_because_it_burned_the_whole_output_budget() -> None:
+    """The most expensive failure the adapter has: 8,000 output tokens for nothing."""
+    lead_assessor, _ = assessor(
+        FakeMessage(
+            stop_reason="max_tokens",
+            content=blocks('{"dimension_scores": {"icp_fit": 2'),
+            usage=FakeUsage(input_tokens=700, output_tokens=MAX_TOKENS),
+        )
+    )
+
+    outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.metering is not None
+    assert outcome.metering.output_tokens == MAX_TOKENS
+    # 8,000 output tokens at $25/MTok is $0.20 of budget burned on a fragment.
+    assert outcome.metering.cost_usd >= Decimal("0.20")
+
+
 def test_prompt_version_mismatch_escalates_rather_than_raising() -> None:
     """Even a misconfigured tenant must not lose the lead — invariant 3 has no exceptions."""
     config = make_config(prompt_version="rubric_v99")
-    lead_assessor, messages = assessor(FakeMessage(parsed_output=make_assessment()))
+    lead_assessor, messages = assessor(FakeMessage())
 
     outcome = lead_assessor.assess(config=config, rendered_lead=LEAD)
 
@@ -478,9 +695,13 @@ def test_prompt_version_mismatch_escalates_rather_than_raising() -> None:
 def test_no_failure_is_ever_reported_as_a_success() -> None:
     """The one bug this whole file exists to prevent: a failure read as a bad lead."""
     failures: list[object] = [
-        FakeMessage(stop_reason="refusal"),
-        FakeMessage(stop_reason="end_turn", parsed_output=None),
-        FakeMessage(stop_reason="max_tokens", parsed_output=make_assessment()),
+        FakeMessage(stop_reason="refusal", content=[]),
+        FakeMessage(stop_reason="refusal", content=blocks(REFUSAL_PROSE)),
+        # A refusal whose text block happens to be schema-valid: still never a score.
+        FakeMessage(stop_reason="refusal", content=blocks(assessment_json())),
+        FakeMessage(stop_reason="end_turn", content=blocks(None)),
+        FakeMessage(stop_reason="end_turn", content=blocks("not json at all")),
+        FakeMessage(stop_reason="max_tokens", content=blocks(assessment_json())),
         anthropic.APITimeoutError(request=httpx_request()),
         anthropic.InternalServerError("boom", response=httpx_response(500), body=None),
         RuntimeError("unpredicted"),
@@ -560,7 +781,7 @@ def test_metering_cost_matches_the_standalone_calculation() -> None:
         cache_read_input_tokens=4_000,
         cache_creation_input_tokens=0,
     )
-    lead_assessor, _ = assessor(FakeMessage(parsed_output=make_assessment(), usage=usage))
+    lead_assessor, _ = assessor(FakeMessage(usage=usage))
 
     outcome = lead_assessor.assess(config=make_config(), rendered_lead=LEAD)
 

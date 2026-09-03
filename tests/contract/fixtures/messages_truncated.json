@@ -1,0 +1,28 @@
+{
+  "_comment": "SYNTHETIC, hand-written to the documented shape - not a recording. The max_tokens truncation: adaptive thinking consumed the 8,000-token output budget before the JSON was finished, so `stop_reason` is `max_tokens` and the text block ends mid-document. `output_tokens` is the full budget because the whole budget was spent. This is the single most expensive way this adapter can fail, which is why the contract test asserts it is metered rather than merely escalated.",
+  "id": "msg_01Zt6bNq9wLm4kPd3vRy8XcJ",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "ErUBCkYIBRgCIkB0cnVuY2F0ZWQtYXQtbWF4"
+    },
+    {
+      "type": "text",
+      "text": "{\"dimension_scores\": {\"icp_fit\": 26, \"intent\": 21, \"authority\": 12, \"urgency\": 11, \"budget_signal\": 9}, \"extracted\": {\"company_name\": \"Northwind Too"
+    }
+  ],
+  "stop_reason": "max_tokens",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 612,
+    "output_tokens": 8000,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 1984,
+    "service_tier": "standard"
+  }
+}

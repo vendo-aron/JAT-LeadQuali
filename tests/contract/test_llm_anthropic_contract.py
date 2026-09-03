@@ -2,20 +2,31 @@
 
 ``tests/unit/test_llm_anthropic.py`` proves the adapter's logic with a fake client. What
 it cannot prove is that our idea of the wire is the SDK's idea of the wire — that
-``messages.parse`` really serialises ``cache_control`` where we put it, really turns
-``output_format=LeadAssessment`` into a ``json_schema`` on ``output_config``, and really
-hands back a validated ``LeadAssessment`` from a payload shaped like the API's.
+``messages.create`` really serialises ``cache_control`` where we put it, that
+:data:`~leadquali.adapters.llm_anthropic.OUTPUT_FORMAT` really lands as a ``json_schema``
+on ``output_config``, and that a payload shaped like the API's really becomes a validated
+:class:`~leadquali.domain.models.LeadAssessment`.
 
 So this file swaps only the transport. The client is a genuine ``anthropic.Anthropic``;
-its HTTP layer is an ``httpx2.MockTransport`` that replays a recorded response and captures
+its HTTP layer is an ``httpx2.MockTransport`` that replays a response payload and captures
 the request that produced it. Everything between — request serialisation, response
-modelling, schema validation — is the SDK's own code. No key, no network, no cost.
+modelling, error translation — is the SDK's own code. No key, no network, no cost.
 
-Two things are asserted that only a real serialisation can show:
+Three things are asserted that only a real serialisation can show:
 
 * the JSON schema that actually goes over the wire contains no ``tier`` and no
-  ``total_score`` (invariant 2, checked at the boundary rather than in the abstract), and
-* the ``cache_control`` breakpoint lands on the rubric block and on nothing else.
+  ``total_score`` (invariant 2, checked at the boundary rather than in the abstract),
+* the ``cache_control`` breakpoint lands on the rubric block and on nothing else, and
+* a refusal carrying a prose text block comes back as ``MODEL_REFUSAL``. That one is the
+  reason the adapter does not use ``client.messages.parse``: ``parse`` validates every
+  text block *inside the SDK* before it returns, so on that payload it raises
+  ``pydantic.ValidationError`` from the call itself and the refusal is misfiled as a
+  parse error. A fake client cannot catch that — it bypasses the SDK's parse step
+  entirely — which is precisely why the case lives here, against the real thing.
+
+**On "recorded".** These payloads are hand-written to the documented response shape, not
+captured from a live account: this repository has never had an API key. Each fixture says
+so in its own ``_comment`` field. What is real is everything downstream of the socket.
 """
 
 from __future__ import annotations
@@ -48,7 +59,7 @@ RENDERED_LEAD = (
 
 
 def recorded(name: str) -> dict[str, Any]:
-    """One recorded ``POST /v1/messages`` response body."""
+    """One ``POST /v1/messages`` response body, replayed from ``fixtures/``."""
     with (FIXTURES / f"{name}.json").open(encoding="utf-8") as handle:
         payload: dict[str, Any] = json.load(handle)
     return payload
@@ -233,6 +244,14 @@ def test_a_cache_read_actually_showed_up_in_the_recorded_usage(
 
 
 def test_recorded_refusal_escalates_to_a_human() -> None:
+    """The pre-output refusal: empty ``content``, and documented as unbilled.
+
+    Every counter in the fixture is zero because Anthropic bills a classifier decline
+    that fires before any output at nothing at all — no input tokens, no output tokens,
+    no rate-limit consumption. The metering row is still written: a zero-cost call is a
+    fact worth recording, and "no row" and "a row that cost nothing" answer different
+    questions when someone asks how often the classifier is firing.
+    """
     recorder = Recorder(recorded("messages_parse_refusal"))
 
     outcome = build(recorder).assess(config=tenant(), rendered_lead=RENDERED_LEAD)
@@ -241,7 +260,108 @@ def test_recorded_refusal_escalates_to_a_human() -> None:
     assert outcome.reason is EscalationReason.MODEL_REFUSAL
     assert "cyber" in outcome.detail
     assert outcome.metering is not None
-    assert outcome.metering.input_tokens == 598
+    assert outcome.metering.input_tokens == 0
+    assert outcome.metering.cost_usd == Decimal(0)
+
+
+def test_recorded_refusal_after_partial_output_is_still_a_refusal() -> None:
+    """The refusal shape that a content-parsing SDK helper hides.
+
+    Anthropic documents two refusal shapes: the classifier fires *before any output*
+    (empty ``content``, unbilled) or *mid-stream* after partial output (a prose text
+    block, billed at normal rates). ``client.messages.parse()`` reads and validates
+    every text block inside the SDK before it returns, so on the second shape it raises
+    ``pydantic.ValidationError`` from the call itself — the refusal is filed as a parse
+    error and the billed call goes unmetered. That is why the adapter asks for a plain
+    ``Message`` and gates on ``stop_reason`` itself.
+    """
+    recorder = Recorder(recorded("messages_refusal_after_output"))
+
+    outcome = build(recorder).assess(config=tenant(), rendered_lead=RENDERED_LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.reason is EscalationReason.MODEL_REFUSAL
+    assert "cyber" in outcome.detail
+    # Billed, so metered: 731 x $5.00 + 96 x $25.00 + 1,984 x $0.50 per MTok.
+    assert outcome.metering is not None
+    assert outcome.metering.input_tokens == 731
+    assert outcome.metering.output_tokens == 96
+    assert outcome.metering.cost_usd == Decimal("0.007047")
+
+
+def test_the_refusal_prose_never_reaches_the_operator_detail() -> None:
+    """A refusal explains itself in prose that quotes the lead. Invariant 5 says no."""
+    recorder = Recorder(recorded("messages_refusal_after_output"))
+
+    outcome = build(recorder).assess(config=tenant(), rendered_lead=RENDERED_LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert "enumerate" not in outcome.detail
+    assert outcome.detail == "model declined to answer (category=cyber)"
+
+
+def test_recorded_malformed_response_is_a_parse_error_and_is_metered() -> None:
+    """A complete, fully billed response that is not a valid assessment.
+
+    This is the case the ``pydantic.ValidationError`` handler is named for, and after the
+    move off ``messages.parse`` it is the only case that reaches it.
+    """
+    recorder = Recorder(recorded("messages_malformed"))
+
+    outcome = build(recorder).assess(config=tenant(), rendered_lead=RENDERED_LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.reason is EscalationReason.PARSE_ERROR
+    # Field paths, never the offending value — model output derived from lead text.
+    assert "dimension_scores.icp_fit" in outcome.detail
+    assert "999" not in outcome.detail
+    # 612 x $5.00 + 388 x $25.00 + 1,984 x $0.50 per MTok.
+    assert outcome.metering is not None
+    assert outcome.metering.output_tokens == 388
+    assert outcome.metering.cost_usd == Decimal("0.013752")
+
+
+def test_recorded_truncation_is_a_parse_error_and_is_metered() -> None:
+    """The most expensive failure available: the whole output budget, spent on a fragment."""
+    recorder = Recorder(recorded("messages_truncated"))
+
+    outcome = build(recorder).assess(config=tenant(), rendered_lead=RENDERED_LEAD)
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.reason is EscalationReason.PARSE_ERROR
+    assert "max_tokens" in outcome.detail
+    assert outcome.metering is not None
+    assert outcome.metering.output_tokens == MAX_TOKENS
+    # 8,000 output tokens at $25/MTok is $0.20 before a single input token is counted.
+    assert outcome.metering.cost_usd > Decimal("0.20")
+
+
+def test_a_transport_timeout_becomes_a_typed_timeout_not_an_exception() -> None:
+    """A timeout has no response body, so it is recorded as the transport failure it is.
+
+    ``httpx2.ReadTimeout`` is what the connection layer raises; the assertion that matters
+    is that the SDK turns it into ``anthropic.APITimeoutError`` and the adapter maps that
+    to ``TIMEOUT`` rather than to the generic ``API_ERROR`` — the ordering of two handlers
+    where ``APITimeoutError`` subclasses ``APIConnectionError``.
+    """
+
+    def time_out(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ReadTimeout("timed out", request=request)
+
+    client = anthropic.Anthropic(
+        api_key="not-a-real-key",
+        max_retries=0,
+        http_client=anthropic.DefaultHttpxClient(transport=httpx2.MockTransport(time_out)),
+    )
+
+    outcome = AnthropicLeadAssessor(client=client).assess(
+        config=tenant(), rendered_lead=RENDERED_LEAD
+    )
+
+    assert isinstance(outcome, AssessmentFailed)
+    assert outcome.reason is EscalationReason.TIMEOUT
+    # Nothing was billed, because nothing completed.
+    assert outcome.metering is None
 
 
 def test_a_server_error_becomes_an_api_error_not_an_exception() -> None:

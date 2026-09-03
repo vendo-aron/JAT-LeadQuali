@@ -25,6 +25,29 @@ response body, and it produces
 :attr:`~leadquali.domain.models.EscalationReason.MODEL_REFUSAL` — never a disqualification.
 "The model would not answer" and "this lead is worthless" are different facts.
 
+Making that true is the reason this module calls ``client.messages.create`` and validates
+the JSON itself rather than using the ``client.messages.parse`` helper. ``parse`` is the
+more obvious call and it produces the same request bytes — :data:`OUTPUT_FORMAT` is the
+SDK's own ``transform_schema`` applied to the same model — but it *reads the response
+inside the SDK before returning it*: ``parse_response`` iterates ``response.content`` and
+runs ``TypeAdapter(LeadAssessment).validate_json`` on every text block, with no regard for
+``stop_reason``. Anthropic documents two refusal shapes — the classifier fires before any
+output (empty ``content``, unbilled) or mid-stream after partial output (a prose text
+block, billed). On the second shape ``parse`` raises :class:`pydantic.ValidationError`
+*from the call itself*, so a refusal arrives as a parse error, the ``stop_reason`` gate
+below is never reached, and a billed call goes unmetered. Invariant 3 survives either way
+— both paths escalate and neither scores the lead — but the ``MODEL_REFUSAL`` signal, the
+one that says a safety classifier is firing on our traffic, disappears into the
+parse-error bucket. Hand-rolling one ``model_validate_json`` call is the price of keeping
+it. See ``tests/contract/fixtures/messages_refusal_after_output.json``.
+
+**Every completed call is metered, including the ones that failed.** A ``max_tokens``
+truncation burns the whole 8,000-token output budget and a schema violation burns a
+complete response; both are HTTP 200s that Anthropic charges for. Metering is therefore
+computed once, from the response, before any branch decides what the response *means* —
+the alternative is a plan in which the two most expensive failure modes are the two the
+business cannot see.
+
 **Retries are the SDK's, not ours.** ``anthropic.Anthropic`` already retries connection
 errors, 408, 409, 429 and 5xx with exponential backoff. Wrapping a second loop around it
 multiplies the wall clock and the bill for no gain; see :func:`build_anthropic_client` for
@@ -47,8 +70,9 @@ import anthropic
 import pydantic
 from anthropic.types import (
     CacheControlEphemeralParam,
+    JSONOutputFormatParam,
+    Message,
     MessageParam,
-    ParsedMessage,
     TextBlockParam,
     Usage,
 )
@@ -85,6 +109,23 @@ MAX_TOKENS: Final[int] = 8000
 #: The cache breakpoint marker, applied to the rubric block and to nothing else. Five
 #: minutes is the default TTL and the right one here: leads arrive in bursts behind a form.
 CACHE_CONTROL_EPHEMERAL: Final[CacheControlEphemeralParam] = {"type": "ephemeral"}
+
+#: The structured-output constraint sent on every call, as ``output_config.format``.
+#:
+#: ``anthropic.transform_schema`` is the SDK's own Pydantic-model-to-API-schema conversion —
+#: the exact function ``client.messages.parse(output_format=LeadAssessment)`` applies
+#: internally — so passing the format explicitly changes which SDK entry point we call and
+#: nothing about the bytes on the wire. Using the SDK's converter rather than
+#: ``LeadAssessment.model_json_schema()`` matters: the API rejects several JSON Schema
+#: keywords Pydantic emits (``minimum``/``maximum`` among them, which every dimension score
+#: carries), and ``transform_schema`` is what folds them into descriptions.
+#:
+#: Built once at import: it is a pure function of a frozen model, and rebuilding it per
+#: request would burn the schema walk on every lead for an identical result.
+OUTPUT_FORMAT: Final[JSONOutputFormatParam] = {
+    "type": "json_schema",
+    "schema": anthropic.transform_schema(LeadAssessment),
+}
 
 #: Client defaults. The SDK's own default timeout is 10 minutes, which is far too long for
 #: a worker with a Lambda deadline; two retries is the SDK default and is left alone.
@@ -313,7 +354,19 @@ class AnthropicLeadAssessor:
         def elapsed_ms() -> int:
             return (time.monotonic_ns() - started_ns) // 1_000_000
 
-        def failed(reason: EscalationReason, detail: str) -> AssessmentFailed:
+        def failed(
+            reason: EscalationReason,
+            detail: str,
+            *,
+            metering: CallMetering | None = None,
+        ) -> AssessmentFailed:
+            """One failure value, logged.
+
+            ``metering`` is passed on every path that reached an HTTP 200 and is left
+            ``None`` on the paths where no response — and therefore no bill — exists. A
+            truncation and a schema violation are the two most expensive failures this
+            adapter can have, and they were the two that used to be free to look at.
+            """
             # Tenant id only: never the lead, never the contact (invariant 5).
             logger.warning(
                 "lead assessment failed tenant_id=%s reason=%s detail=%s",
@@ -321,17 +374,21 @@ class AnthropicLeadAssessor:
                 reason.value,
                 detail,
             )
-            return AssessmentFailed(reason=reason, detail=detail, latency_ms=elapsed_ms())
+            return AssessmentFailed(
+                reason=reason,
+                detail=detail,
+                latency_ms=metering.latency_ms if metering is not None else elapsed_ms(),
+                metering=metering,
+            )
 
         messages: list[MessageParam] = [{"role": "user", "content": rendered_lead}]
         try:
-            response: ParsedMessage[LeadAssessment] = self._client.messages.parse(
+            response: Message = self._client.messages.create(
                 model=self._model_id,
                 max_tokens=self._max_tokens,
                 system=self._system_blocks(config),
                 messages=messages,
-                output_format=LeadAssessment,
-                output_config={"effort": self._effort},
+                output_config={"effort": self._effort, "format": OUTPUT_FORMAT},
             )
         # Order matters: APITimeoutError subclasses APIConnectionError and RateLimitError
         # subclasses APIStatusError, so the specific classes have to come first or every
@@ -351,14 +408,6 @@ class AnthropicLeadAssessor:
             # The status only. The response body can echo the submission back, and a lead's
             # free text is PII (invariant 5).
             return failed(EscalationReason.API_ERROR, f"http {exc.status_code} from the API")
-        except pydantic.ValidationError as exc:
-            # The model returned something that is not a valid LeadAssessment. Field paths
-            # only — a validation message quotes the offending input, which is lead text.
-            locations = sorted({".".join(str(part) for part in e["loc"]) for e in exc.errors()})
-            return failed(
-                EscalationReason.PARSE_ERROR,
-                f"response failed schema validation at: {', '.join(locations) or '<root>'}",
-            )
         except (PromptVersionMismatchError, PromptAssetError) as exc:
             # Ours, and therefore safe to quote: it names the tenant and the missing
             # revision. An operator error, but still an escalation — invariant 3 does not
@@ -378,12 +427,18 @@ class AnthropicLeadAssessor:
                 f"unexpected {type(exc).__name__} from the Anthropic adapter",
             )
 
+        # The call completed, so it is billed — whatever the response turns out to mean.
+        # Metering before the branches is what makes "record usage on every call" a
+        # property of the code rather than a promise repeated on each path.
+        metering = self._meter(response.usage, elapsed_ms())
+
         # ---- Refusal first. Nothing below this point may run for a refused response, and
-        # nothing above it has touched `response.content`.
+        # nothing above it — not this method, and deliberately not the SDK either — has
+        # read `response.content`. Branch on `stop_reason`, never on `stop_details`:
+        # `stop_details` is informational and may be null even on a genuine refusal.
         if response.stop_reason == "refusal":
             details = response.stop_details
             category = details.category if details is not None else None
-            metering = self._meter(response.usage, elapsed_ms())
             logger.warning(
                 "model refused tenant_id=%s category=%s",
                 config.tenant_id,
@@ -391,35 +446,51 @@ class AnthropicLeadAssessor:
             )
             return AssessmentFailed(
                 reason=EscalationReason.MODEL_REFUSAL,
+                # The category only. `stop_details.explanation` is prose about the
+                # submission and the refused text block quotes it outright; both are lead
+                # content and neither belongs in an operator log (invariant 5).
                 detail=f"model declined to answer (category={category or 'unspecified'})",
                 latency_ms=metering.latency_ms,
-                # A refusal is a billed HTTP 200. Metering it is the difference between
-                # seeing that cost and not seeing it.
+                # A refusal after partial output is a billed HTTP 200. Metering it is the
+                # difference between seeing that cost and not seeing it.
                 metering=metering,
             )
 
         if response.stop_reason == "max_tokens":
             # Thinking ate the budget before the JSON was finished. Whatever came back is
             # a fragment, not a judgment — treat it as unparseable and raise max_tokens.
+            # The full output budget was spent to produce it, so it is metered.
             return failed(
                 EscalationReason.PARSE_ERROR,
                 f"response truncated at max_tokens={self._max_tokens}",
+                metering=metering,
             )
 
-        assessment = response.parsed_output
-        if assessment is None:
-            # `parse` returns None when no text block carried schema-valid JSON. It should
-            # be unreachable given output_config.format, but "should be" is not a guarantee
-            # we are willing to route a lead on.
+        text = next((block.text for block in response.content if block.type == "text"), None)
+        if text is None:
+            # No text block at all. It should be unreachable given output_config.format,
+            # but "should be" is not a guarantee we are willing to route a lead on.
             return failed(
                 EscalationReason.PARSE_ERROR,
-                f"no structured output in the response (stop_reason={response.stop_reason})",
+                f"no text block in the response (stop_reason={response.stop_reason})",
+                metering=metering,
             )
 
-        return AssessmentSucceeded(
-            assessment=assessment,
-            metering=self._meter(response.usage, elapsed_ms()),
-        )
+        try:
+            assessment = LeadAssessment.model_validate_json(text)
+        except pydantic.ValidationError as exc:
+            # The model returned something that is not a valid LeadAssessment — the case
+            # this handler is named for, now that it can only be reached by one call.
+            # Field paths only: a validation message quotes the offending input, which is
+            # lead text. A complete response was billed to produce it, so it is metered.
+            locations = sorted({".".join(str(part) for part in e["loc"]) for e in exc.errors()})
+            return failed(
+                EscalationReason.PARSE_ERROR,
+                f"response failed schema validation at: {', '.join(locations) or '<root>'}",
+                metering=metering,
+            )
+
+        return AssessmentSucceeded(assessment=assessment, metering=metering)
 
 
 __all__ = [
@@ -429,6 +500,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "MAX_TOKENS",
     "MODEL_ID",
+    "OUTPUT_FORMAT",
     "AnthropicLeadAssessor",
     "TokenPrices",
     "build_anthropic_client",
