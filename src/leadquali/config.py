@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     database_url: str | None = Field(
         default=None, description="SQLAlchemy URL for Postgres; required by the store adapter."
     )
+    ingest_credentials: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Per-tenant ingest secrets as JSON: "
+            '{"<tenant_id>": {"api_key_sha256": "<64 hex>", "signing_secret": "..."}}. '
+            "Required by the public ingest API; see leadquali.api.signing."
+        ),
+    )
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -63,6 +71,20 @@ class Settings(BaseSettings):
                 "(or add it to .env for local development)."
             )
         return self.anthropic_api_key.get_secret_value()
+
+    def require_ingest_credentials(self) -> str:
+        """Return the ingest credential JSON, or raise if it was never configured.
+
+        There is deliberately no "no credentials means no authentication" fallback: an
+        unauthenticated public ingest endpoint is worse than one that will not start.
+        """
+        if self.ingest_credentials is None:
+            raise RuntimeError(
+                "INGEST_CREDENTIALS is not set. The ingest API refuses to run without "
+                "per-tenant keys; export it in the environment (or add it to .env for "
+                "local development)."
+            )
+        return self.ingest_credentials.get_secret_value()
 
     def require_database_url(self) -> str:
         """Return the database URL, or raise if it was never configured."""
