@@ -15,6 +15,7 @@ from typing import Protocol, runtime_checkable
 
 from leadquali.app.assessment_result import AssessmentOutcome
 from leadquali.app.enrichment import Enrichment
+from leadquali.app.feedback import Verdict
 from leadquali.domain.models import Action, LeadAssessment, RoutingDecision
 from leadquali.domain.tenant_config import TenantConfig
 from leadquali.prompts.lead import LeadSubmission
@@ -266,6 +267,84 @@ class EnricherPort(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class RecordedFeedback:
+    """What one feedback write did, in the terms the thank-you page has to speak.
+
+    The page a rep lands on says either "recorded" or "updated — you had said this was a
+    good lead", and it can only say the second if the write reports what was there before.
+    Returning it from the port rather than making the caller read the row back keeps the
+    click path to a single statement.
+    """
+
+    verdict: Verdict
+    """The verdict now on record — what was just written."""
+
+    created: bool
+    """``True`` when this click inserted a row, ``False`` when it updated an existing one."""
+
+    previous_verdict: Verdict | None = None
+    """What this rater had said before, or ``None`` on a first verdict."""
+
+    @property
+    def changed(self) -> bool:
+        """Whether this click actually changed the recorded verdict."""
+        return self.previous_verdict is not None and self.previous_verdict is not self.verdict
+
+
+@runtime_checkable
+class FeedbackStorePort(Protocol):
+    """The write side of the feedback loop, and the only thing that grows the golden set.
+
+    Separate from :class:`LeadStorePort` because the callers are separate: the pipeline
+    writes leads, assessments and routing events from a worker, and a rep's browser writes
+    feedback through the API. #16 deferred these writes because no port defined them; this
+    is that port, and it keeps the same conventions — ``tenant_id`` on every call
+    (invariant 4), keyword-only arguments, raise rather than swallow.
+
+    **A repeated click must not create a second row.** ``(tenant_id, lead_id, rater)``
+    identifies one person's verdict on one lead, and writing it again is an update: mail
+    clients prefetch, people double-tap on phones, and a rep who changes their mind must be
+    able to. Anything else would turn "how often does sales disagree with the model" into a
+    measure of how many times a link was clicked.
+    """
+
+    def record_feedback(
+        self,
+        *,
+        tenant_id: str,
+        lead_id: str,
+        rater: str,
+        verdict: Verdict,
+        notes: str | None,
+        recorded_at: datetime,
+    ) -> RecordedFeedback:
+        """Record ``rater``'s verdict on this lead, replacing any verdict they gave before.
+
+        Args:
+            tenant_id: whose lead this is. Filtered on, always.
+            lead_id: the lead being judged.
+            rater: an **opaque subject id**, never an email address — see
+                :func:`leadquali.app.feedback.rater_id`. This column is retained for longer
+                than the raw lead payload is (#37), so an address here would put personal
+                data outside the one place invariant 5 allows it to live.
+            verdict: good, bad or unsure.
+            notes: the rep's free text, or ``None``. ``None`` leaves any existing note
+                alone: a second click through a link that carries no notes must not erase
+                the sentence the rep typed the first time.
+            recorded_at: when the verdict was given, from the clock port.
+
+        Raises:
+            UnknownLeadError: this tenant has no such lead. Expected rather than
+                exceptional — a link in a mailbox outlives the row once #37's retention job
+                has run, and the rep deserves a page that says so.
+            Exception: any other store failure. The rep sees an honest error page and can
+                click again; returning success from a failed write would lose the one
+                signal this system exists to collect.
+        """
+        ...
+
+
 @runtime_checkable
 class ClockPort(Protocol):
     """Time, injected rather than ambient.
@@ -292,9 +371,11 @@ class ClockPort(Protocol):
 __all__ = [
     "ClockPort",
     "EnricherPort",
+    "FeedbackStorePort",
     "LeadAssessorPort",
     "LeadStorePort",
     "NotifierPort",
+    "RecordedFeedback",
     "RoutingOutcome",
     "StoredLead",
     "TenantConfigPort",

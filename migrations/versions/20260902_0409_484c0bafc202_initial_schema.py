@@ -247,6 +247,14 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_feedback")),
+        # One verdict per rater per lead (#19). The conflict target the feedback endpoint
+        # upserts against, so a prefetched link, a double tap and a change of mind all
+        # resolve to one row instead of three. Added here rather than in a follow-up
+        # revision, per this file's own in-place policy: nothing is deployed and no row
+        # exists, so there is nothing to migrate.
+        sa.UniqueConstraint(
+            "tenant_id", "lead_id", "rater", name=op.f("uq_feedback_tenant_id_lead_id_rater")
+        ),
     )
     op.create_index("ix_feedback_lead_id", "feedback", ["lead_id"], unique=False)
     op.create_index(

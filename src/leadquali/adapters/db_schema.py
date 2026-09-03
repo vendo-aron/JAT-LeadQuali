@@ -424,6 +424,16 @@ class Feedback(Base):
 
     __table_args__ = (
         _owned_lead_fk(),
+        # One verdict per rater per lead, so a second click is an UPDATE and not a second
+        # row. Mail clients prefetch links, phones register double taps, and a rep is
+        # allowed to change their mind — without this, "how often does sales disagree with
+        # the model" would measure how many times a link was clicked. It is also the
+        # conflict target `PostgresFeedbackStore.record_feedback` upserts against, which is
+        # what makes that a single statement and therefore safe under a race. Added by #19
+        # with migration `20260903_feedback_one_verdict_per_rater`.
+        UniqueConstraint(
+            "tenant_id", "lead_id", "rater", name="uq_feedback_tenant_id_lead_id_rater"
+        ),
         # Join side of the feedback-loop analytics query.
         Index("ix_feedback_lead_id", "lead_id"),
         # ... and its filter side: WHERE tenant_id = ? AND verdict = 'bad'

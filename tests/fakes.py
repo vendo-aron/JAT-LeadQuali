@@ -23,7 +23,8 @@ from leadquali.app.assessment_result import (
     AssessmentSucceeded,
 )
 from leadquali.app.enrichment import Enrichment
-from leadquali.app.ports import RoutingOutcome, StoredLead
+from leadquali.app.feedback import UnknownLeadError, Verdict
+from leadquali.app.ports import RecordedFeedback, RoutingOutcome, StoredLead
 from leadquali.domain.models import Action, LeadAssessment, RoutingDecision
 from leadquali.domain.tenant_config import TenantConfig, TenantNotFoundError
 from leadquali.prompts.lead import LeadSubmission
@@ -187,6 +188,71 @@ class InMemoryLeadStore:
             for event in self.routing_events
             if event.lead_id == lead_id and event.outcome is not RoutingOutcome.FAILED
         ]
+
+
+@dataclass
+class FeedbackRow:
+    """One row of the ``feedback`` table, as the in-memory store keeps it."""
+
+    tenant_id: str
+    lead_id: str
+    rater: str
+    verdict: Verdict
+    notes: str | None
+    created_at: datetime
+
+
+class InMemoryFeedbackStore:
+    """A ``FeedbackStorePort`` with the real one's uniqueness behaviour and none of its I/O.
+
+    ``(tenant_id, lead_id, rater)`` is unique, exactly as
+    ``uq_feedback_tenant_id_lead_id_rater`` makes it in #15's schema, so a prefetched link,
+    a double tap and a change of mind all land on one row. ``known_leads`` mirrors the
+    composite foreign key: a lead nobody has heard of raises ``UnknownLeadError`` here just
+    as the database raises it there, which is the path a link outliving #37's retention job
+    takes.
+    """
+
+    def __init__(
+        self, *, known_leads: Iterable[tuple[str, str]] | None = None, fail: bool = False
+    ) -> None:
+        self.rows: dict[tuple[str, str, str], FeedbackRow] = {}
+        self.known_leads = set(known_leads) if known_leads is not None else None
+        self.fail = fail
+        self.calls = 0
+
+    def record_feedback(
+        self,
+        *,
+        tenant_id: str,
+        lead_id: str,
+        rater: str,
+        verdict: Verdict,
+        notes: str | None,
+        recorded_at: datetime,
+    ) -> RecordedFeedback:
+        self.calls += 1
+        if self.fail:
+            raise FakeStoreError("store unavailable during record_feedback")
+        if self.known_leads is not None and (tenant_id, lead_id) not in self.known_leads:
+            raise UnknownLeadError(f"tenant '{tenant_id}' has no lead {lead_id}")
+
+        key = (tenant_id, lead_id, rater)
+        existing = self.rows.get(key)
+        self.rows[key] = FeedbackRow(
+            tenant_id=tenant_id,
+            lead_id=lead_id,
+            rater=rater,
+            verdict=verdict,
+            # A click with no note leaves the previous one alone, as COALESCE does.
+            notes=notes if notes is not None else (existing.notes if existing else None),
+            created_at=recorded_at,
+        )
+        return RecordedFeedback(
+            verdict=verdict,
+            created=existing is None,
+            previous_verdict=existing.verdict if existing is not None else None,
+        )
 
 
 class RecordingNotifier:
