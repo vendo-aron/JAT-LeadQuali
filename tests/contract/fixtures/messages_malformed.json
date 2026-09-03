@@ -1,0 +1,28 @@
+{
+  "_comment": "SYNTHETIC, hand-written to the documented shape - not a recording. A response that stopped cleanly (`end_turn`) whose text block is not a valid LeadAssessment: `icp_fit` is 999, outside the 0-30 the rubric allows, and `confidence` is absent. Structured outputs make this shape rare, not impossible - the schema constrains the grammar, and a model can still emit a document the domain model rejects. The point of the fixture is that a complete, fully billed response can fail validation, so this path must be both PARSE_ERROR and metered.",
+  "id": "msg_01Mk4dJp8vXc2wQr5nTz7HbY",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "ErUBCkYIBRgCIkBzY2hlbWEtdmlvbGF0aW9u"
+    },
+    {
+      "type": "text",
+      "text": "{\"dimension_scores\": {\"icp_fit\": 999, \"intent\": 21, \"authority\": 12, \"urgency\": 11, \"budget_signal\": 9}, \"extracted\": {\"company_name\": \"Northwind Tooling\", \"industry\": \"Industrial manufacturing\", \"company_size_estimate\": \"250-400 employees\", \"role_seniority\": \"vp\", \"stated_use_case\": \"Automate weld seam inspection\", \"stated_timeline\": \"Pilot before quarter end\"}, \"reasoning\": \"Strong fit on every axis.\", \"missing_information\": [\"budget range\"], \"suggested_first_question\": \"Which line would you pilot on?\", \"spam_or_test_submission\": false}"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 612,
+    "output_tokens": 388,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 1984,
+    "service_tier": "standard"
+  }
+}

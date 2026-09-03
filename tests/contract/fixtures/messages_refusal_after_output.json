@@ -1,0 +1,32 @@
+{
+  "_comment": "SYNTHETIC, hand-written to the documented shape - not a recording. A mid-stream refusal: the safety classifier fired after the model had already emitted output, so `content` carries a thinking block and a prose text block, `stop_reason` is `refusal`, and the already-generated tokens are billed at normal rates. This is the shape that the SDK's `messages.parse()` cannot survive: it calls `TypeAdapter(LeadAssessment).validate_json()` on the prose text block before it returns, so the caller never gets to inspect `stop_reason`.",
+  "id": "msg_01Wq8cKt3mZ5nRv6hLy2XbNe",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-5",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "ErUBCkYIBRgCIkBtaWQtc3RyZWFtLXJlZnVzYWw="
+    },
+    {
+      "type": "text",
+      "text": "I can't help with this request. The submission asks for assistance building tooling to enumerate and exploit unpatched services on networks the sender does not appear to control."
+    }
+  ],
+  "stop_reason": "refusal",
+  "stop_sequence": null,
+  "stop_details": {
+    "type": "refusal",
+    "category": "cyber",
+    "explanation": "The submission asks for help with intrusion tooling."
+  },
+  "usage": {
+    "input_tokens": 731,
+    "output_tokens": 96,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 1984,
+    "service_tier": "standard"
+  }
+}
