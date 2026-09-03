@@ -14,6 +14,7 @@ dependencies = [
     "alembic>=1.16",
     "boto3",
     "mangum",
+    "dnspython",
 ]
 
 [project.optional-dependencies]
@@ -33,7 +34,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-leadquali = ["prompts/*.md", "py.typed"]
+leadquali = ["prompts/*.md", "adapters/data/*.txt", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -68,3 +69,11 @@ files = ["src", "tests", "scripts"]
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 disallow_untyped_defs = true
+
+# dnspython ships `py.typed`, but its exception classes have untyped `__init__`s, so
+# raising one in a test is a `no-untyped-call` error under strict mode. The tests must
+# raise the real exceptions - substituting a stand-in would stop proving that the adapter
+# catches what dnspython actually throws - so the check is relaxed for this module alone.
+[[tool.mypy.overrides]]
+module = ["tests.unit.test_enrich_email"]
+disallow_untyped_calls = false

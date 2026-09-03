@@ -1,0 +1,158 @@
+# Consumer mailbox providers ("free-mail") — data, not code.
+#
+# One domain per line, lowercase, no leading "@". Blank lines and lines starting with
+# "#" are ignored. Matching is exact on the registered domain of the address.
+#
+# WHAT THIS LIST MEANS
+#   A domain here belongs to a mailbox provider anyone can sign up with, so the address
+#   says nothing about the sender's employer. Some entries are paid (fastmail.com,
+#   hey.com, mailbox.org); "free" is the industry's word for the category, and the
+#   category is really "consumer mailbox, not the company's own domain".
+#
+#   This is NOT a spam signal and must never be scored as one. Solo founders, sole
+#   traders and plenty of small businesses run on gmail.com, and they buy things. It is
+#   a weak *ICP-fit* signal — no verifiable employer, and no company/domain match to be
+#   had — which is why it is a separate value from `disposable` in
+#   disposable_email_domains.txt rather than the same flag. A throwaway address means
+#   the sender intends to be unreachable; a consumer address means they are reachable
+#   and simply do not have corporate mail.
+#
+# SOURCE
+#   Assembled from the public free-provider lists maintained at
+#   https://github.com/willwhite/freemail (data/free.txt, MIT) cross-checked against the
+#   providers that actually appear on inbound B2B forms, plus the major regional
+#   webmail providers (Europe, Russia, China, Korea, Japan, Brazil).
+#
+# HOW TO UPDATE — no deploy required
+#   Edit this file, or point the adapter at another one:
+#     EmailEnricher(free_mail_domains_path="/mnt/lists/free_mail.txt")
+#   Read once per process; a change takes effect when the worker recycles. This list
+#   moves at the speed of the consumer email industry (years), unlike the disposable
+#   list, which moves weekly.
+aim.com
+alice.it
+aol.com
+arcor.de
+att.net
+bellsouth.net
+bigpond.com
+bk.ru
+blueyonder.co.uk
+btinternet.com
+charter.net
+comcast.net
+cox.net
+daum.net
+disroot.org
+duck.com
+earthlink.net
+email.com
+fastmail.com
+fastmail.fm
+foxmail.com
+free.fr
+freenet.de
+gmail.com
+gmx.at
+gmx.ch
+gmx.com
+gmx.de
+gmx.net
+googlemail.com
+hanmail.net
+hey.com
+hotmail.co.uk
+hotmail.com
+hotmail.de
+hotmail.es
+hotmail.fr
+hotmail.it
+hushmail.com
+icloud.com
+inbox.ru
+interia.pl
+juno.com
+laposte.net
+libero.it
+list.ru
+live.co.uk
+live.com
+live.de
+live.fr
+live.it
+live.nl
+mac.com
+mail.com
+mail.ru
+mailbox.org
+mailfence.com
+me.com
+msn.com
+nate.com
+naver.com
+netzero.net
+neuf.fr
+ntlworld.com
+o2.pl
+onet.pl
+optonline.net
+optusnet.com.au
+orange.fr
+outlook.co.uk
+outlook.com
+pm.me
+posteo.de
+proton.me
+protonmail.ch
+protonmail.com
+qq.com
+rambler.ru
+riseup.net
+rocketmail.com
+rogers.com
+runbox.com
+sbcglobal.net
+seznam.cz
+sfr.fr
+shaw.ca
+sina.cn
+sina.com
+sky.com
+sohu.com
+startmail.com
+sympatico.ca
+t-online.de
+talktalk.net
+telus.net
+terra.es
+tin.it
+tiscali.it
+tlen.pl
+tuta.io
+tutanota.com
+usa.com
+verizon.net
+virgilio.it
+virginmedia.com
+wanadoo.fr
+web.de
+wp.pl
+xtra.co.nz
+ya.ru
+yahoo.ca
+yahoo.co.jp
+yahoo.co.uk
+yahoo.com
+yahoo.com.au
+yahoo.com.br
+yahoo.de
+yahoo.es
+yahoo.fr
+yahoo.it
+yandex.com
+yandex.ru
+ymail.com
+zoho.com
+zohomail.com
+126.com
+163.com

@@ -1,0 +1,200 @@
+# Disposable / throwaway email domains — data, not code.
+#
+# One domain per line, lowercase, no leading "@". Blank lines and lines starting with
+# "#" are ignored. Matching is exact on the registered domain of the address, so
+# subdomains of a listed domain are NOT matched; list them explicitly if you need them.
+#
+# WHAT THIS LIST MEANS
+#   A domain here exists to give someone a mailbox they intend to abandon. That is a
+#   qualification signal in its own right and a *different* one from free-mail: a lead
+#   at gmail.com is a real person who can be reached tomorrow, a lead at mailinator.com
+#   has told you they do not want to be. Keep the two files separate.
+#
+# SOURCE
+#   Curated subset of the community blocklist at
+#   https://github.com/disposable-email-domains/disposable-email-domains
+#   (file: disposable_email_blocklist.conf, released into the public domain / CC0),
+#   trimmed to the entries that actually turn up on B2B web forms. The upstream list is
+#   ~3,500 domains; the whole thing loads fine (it is a set of short strings, well under
+#   a megabyte) if you want the coverage.
+#
+# HOW TO UPDATE — no deploy required
+#   Replace this file's contents:
+#     curl -sSL https://raw.githubusercontent.com/disposable-email-domains/\
+#   disposable-email-domains/main/disposable_email_blocklist.conf \
+#       -o src/leadquali/adapters/data/disposable_email_domains.txt
+#   or point the adapter somewhere else entirely:
+#     EmailEnricher(disposable_domains_path="/mnt/lists/disposable.txt")
+#   In Phase 4 that path is a mounted config volume or an S3-synced file, so refreshing
+#   the list is an operations task, not a release. The file is read once per process, so
+#   a change takes effect when the worker recycles.
+0-mail.com
+10mail.org
+10minutemail.com
+1secmail.com
+1secmail.net
+1secmail.org
+20email.eu
+20minutemail.com
+33mail.com
+4warding.com
+anonaddy.me
+armyspy.com
+bareed.ws
+burnermail.io
+byom.de
+cachedot.net
+courriel.fr.nf
+crazymailing.com
+cuvox.de
+dayrep.com
+dcctb.com
+deadaddress.com
+disbox.net
+discard.email
+discardmail.com
+discardmail.de
+dispostable.com
+e4ward.com
+einrot.com
+emailfake.com
+emailondeck.com
+emltmp.com
+esiix.com
+fakeinbox.com
+fakemail.net
+fakemailgenerator.com
+filzmail.com
+fleckens.hu
+freemail.ms
+generator.email
+get2mail.fr
+getnada.com
+ghosttexter.de
+gomail.in
+grr.la
+guerrillamail.com
+guerrillamailblock.com
+gustr.com
+harakirimail.com
+hidemail.de
+hulapla.de
+inboxbear.com
+inboxkitten.com
+incognitomail.com
+jetable.fr.nf
+jetable.org
+jourrapide.com
+kurzepost.de
+laafd.com
+lroid.com
+luxusmail.org
+mail-easy.fr
+mail-temporaire.fr
+mail7.io
+mailbox92.biz
+mailcatch.com
+mailde.de
+maildrop.cc
+mailexpire.com
+mailfreeonline.com
+mailguard.me
+mailin8r.com
+mailinator.com
+mailinator.net
+mailinator2.com
+mailismagic.com
+mailmetrash.com
+mailnator.com
+mailnesia.com
+mailnull.com
+mailpoof.com
+mailquack.com
+mailsac.com
+mailscrap.com
+mailtemp.info
+mailtothis.com
+mailzilla.com
+mega.zik.dk
+meltmail.com
+mierdamail.com
+mintemail.com
+minuteinbox.com
+moakt.com
+mohmal.com
+moncourrier.fr.nf
+monemail.fr.nf
+monmail.fr.nf
+mt2015.com
+mvrht.net
+mytemp.email
+mytrashmail.com
+netmails.net
+nice-4u.com
+no-spam.ws
+nomail.xl.cx
+nospam.ze.tc
+notsharingmy.info
+objectmail.com
+pookmail.com
+proxymail.eu
+rcpt.at
+recode.me
+rhyta.com
+safetymail.info
+sharklasers.com
+sofort-mail.de
+spam4.me
+spamavert.com
+spambog.com
+spambog.de
+spambog.ru
+spambox.us
+spamdecoy.net
+spamfree24.com
+spamfree24.de
+spamgourmet.com
+spamherelots.com
+spaml.de
+spamspot.com
+speed.1s.fr
+superrito.com
+tafmail.com
+teleworm.us
+temp-mail.io
+temp-mail.org
+temp-mail.ru
+tempail.com
+tempemail.net
+tempemails.net
+tempinbox.com
+tempmail.com
+tempmailer.com
+tempmailer.de
+tempmailo.com
+tempomail.fr
+tempr.email
+thankyou2010.com
+thisisnotmyrealemail.com
+throwawaymail.com
+tmail.ws
+tmpmail.net
+tmpmail.org
+tradermail.info
+trashmail.com
+trashmail.de
+trbvm.com
+txcct.com
+veryrealemail.com
+vjuum.com
+wegwerfadresse.de
+wegwerfmail.de
+wh4f.org
+willhackforfood.biz
+wuzup.net
+wwjmp.com
+xojxe.com
+yopmail.com
+yopmail.fr
+yopmail.net
+zoemail.com
