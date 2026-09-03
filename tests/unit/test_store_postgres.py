@@ -396,8 +396,12 @@ def test_importing_the_module_creates_no_engine() -> None:
 
 def test_no_sql_is_assembled_from_strings() -> None:
     """Acceptance criterion: no SQL string interpolation of user input anywhere. Every
-    statement is a Core construct, so ids and payloads travel as bound parameters; the one
-    textual fragment in the module is a constant with no input in it."""
+    statement is a Core construct, so ids and payloads travel as bound parameters; the only
+    textual fragments in the module are constants with no input in them.
+
+    There are two, and both are the same one: ``(xmax = 0)``, the Postgres idiom for "did my
+    ``ON CONFLICT`` insert or update", once in ``upsert_lead`` (#16) and once in
+    ``record_feedback`` (#19). Neither contains anything that came from a caller."""
     module = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
     textual = {"text", "literal_column", "column", "table"}
     found = 0
@@ -410,7 +414,7 @@ def test_no_sql_is_assembled_from_strings() -> None:
         assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
             f"line {call.lineno}: {name}() is given something other than a literal string"
         )
-    assert found == 1, "expected exactly the (xmax = 0) fragment; a new one needs a look"
+    assert found == 2, "expected only the two (xmax = 0) fragments; a new one needs a look"
 
 
 def test_the_engine_is_shaped_for_a_lambda_container() -> None:

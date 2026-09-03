@@ -1,7 +1,7 @@
 """The public ingest edge: ``POST /leads`` and ``GET /health``.
 
-Everything a stranger can reach is in this file, and it is written for that. The order of
-operations is the order of cost, cheapest and most sceptical first:
+The ingest route is written for a stranger, and the order of operations is the order of
+cost, cheapest and most sceptical first:
 
 1. **Size.** ``Content-Length`` is checked before a byte is read, and the stream is counted
    as it arrives so a request that lies about its length — or declares nothing at all — is
@@ -30,6 +30,12 @@ form post that waits on one produces browser timeouts, duplicate submissions and
 lost every time the model is slow. The app is constructed without a
 :class:`~leadquali.app.ports.LeadAssessorPort` at all, so the fast path cannot regress into
 a slow one by accident; ``tests/unit/test_api_ingest.py`` asserts that structurally.
+
+The other public surface, ``/feedback/{token}``, is registered here by
+:func:`~leadquali.api.feedback.register_feedback_routes` and implemented in
+:mod:`leadquali.api.feedback`. It shares this app because it is one deployment, and it
+shares nothing else: its dependencies are a separate object, so the ingest handler cannot
+reach a feedback writer and the feedback handler holds no ingest credentials.
 """
 
 from __future__ import annotations
@@ -47,6 +53,7 @@ from pydantic import ValidationError
 from leadquali.adapters.clock_system import SystemClock
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
 from leadquali.adapters.store_postgres import PostgresLeadStore, contact_email_hash
+from leadquali.api.feedback import FeedbackDeps, register_feedback_routes
 from leadquali.api.ratelimit import NoRateLimit, RateLimiterPort
 from leadquali.api.schemas import (
     MAX_BODY_BYTES,
@@ -150,12 +157,24 @@ def _default_deps() -> IngestDeps:
     return build_deps()
 
 
-def create_app(deps: IngestDeps | None = None) -> FastAPI:
+def create_app(
+    deps: IngestDeps | None = None, feedback_deps: FeedbackDeps | None = None
+) -> FastAPI:
     """Build the ASGI application.
 
+    Two public surfaces share it and share nothing else: ``POST /leads``, which a customer's
+    website calls with a signed request, and ``GET``/``POST /feedback/{token}``, which a
+    sales rep opens from an email. One app because it is one deployment — the feedback link
+    has to resolve on a host the rep can reach, and standing up a second service for two
+    routes would mean a second domain, a second certificate and a second thing to page
+    someone about. Their dependencies stay separate objects (see
+    :class:`~leadquali.api.feedback.FeedbackDeps`) so that neither endpoint can reach the
+    other's collaborators.
+
     Args:
-        deps: the wiring to use. ``None`` — the default, and what uvicorn and Mangum get —
+        deps: the ingest wiring. ``None`` — the default, and what uvicorn and Mangum get —
             resolves the production dependencies lazily on the first request.
+        feedback_deps: the feedback wiring, resolved the same way.
 
     Returns:
         A deployment-agnostic ASGI app. It is served by uvicorn locally (``run_local.py``)
@@ -164,12 +183,16 @@ def create_app(deps: IngestDeps | None = None) -> FastAPI:
     provide: Callable[[], IngestDeps] = (lambda: deps) if deps is not None else _default_deps
 
     app = FastAPI(
-        title="LeadQuali ingest",
+        title="LeadQuali",
         version="1",
-        summary="Accepts inbound web-form leads and answers before the model is ever called.",
+        summary=(
+            "Accepts inbound web-form leads before the model is ever called, and records "
+            "the one-click verdicts that grow the golden set."
+        ),
         docs_url="/docs",
         redoc_url=None,
     )
+    register_feedback_routes(app, feedback_deps)
 
     @app.get(
         HEALTH_PATH,

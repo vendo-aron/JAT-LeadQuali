@@ -63,3 +63,21 @@ def test_domain_and_app_import_no_third_party_sdk() -> None:
             continue
         leaked = forbidden & imported_modules(path)
         assert not leaked, f"{relative} imports {sorted(leaked)}"
+
+
+def test_only_the_ses_adapter_imports_boto3() -> None:
+    """``CLAUDE.md``: one file per external system, and ``boto3`` belongs to that one.
+
+    Stated separately from the rule above because it binds the *adapters* too: SES is
+    reached from ``adapters/notify_ses.py`` and nowhere else, so swapping email for a Slack
+    notifier is a wiring change and an operator can find every AWS call by opening one file.
+    """
+    owner = "adapters/notify_ses.py"
+    assert "boto3" in imported_modules(SRC / owner), "the adapter is supposed to own the SDK"
+    for path in python_sources():
+        relative = path.relative_to(SRC).as_posix()
+        if relative == owner:
+            continue
+        assert "boto3" not in imported_modules(path), (
+            f"{relative} imports boto3; AWS belongs in {owner} alone"
+        )

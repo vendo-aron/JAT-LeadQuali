@@ -91,6 +91,7 @@ from sqlalchemy import (
     Boolean,
     Engine,
     create_engine,
+    func,
     insert,
     literal_column,
     null,
@@ -99,12 +100,14 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from leadquali.adapters.db_schema import Assessment, Lead, RoutingEvent, Tenant
+from leadquali.adapters.db_schema import Assessment, Feedback, Lead, RoutingEvent, Tenant
 from leadquali.adapters.seed import tenant_id_for
 from leadquali.app.assessment_result import AssessmentOutcome, CallMetering
-from leadquali.app.ports import RoutingOutcome, StoredLead
+from leadquali.app.feedback import UnknownLeadError, Verdict
+from leadquali.app.ports import RecordedFeedback, RoutingOutcome, StoredLead
 from leadquali.config import Settings, get_settings
 from leadquali.domain.models import Action, RoutingDecision
 from leadquali.domain.tenant_config import (
@@ -116,9 +119,11 @@ from leadquali.domain.tenant_config import (
 from leadquali.prompts.lead import LeadSubmission
 
 __all__ = [
+    "FEEDBACK_IDEMPOTENCY_CONSTRAINT",
     "LEAD_IDEMPOTENCY_CONSTRAINT",
     "UNKNOWN_MODEL_ID",
     "UNKNOWN_PROMPT_VERSION",
+    "PostgresFeedbackStore",
     "PostgresLeadStore",
     "PostgresTenantConfigSource",
     "assessment_values",
@@ -134,6 +139,14 @@ LOGGER = logging.getLogger(__name__)
 #: The unique constraint ``upsert_lead`` resolves its conflict against. Named rather than
 #: inferred from columns so that a rename in #15's schema breaks loudly here.
 LEAD_IDEMPOTENCY_CONSTRAINT: Final[str] = "uq_leads_tenant_id_submission_id"
+
+#: The unique constraint ``record_feedback`` resolves its conflict against: one verdict per
+#: rater per lead, which is what makes a second click an update rather than a second row.
+FEEDBACK_IDEMPOTENCY_CONSTRAINT: Final[str] = "uq_feedback_tenant_id_lead_id_rater"
+
+#: SQLSTATE for ``foreign_key_violation``. The composite ``(tenant_id, lead_id)`` key is the
+#: only one this module can trip, so it means "no such lead for this tenant" and nothing else.
+_FOREIGN_KEY_VIOLATION: Final[str] = "23503"
 
 #: Recorded as the model provenance of an attempt that never reached the model — a
 #: connection error or a timeout has no ``model_id`` to report, and the columns are NOT
@@ -612,6 +625,130 @@ class PostgresLeadStore:
         session.execute(
             update(Lead).where(Lead.tenant_id == tenant, Lead.id == lead).values(status=status)
         )
+
+
+class PostgresFeedbackStore:
+    """:class:`~leadquali.app.ports.FeedbackStorePort` over the ``feedback`` table.
+
+    A separate class from :class:`PostgresLeadStore` because the callers are separate — the
+    pipeline writes leads from a worker, a rep's browser writes feedback through the API —
+    and an endpoint handed a feedback writer cannot reach the lead lifecycle by accident.
+    They share the session factory, so a process doing both still opens one pool.
+
+    Conventions are #16's, unchanged: ``tenant_id`` on the method and in the statement
+    (invariant 4, including in the ``ON CONFLICT ... WHERE`` clause where the unique index
+    already implies it), one short transaction per call, failures raised rather than
+    swallowed.
+
+    **Idempotency is the database's job here too.** One ``INSERT ... ON CONFLICT DO UPDATE``
+    against ``uq_feedback_tenant_id_lead_id_rater``: a mail scanner's prefetch, a rep's
+    double tap and a change of mind three days later all resolve to the same row. A
+    ``SELECT`` followed by an ``INSERT`` would duplicate under exactly the concurrency this
+    endpoint sees — a phone retrying a POST on a flaky connection.
+    """
+
+    def __init__(self, sessions: sessionmaker[Session]) -> None:
+        """Take the session factory to use. See :func:`session_factory`."""
+        self._sessions = sessions
+
+    @classmethod
+    def from_url(cls, url: str) -> PostgresFeedbackStore:
+        """A feedback store over the memoised engine for ``url``."""
+        return cls(session_factory(url))
+
+    @classmethod
+    def from_env(cls, settings: Settings | None = None) -> PostgresFeedbackStore:
+        """A feedback store over the configured ``DATABASE_URL``."""
+        return cls(session_factory_from_env(settings))
+
+    def record_feedback(
+        self,
+        *,
+        tenant_id: str,
+        lead_id: str,
+        rater: str,
+        verdict: Verdict,
+        notes: str | None,
+        recorded_at: datetime,
+    ) -> RecordedFeedback:
+        """Record this rater's verdict on this lead, replacing any verdict they gave before.
+
+        The prior verdict is read in the same transaction before the upsert, because the
+        page the rep lands on says "changed from good lead to bad lead" and ``RETURNING``
+        after ``DO UPDATE`` yields the *new* row, not the one that was there. Under a
+        genuine race the reader may see the other writer's value — which changes one
+        sentence of wording and never the row, since the write is still one atomic
+        statement.
+
+        ``created_at`` moves forward on an update: the row *is* the current verdict, and
+        leaving it stamped with a verdict that has since been replaced would misdate the
+        training data. #15's table has no ``updated_at``, so the first-recorded time is not
+        kept; that is flagged in the report rather than smuggled into ``notes``.
+
+        Raises:
+            UnknownLeadError: this tenant has no such lead. Read off the composite foreign
+                key rather than from a prior existence check, so there is no window between
+                the check and the write — and so a link that outlived #37's retention job
+                produces a page that says so instead of a 500.
+        """
+        tenant = tenant_uuid(tenant_id)
+        lead = lead_uuid(lead_id)
+        if not rater:
+            raise ValueError("rater must not be blank; feedback with no subject is unattributable")
+
+        previous = select(Feedback.verdict).where(
+            Feedback.tenant_id == tenant,
+            Feedback.lead_id == lead,
+            Feedback.rater == rater,
+        )
+        insertion = pg_insert(Feedback).values(
+            tenant_id=tenant,
+            lead_id=lead,
+            rater=rater,
+            verdict=verdict.value,
+            notes=notes,
+            created_at=recorded_at,
+        )
+        statement = insertion.on_conflict_do_update(
+            constraint=FEEDBACK_IDEMPOTENCY_CONSTRAINT,
+            set_={
+                "verdict": insertion.excluded.verdict,
+                "created_at": insertion.excluded.created_at,
+                # A click carrying no note must not erase the sentence the rep typed last
+                # time: the new value wins only when there is one.
+                "notes": func.coalesce(insertion.excluded.notes, Feedback.notes),
+            },
+            # Redundant against the conflict target and kept anyway: invariant 4 has no
+            # exceptions for the statements that are provably safe.
+            where=Feedback.tenant_id == tenant,
+        ).returning(literal_column("(xmax = 0)", Boolean))
+
+        try:
+            with self._sessions.begin() as session:
+                existing = session.execute(previous).scalar_one_or_none()
+                inserted = bool(session.execute(statement).scalar_one())
+        except IntegrityError as error:
+            if _is_foreign_key_violation(error):
+                raise UnknownLeadError(
+                    f"tenant '{tenant_id}' has no lead {lead_id}; a link can outlive its row"
+                ) from None
+            raise
+
+        return RecordedFeedback(
+            verdict=verdict,
+            created=inserted,
+            previous_verdict=Verdict(existing) if existing is not None else None,
+        )
+
+
+def _is_foreign_key_violation(error: IntegrityError) -> bool:
+    """Whether this integrity error is the composite lead foreign key rejecting the row.
+
+    Matched on SQLSTATE rather than on the message, which is localised and version-specific.
+    Anything else — a broken CHECK, a duplicate that somehow escaped the upsert — is a bug
+    here, and is re-raised rather than reported to a rep as "that lead is gone".
+    """
+    return getattr(error.orig, "sqlstate", None) == _FOREIGN_KEY_VIOLATION
 
 
 class PostgresTenantConfigSource:

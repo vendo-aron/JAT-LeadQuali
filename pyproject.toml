@@ -23,6 +23,9 @@ dev = [
     "ruff",
     "mypy",
     "httpx",
+    # SES is mocked in-process: there are no AWS credentials in CI and a test that
+    # needed them would simply never run.
+    "moto[ses]",
 ]
 
 [build-system]
