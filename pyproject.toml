@@ -21,6 +21,10 @@ dev = [
     "pytest-asyncio",
     "ruff",
     "mypy",
+    # `httpx`, for FastAPI's TestClient. Not to be confused with `httpx2`, which the
+    # plan's dev list names: that is also a real package — it is the HTTP layer the
+    # `anthropic` SDK depends on, so it arrives transitively and contract tests import
+    # it directly to mock transports. Both exist; neither is a typo for the other.
     "httpx",
 ]
 
