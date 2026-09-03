@@ -50,3 +50,38 @@ Two behaviours are deliberate and worth knowing before you read the output:
 
 If `cache_read` is `0` on a second run of the same tenant, the cacheable prompt prefix has
 moved — something volatile has leaked into it, and the cost model no longer holds.
+
+## The release rule: no prompt or model change ships without an eval
+
+Every change to the rubric, the prompt, the model id or the effort level **must have an
+eval run attached to the pull request** — the run summary or the JSON result file from
+`tests/evals/run_eval.py`. Not a description of one; the output. Without it the change is
+a guess, and a rubric regression is invisible until a salesperson notices that good leads
+stopped arriving, which is months later and unattributable.
+
+```bash
+# What will this cost? Free, calls nothing, needs no key.
+python -m tests.evals.run_eval --estimate
+
+# Run it. Both the flag and the key are required, and neither implies the other.
+export ANTHROPIC_API_KEY=sk-ant-...
+python -m tests.evals.run_eval --confirm-spend --effort medium
+```
+
+It prints, in this order: **recall on "should have been contacted"** (hot + warm — the
+false-disqualification rate, the number that costs money), precision on `hot` (the number
+sales feels), exact and adjacent tier accuracy, cost and p95 latency per lead, a confusion
+matrix, per-case results with each label's notes beside the model's reasoning, and any
+prompt-injection findings. It also writes a timestamped JSON file under
+`tests/evals/results/` tagged with the model, prompt version, effort and git SHA, so two
+runs can be diffed.
+
+In CI it is `workflow_dispatch` only — see the header of `ci/github-actions-eval.yml` for
+the one-line `git mv` that activates it. It never runs on `push`: the eval costs real
+money per invocation.
+
+> **Read this before quoting a number from it.** The golden set is currently **synthetic
+> and self-labeled**, so every figure it produces measures self-consistency with whoever
+> wrote the seed cases — not correctness. The report says so beside every metric, and
+> [`docs/labeling-golden-set.md`](docs/labeling-golden-set.md) is how the set stops being
+> synthetic: promote real leads from the `feedback` table, weekly.

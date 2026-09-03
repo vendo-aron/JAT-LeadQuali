@@ -1,0 +1,159 @@
+# ACTIVATION REQUIRED — this file must live at .github/workflows/eval.yml to run.
+#
+#     git mv ci/github-actions-eval.yml .github/workflows/eval.yml && git commit -m "Activate the eval workflow"
+#
+# It is staged here only because the automation that authored it pushes over a credential
+# without GitHub's `workflow` scope, which rejects any push that touches
+# .github/workflows/. The content below is final; the move is the whole activation.
+# tests/unit/test_eval_workflow.py finds the file at either path, so the move needs no
+# test change.
+#
+# BEFORE THE FIRST RUN: add the *development* Anthropic key as a repository secret named
+# ANTHROPIC_API_KEY. Scope it to this workflow's environment if the repository has one; it
+# is the only workflow that should ever be able to read it, and CI (ci.yml) deliberately
+# cannot — see the assertion in tests/unit/test_ci_workflow.py.
+#
+# WHY workflow_dispatch AND NOTHING ELSE (plan §7.4). Every run of this workflow makes one
+# billable model call per golden case and consumes real rate limit. On `push` it would
+# bill every commit, and on `pull_request` it would let anybody with a fork spend the
+# account's money. It runs when a person decides a prompt or model change is worth
+# measuring, and before a deploy. That is the entire trigger policy, and the harness
+# refuses to start without --confirm-spend besides, so a mis-wired trigger still cannot
+# spend anything.
+#
+# WHAT A GREEN RUN DOES NOT MEAN. The golden set is currently synthetic and self-labeled,
+# so the numbers in the summary measure self-consistency with whoever wrote the seed, not
+# correctness. The report says so on every metric block; read it, and read
+# docs/labeling-golden-set.md, before quoting anything from an Actions run.
+name: Eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      effort:
+        description: "Model effort level to evaluate at."
+        type: choice
+        default: medium
+        options:
+          - low
+          - medium
+          - high
+          - xhigh
+          - max
+      prompt_version:
+        description: "Prompt version you believe you are testing. The run aborts if the checkout ships a different one."
+        type: string
+        default: rubric_v1
+      repeat:
+        description: "Runs of the whole set. 2+ quantifies run-to-run nondeterminism, and multiplies the cost."
+        type: string
+        default: "1"
+      concurrency:
+        description: "In-flight model calls. Lower this if the account is rate limited; the SDK already retries with backoff."
+        type: string
+        default: "4"
+
+# Read-only: this job checks out the source, spends money and writes a summary. It does
+# not need to write to the repository, and a token that could would be a token an eval
+# result could be forged with.
+permissions:
+  contents: read
+
+# One paid run at a time. `cancel-in-progress: false` on purpose - unlike CI, a superseded
+# run here has already spent money, and cancelling it throws that away while leaving no
+# report to show for it. A second dispatch queues behind the first, which also keeps two
+# runs from competing for the same account rate limit.
+concurrency:
+  group: eval-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    name: Golden-set eval
+    runs-on: ubuntu-latest
+    # Generous, because this waits on a model: 100 cases at 4-way concurrency and a
+    # 120s per-attempt timeout is minutes, not seconds. Bounded anyway, so a hung run
+    # cannot burn an hour of minutes on a call that is never coming back.
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out the revision being evaluated
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the package and its dev extras
+        run: pip install -e ".[dev]"
+
+      - name: Verify the checkout ships the prompt version being claimed
+        # Fails before a penny is spent. A run labeled `rubric_v1` that actually exercised
+        # `rubric_v2` is worse than no run: it is a number filed against the wrong prompt.
+        run: |
+          set -o pipefail
+          shipped=$(python -c 'from leadquali.prompts.rubric import PROMPT_VERSION; print(PROMPT_VERSION)')
+          echo "checkout ships: $shipped"
+          if [ "$shipped" != "${{ inputs.prompt_version }}" ]; then
+            echo "::error::this checkout ships prompt version '$shipped', but the run was dispatched for '${{ inputs.prompt_version }}'"
+            exit 1
+          fi
+
+      - name: Estimate the spend before committing to it
+        # Free, calls nothing, and needs no key. Printed first so the cost of the run is
+        # in the log above the run itself rather than discovered on the invoice.
+        run: |
+          set -o pipefail
+          python -m tests.evals.run_eval --estimate \
+            --effort "${{ inputs.effort }}" \
+            --concurrency "${{ inputs.concurrency }}" | tee eval-estimate.txt
+
+      - name: Run the golden-set eval
+        # The only step that sees the key, and the only one that spends anything.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -o pipefail
+          python -m tests.evals.run_eval \
+            --confirm-spend \
+            --effort "${{ inputs.effort }}" \
+            --repeat "${{ inputs.repeat }}" \
+            --concurrency "${{ inputs.concurrency }}" \
+            --out eval-results | tee eval-report.txt
+
+      - name: Post the report to the run summary
+        # `always()`: a run that ended on a prompt-injection finding exits non-zero, and
+        # that is exactly the run whose report somebody needs to read.
+        if: always()
+        run: |
+          {
+            echo '### Golden-set eval — effort `${{ inputs.effort }}`, prompt `${{ inputs.prompt_version }}`'
+            echo
+            echo '> The golden set is currently synthetic and self-labeled. Numbers below measure'
+            echo '> self-consistency with the seed author, not correctness. See docs/labeling-golden-set.md.'
+            echo
+            echo '```'
+            cat eval-estimate.txt 2>/dev/null || echo '(no estimate: the run failed before it was produced)'
+            echo
+            cat eval-report.txt 2>/dev/null || echo '(no report: the run failed before it produced one)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the JSON result
+        # Retained so two runs can be diffed later - which is the whole point of the file,
+        # and what #24's effort sweep consumes.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ inputs.effort }}-${{ github.run_id }}
+          path: |
+            eval-results/
+            eval-report.txt
+          if-no-files-found: warn
+          retention-days: 90
