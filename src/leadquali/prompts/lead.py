@@ -118,15 +118,24 @@ class LeadSubmission(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    full_name: str | None = None
-    email: str | None = None
-    company: str | None = None
-    role: str | None = None
-    phone: str | None = None
-    website: str | None = None
-    message: str | None = None
+    # Every field is ``repr=False``. A submission is personal data, and ``repr`` is the one
+    # place it escapes without anybody deciding to emit it: an exception raised anywhere
+    # below this object — ``ValueError(f"bad lead {submission!r}")``, a ``TypeError`` whose
+    # message pydantic built, an assertion in a library — is formatted into a traceback and
+    # that traceback is logged. #21's formatter redacts addresses on the way out, but it
+    # cannot recognise a lead's free text, so the fix has to be that the text was never in
+    # the string. ``model_dump`` is unaffected, which is what the queue message and the
+    # ``leads`` row use.
+    full_name: str | None = Field(default=None, repr=False)
+    email: str | None = Field(default=None, repr=False)
+    company: str | None = Field(default=None, repr=False)
+    role: str | None = Field(default=None, repr=False)
+    phone: str | None = Field(default=None, repr=False)
+    website: str | None = Field(default=None, repr=False)
+    message: str | None = Field(default=None, repr=False)
     extra: Mapping[str, str | None] = Field(
         default_factory=dict,
+        repr=False,
         description="Form fields beyond the known ones, kept so nothing is lost.",
     )
 

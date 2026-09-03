@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol, runtime_checkable
@@ -34,6 +34,7 @@ from typing import Any, Final, Protocol, runtime_checkable
 from leadquali.app.ports import ClockPort, LeadStorePort, RoutingOutcome
 from leadquali.domain.models import Action
 from leadquali.domain.spam import DEFAULT_SPAM_POLICY, SpamPolicy, SpamReason, screen
+from leadquali.observability import ensure_trace_id, log_context, log_lead_accepted, new_trace_id
 from leadquali.prompts.lead import LeadSubmission
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,15 @@ DEFAULT_SOURCE: Final[str] = "web_form"
 #: Version stamped on every queue message. #26 puts these on SQS, where a message written
 #: by yesterday's deploy is read by today's worker; an unrecognised version is refused
 #: rather than partially understood.
+#:
+#: Still ``1`` after #21 added ``trace_id``, and deliberately so. A version bump would have
+#: been a breaking change in the middle of a rolling deploy: the old worker refuses any
+#: version it does not know, so every message the new ingest wrote while both were running
+#: would have gone to the DLQ. The field is *additive and optional in both directions*
+#: instead — an old worker reads the keys it knows and ignores ``trace_id``; a new worker
+#: reading an old message finds none and mints one (see :meth:`QueuedLead.from_message`).
+#: Neither side can be broken by the other's deploy order, which is the only property that
+#: makes a version number worth keeping for the change that does need it.
 QUEUE_MESSAGE_VERSION: Final[int] = 1
 
 
@@ -64,6 +74,10 @@ class QueuedLead:
     submission: LeadSubmission
     source: str
     received_at: datetime
+    trace_id: str = field(default_factory=new_trace_id)
+    """The id that makes this lead's ingest half and its worker half the same journey.
+    Defaulted rather than required so that a caller who has not thought about tracing still
+    produces a traceable lead — an unset trace id is the one value that helps nobody."""
 
     def to_message(self) -> dict[str, Any]:
         """The JSON-safe form that goes on the wire (an SQS message body in #26)."""
@@ -74,12 +88,19 @@ class QueuedLead:
             "submission_id": self.submission_id,
             "source": self.source,
             "received_at": self.received_at.isoformat(),
+            "trace_id": self.trace_id,
             "submission": self.submission.model_dump(mode="json"),
         }
 
     @classmethod
     def from_message(cls, message: Mapping[str, Any]) -> QueuedLead:
         """Rebuild a queued lead from :meth:`to_message`.
+
+        A message written before ``trace_id`` existed — one already on the queue when this
+        shipped — is not an error and is not refused: it loads with a freshly minted id, so
+        the worker half of its journey is still greppable under a single id and only the
+        ingest half sits under none. Refusing it would have meant sending real leads to the
+        DLQ to protect a log field, which is the wrong trade by a wide margin.
 
         Raises:
             ValueError: the message is not a version this code understands, or a required
@@ -100,6 +121,7 @@ class QueuedLead:
                 submission=LeadSubmission.model_validate(message["submission"]),
                 source=str(message["source"]),
                 received_at=datetime.fromisoformat(str(message["received_at"])),
+                trace_id=ensure_trace_id(_optional_str(message.get("trace_id"))),
             )
         except KeyError as error:
             raise ValueError(f"queue message is missing {error.args[0]!r}") from None
@@ -159,12 +181,21 @@ class IngestRequest:
     elapsed_ms: int | None = None
     """Client-reported milliseconds from form render to submit; ``None`` if not reported."""
 
+    trace_id: str | None = None
+    """The id to trace this lead by, when the caller already has one — the HTTP layer mints
+    it so that a request rejected before this point still logs under an id. ``None`` means
+    "mint one here", which is what a CLI replay or a test gets."""
+
 
 @dataclass(frozen=True, slots=True)
 class IngestReceipt:
     """What happened to one submission, for the response, the log and the tests."""
 
     tenant_id: str
+    trace_id: str
+    """Echoed back so the caller can put it on its own log line — and, in #26, on the SQS
+    message and the HTTP response header — without re-deriving it."""
+
     submission_id: str
     lead_id: str
     disposition: IngestDisposition
@@ -208,6 +239,12 @@ class IngestService:
         duplicate, or an exception on the way to the queue — leaves a row a person can
         find.
 
+        This is also where a lead's trace id is minted (or adopted from the caller) and
+        bound to the logging context, so that everything written from here down — the
+        store's own lines, the queue's, and the exception if one escapes — carries it. The
+        binding is a wrapper rather than a ``with`` inside the body so that the body reads
+        as the sequence of steps it is.
+
         Raises:
             ValueError: the submission id is blank. It is the idempotency key, and a blank
                 one would make every post the same lead.
@@ -215,6 +252,14 @@ class IngestService:
                 the form retries with the same ``submission_id``, which is why the retry
                 path is the tested one.
         """
+        trace_id = ensure_trace_id(request.trace_id)
+        with log_context(
+            trace_id=trace_id, tenant_id=request.tenant_id, submission_id=request.submission_id
+        ):
+            return self._accept(request, trace_id)
+
+    def _accept(self, request: IngestRequest, trace_id: str) -> IngestReceipt:
+        """The body of :meth:`accept`, inside the trace context it binds."""
         submission_id = request.submission_id.strip()
         if not submission_id:
             raise ValueError("submission_id must not be blank; it is the idempotency key")
@@ -231,13 +276,17 @@ class IngestService:
         if not stored.is_new and self._store.already_routed(
             tenant_id=request.tenant_id, lead_id=stored.lead_id
         ):
-            return self._receipt(
+            return self._announce(
+                self._receipt(
+                    request,
+                    trace_id,
+                    submission_id,
+                    stored.lead_id,
+                    IngestDisposition.DUPLICATE,
+                    received_at,
+                    is_new=False,
+                ),
                 request,
-                submission_id,
-                stored.lead_id,
-                IngestDisposition.DUPLICATE,
-                received_at,
-                is_new=False,
             )
 
         verdict = screen(
@@ -248,14 +297,18 @@ class IngestService:
         )
         if verdict.reason is not None:
             self._suppress(request, stored.lead_id, verdict.reason, verdict.detail, received_at)
-            return self._receipt(
+            return self._announce(
+                self._receipt(
+                    request,
+                    trace_id,
+                    submission_id,
+                    stored.lead_id,
+                    IngestDisposition.SUPPRESSED,
+                    received_at,
+                    is_new=stored.is_new,
+                    spam_reason=verdict.reason,
+                ),
                 request,
-                submission_id,
-                stored.lead_id,
-                IngestDisposition.SUPPRESSED,
-                received_at,
-                is_new=stored.is_new,
-                spam_reason=verdict.reason,
             )
 
         self._queue.enqueue(
@@ -266,15 +319,20 @@ class IngestService:
                 submission=request.submission,
                 source=request.source or self._source,
                 received_at=received_at,
+                trace_id=trace_id,
             )
         )
-        return self._receipt(
+        return self._announce(
+            self._receipt(
+                request,
+                trace_id,
+                submission_id,
+                stored.lead_id,
+                IngestDisposition.QUEUED,
+                received_at,
+                is_new=stored.is_new,
+            ),
             request,
-            submission_id,
-            stored.lead_id,
-            IngestDisposition.QUEUED,
-            received_at,
-            is_new=stored.is_new,
         )
 
     def _suppress(
@@ -298,8 +356,30 @@ class IngestService:
         )
 
     @staticmethod
+    def _announce(receipt: IngestReceipt, request: IngestRequest) -> IngestReceipt:
+        """Emit the first line of this lead's journey, then hand the receipt back.
+
+        Emitted here rather than in the HTTP handler so that every caller of this service
+        — the endpoint, #26's producer, a replay script — produces the same event with the
+        same fields. The submission goes no further than
+        :func:`~leadquali.observability.pii.contact_email_hash`.
+        """
+        log_lead_accepted(
+            LOGGER,
+            tenant_id=receipt.tenant_id,
+            lead_id=receipt.lead_id,
+            disposition=receipt.disposition.value,
+            source=request.source,
+            is_new_lead=receipt.is_new_lead,
+            email=request.submission.email,
+            spam_reason=receipt.spam_reason.value if receipt.spam_reason is not None else None,
+        )
+        return receipt
+
+    @staticmethod
     def _receipt(
         request: IngestRequest,
+        trace_id: str,
         submission_id: str,
         lead_id: str,
         disposition: IngestDisposition,
@@ -310,6 +390,7 @@ class IngestService:
     ) -> IngestReceipt:
         return IngestReceipt(
             tenant_id=request.tenant_id,
+            trace_id=trace_id,
             submission_id=submission_id,
             lead_id=lead_id,
             disposition=disposition,
@@ -317,6 +398,11 @@ class IngestService:
             is_new_lead=is_new,
             spam_reason=spam_reason,
         )
+
+
+def _optional_str(value: Any) -> str | None:
+    """A trimmed string, or ``None`` for a key the message did not carry."""
+    return None if value is None else str(value)
 
 
 __all__ = [

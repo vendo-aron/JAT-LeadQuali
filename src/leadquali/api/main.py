@@ -52,7 +52,7 @@ from pydantic import ValidationError
 
 from leadquali.adapters.clock_system import SystemClock
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
-from leadquali.adapters.store_postgres import PostgresLeadStore, contact_email_hash
+from leadquali.adapters.store_postgres import PostgresLeadStore
 from leadquali.api.feedback import FeedbackDeps, register_feedback_routes
 from leadquali.api.ratelimit import NoRateLimit, RateLimiterPort
 from leadquali.api.schemas import (
@@ -75,6 +75,7 @@ from leadquali.app.ingest import IngestRequest, IngestService
 from leadquali.app.ports import ClockPort
 from leadquali.config import Settings, get_settings
 from leadquali.domain.spam import DEFAULT_SPAM_POLICY, SpamPolicy
+from leadquali.observability import configure_logging, log_context, log_event, new_trace_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -231,6 +232,20 @@ def create_app(
 
 async def _handle_ingest(request: Request, deps: IngestDeps) -> Response:
     """The ingest handler, outside the closure so it can be read and tested on its own."""
+    trace_id = new_trace_id()
+    with log_context(trace_id=trace_id):
+        return await _handle_ingest_traced(request, deps, trace_id)
+
+
+async def _handle_ingest_traced(request: Request, deps: IngestDeps, trace_id: str) -> Response:
+    """The handler proper, under a bound trace id.
+
+    The id is minted *here* rather than in
+    :meth:`~leadquali.app.ingest.IngestService.accept` so that a request refused before the
+    service is ever reached — 413, 401, 429, 422 — still logs under an id. A stranger's
+    rejected probe and a customer's accepted lead are then the same kind of thing in the
+    log, which is what makes "what happened to this request" answerable at all.
+    """
     started_ms = deps.clock.monotonic_ms()
 
     body = await _read_bounded_body(request, deps.max_body_bytes)
@@ -252,7 +267,13 @@ async def _handle_ingest(request: Request, deps: IngestDeps) -> Response:
 
     limit = deps.rate_limiter.check(tenant_id=auth.tenant_id, now=deps.clock.now())
     if not limit.allowed:
-        LOGGER.warning("ingest rate limited tenant=%s", auth.tenant_id)
+        log_event(
+            LOGGER,
+            "ingest.rate_limited",
+            level=logging.WARNING,
+            tenant_id=auth.tenant_id,
+            retry_after_seconds=limit.retry_after_seconds,
+        )
         return _error(
             429,
             "too many submissions; retry later",
@@ -272,21 +293,23 @@ async def _handle_ingest(request: Request, deps: IngestDeps) -> Response:
             source=payload.source,
             honeypot=payload.honeypot,
             elapsed_ms=payload.elapsed_ms,
+            trace_id=trace_id,
         )
     )
 
-    # Invariant 5: identifiers, a hash and a disposition. Never the address, never the
-    # lead's own words, never the raw payload.
-    LOGGER.info(
-        "lead accepted tenant=%s submission=%s lead=%s disposition=%s reason=%s "
-        "contact=%s latency_ms=%d",
-        receipt.tenant_id,
-        receipt.submission_id,
-        receipt.lead_id,
-        receipt.disposition.value,
-        receipt.spam_reason.value if receipt.spam_reason is not None else "-",
-        contact_email_hash(payload.form.email) or "-",
-        deps.clock.monotonic_ms() - started_ms,
+    # The lead's own event — identifiers, a hash and a disposition — is emitted by the
+    # ingest service, so that #26's producer and a replay script emit it too. This line is
+    # about the *request*: what the endpoint answered and how long it took, which is the
+    # 200 ms budget in plan section 3 made observable.
+    log_event(
+        LOGGER,
+        "http.ingest",
+        tenant_id=receipt.tenant_id,
+        submission_id=receipt.submission_id,
+        lead_id=receipt.lead_id,
+        disposition=receipt.disposition.value,
+        status=202,
+        latency_ms=deps.clock.monotonic_ms() - started_ms,
     )
 
     accepted = IngestAccepted(submission_id=receipt.submission_id, received_at=receipt.received_at)
@@ -326,11 +349,14 @@ def _log_rejection(failure: AuthFailure, request: Request) -> None:
     and it is the only handle an operator has on "a customer's form has the wrong key"
     versus "someone is probing us".
     """
-    LOGGER.warning(
-        "ingest rejected reason=%s claimed_tenant=%s client=%s",
-        failure.value,
-        request.headers.get("x-leadquali-tenant", "-")[:64],
-        request.client.host if request.client is not None else "-",
+    log_event(
+        LOGGER,
+        "ingest.rejected",
+        level=logging.WARNING,
+        reason=failure.value,
+        claimed_tenant=request.headers.get("x-leadquali-tenant", "-")[:64],
+        client=request.client.host if request.client is not None else "-",
+        status=401,
     )
 
 
@@ -363,6 +389,13 @@ def _validation_error(error: ValidationError) -> JSONResponse:
     ).model_dump()
     return JSONResponse(status_code=422, content=body, headers=_NO_STORE)
 
+
+# Logging is configured at import, before the app object exists, because uvicorn, Mangum
+# and `run_local.py` all import this module and none of them gives us a startup hook we can
+# rely on — and a request served before logging is configured is a request with no record.
+# `configure_logging` converges rather than accumulating, so the reload child process, the
+# Lambda cold start and a test that reconfigures afterwards are all safe.
+configure_logging()
 
 #: The ASGI application. ``uvicorn leadquali.api.main:app`` and ``run_local.py`` serve this
 #: one; ``api/handlers.py`` wraps the same object for Lambda.

@@ -78,7 +78,6 @@ convenience that reads ``DATABASE_URL`` through :class:`~leadquali.config.Settin
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 import uuid
@@ -116,6 +115,12 @@ from leadquali.domain.tenant_config import (
     TenantConfigError,
     TenantNotFoundError,
 )
+
+# Re-exported (it is in ``__all__``) so callers keep importing it from the store that
+# writes it. The definition lives in ``observability`` because a log line and a ``leads``
+# row must agree on the hash to be joinable, and two definitions of "the hash" is exactly
+# how they stop agreeing.
+from leadquali.observability.pii import contact_email_hash
 from leadquali.prompts.lead import LeadSubmission
 
 __all__ = [
@@ -226,26 +231,6 @@ def lead_uuid(lead_id: str) -> uuid.UUID:
         return uuid.UUID(lead_id)
     except ValueError:
         raise ValueError(f"lead id {lead_id!r} is not a UUID") from None
-
-
-def contact_email_hash(email: str | None) -> str | None:
-    """SHA-256 of the normalised contact address, or ``None`` when there is no address.
-
-    Invariant 5: this is what a log line or a metric carries so one person's leads can be
-    correlated without their address ever leaving ``leads.raw_payload``. Normalised —
-    stripped and lowercased — so that ``Ada@Example.com`` and ``ada@example.com`` correlate
-    to the same person, which is the entire point of storing it.
-
-    Not a secret and not reversible-proof: an email address has little entropy, so this
-    defends against casual disclosure in logs, not against a determined attacker with the
-    hash. It is never returned to a caller and never logged next to the address.
-    """
-    if email is None:
-        return None
-    normalised = email.strip().lower()
-    if not normalised:
-        return None
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
 
 
 # ------------------------------------------------------------------- engine & sessions
