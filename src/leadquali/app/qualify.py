@@ -43,6 +43,7 @@ make the signature that #17, #21 and #26 call three times as wide as the thing i
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -67,7 +68,18 @@ from leadquali.app.ports import (
 from leadquali.domain.models import Action, EscalationReason, RoutingDecision, Tier
 from leadquali.domain.routing import decide, system_failure
 from leadquali.domain.tenant_config import TenantConfig
+from leadquali.observability import (
+    ensure_trace_id,
+    log_assessment,
+    log_context,
+    log_dispatch_failed,
+    log_lead_duplicate,
+    log_lead_routed,
+    log_lead_suppressed,
+)
 from leadquali.prompts.lead import LeadSubmission, render_lead_detailed
+
+LOGGER = logging.getLogger(__name__)
 
 #: Where a lead came from when the caller does not say. Recorded on the lead row so a
 #: tenant with a web form, a webhook and a CSV import can tell them apart later.
@@ -107,13 +119,27 @@ class QualificationRequest:
     """When ingest accepted the lead. The clock is read when this is ``None``, so a message
     that sat in the queue for an hour is not recorded as having arrived an hour late."""
 
+    trace_id: str | None = None
+    """The id minted at ingest and carried on the queue message, so that the worker's half
+    of this lead's journey is greppable together with the edge's. ``None`` — a CLI replay,
+    a test, a message written before #21 — mints a fresh one rather than going untraced."""
+
 
 @dataclass(frozen=True, slots=True)
 class QualificationResult:
     """What happened, in the terms #21's metrics and #26's worker need.
 
-    Returned rather than logged: this module has no logger, because a pipeline that decides
-    its own log format cannot be reused by a CLI, a test and a Lambda.
+    Still returned rather than *only* logged, and for the original reason: a caller needs
+    the outcome as a value — #26's worker acknowledges the SQS message on it, and the CLI
+    prints from it — and a caller that had to parse its own log output would be absurd.
+
+    What changed with #21 is that the pipeline also *emits* the outcome, which is not the
+    same thing as deciding a log format. It calls
+    :mod:`leadquali.observability.events`, which names the events and owns the field set;
+    whether that becomes a JSON line or a human one is
+    :func:`~leadquali.observability.logs.configure_logging`'s business, chosen once per
+    process by the entry point. The pipeline is still reusable by a CLI, a test and a
+    Lambda, and all three now produce the same events.
     """
 
     tenant_id: str
@@ -143,6 +169,10 @@ class QualificationResult:
     latency_ms: int
     """Wall-clock cost of the whole pipeline, from a monotonic reading. Not the model's
     latency, which rides on :attr:`metering`."""
+
+    trace_id: str
+    """The id every log record from this run carries. Returned so the worker can put it on
+    an SQS batch-item failure, where the log line and the failed message meet."""
 
     @property
     def dispatched(self) -> bool:
@@ -230,6 +260,20 @@ class QualificationPipeline:
             delivery was a repeat of one already routed and nothing was done — no model
             call, no email, no second row.
         """
+        trace_id = ensure_trace_id(request.trace_id)
+        with log_context(
+            trace_id=trace_id,
+            tenant_id=request.tenant_id,
+            submission_id=request.submission_id,
+        ):
+            return self._qualify(request, trace_id)
+
+    def _qualify(self, request: QualificationRequest, trace_id: str) -> QualificationResult:
+        """The body of :meth:`qualify`, inside the trace context it binds.
+
+        Split out rather than indenting the whole method under a ``with``: the sequence of
+        steps is the readable thing about this code, and the binding is not one of them.
+        """
         started_ms = self._clock.monotonic_ms()
         config = self._config_source.get(request.tenant_id)
         lead = self._store.upsert_lead(
@@ -246,9 +290,10 @@ class QualificationPipeline:
         if not lead.is_new and self._store.already_routed(
             tenant_id=request.tenant_id, lead_id=lead.lead_id
         ):
-            return self._result(
+            duplicate = self._result(
                 request=request,
                 lead=lead,
+                trace_id=trace_id,
                 disposition=Disposition.DUPLICATE,
                 decision=None,
                 destination=None,
@@ -258,11 +303,32 @@ class QualificationPipeline:
                 metering=None,
                 started_ms=started_ms,
             )
+            log_lead_duplicate(
+                LOGGER,
+                tenant_id=request.tenant_id,
+                lead_id=lead.lead_id,
+                latency_ms=duplicate.latency_ms,
+            )
+            return duplicate
 
         enrichment = self._enrich(request)
         rendered = render_lead_detailed(request.submission)
         outcome = self._assess(config, _compose_user_turn(enrichment, rendered.text))
         decision = self._decide(outcome, config)
+
+        # Before the branch, so that `Assessments` by `Tier` is the distribution over every
+        # decision rather than over the ones that happened to be emailed. That completeness
+        # is the whole basis of plan section 8's tier-distribution drift signal.
+        log_assessment(
+            LOGGER,
+            tenant_id=request.tenant_id,
+            lead_id=lead.lead_id,
+            decision=decision,
+            metering=outcome.metering,
+            assessed=outcome.ok,
+            confidence=outcome.assessment.confidence if outcome.ok else None,
+            enrichment_available=enrichment.available,
+        )
 
         self._store.record_assessment(
             tenant_id=request.tenant_id,
@@ -286,9 +352,10 @@ class QualificationPipeline:
                 occurred_at=self._clock.now(),
                 detail=decision.note,
             )
-            return self._result(
+            suppressed = self._result(
                 request=request,
                 lead=lead,
+                trace_id=trace_id,
                 disposition=Disposition.SUPPRESSED,
                 decision=decision,
                 destination=None,
@@ -298,6 +365,14 @@ class QualificationPipeline:
                 metering=outcome.metering,
                 started_ms=started_ms,
             )
+            log_lead_suppressed(
+                LOGGER,
+                tenant_id=request.tenant_id,
+                lead_id=lead.lead_id,
+                decision=decision,
+                latency_ms=suppressed.latency_ms,
+            )
+            return suppressed
 
         destination, used_fallback = self._destination_for(config, decision)
         try:
@@ -311,6 +386,14 @@ class QualificationPipeline:
             )
         except Exception as error:
             self._record_failed_dispatch(request, lead, decision, destination, error)
+            log_dispatch_failed(
+                LOGGER,
+                tenant_id=request.tenant_id,
+                lead_id=lead.lead_id,
+                tier=decision.tier,
+                destination=destination,
+                error=error,
+            )
             raise
 
         self._store.record_routing_event(
@@ -323,9 +406,10 @@ class QualificationPipeline:
             occurred_at=self._clock.now(),
             detail=decision.note,
         )
-        return self._result(
+        dispatched = self._result(
             request=request,
             lead=lead,
+            trace_id=trace_id,
             disposition=Disposition.DISPATCHED,
             decision=decision,
             destination=destination,
@@ -335,6 +419,18 @@ class QualificationPipeline:
             metering=outcome.metering,
             started_ms=started_ms,
         )
+        log_lead_routed(
+            LOGGER,
+            tenant_id=request.tenant_id,
+            lead_id=lead.lead_id,
+            tier=decision.tier,
+            action=decision.action,
+            destination=destination,
+            used_fallback_destination=used_fallback,
+            provider_message_id=provider_message_id,
+            latency_ms=dispatched.latency_ms,
+        )
+        return dispatched
 
     # ------------------------------------------------------------------------- steps
 
@@ -435,6 +531,7 @@ class QualificationPipeline:
         *,
         request: QualificationRequest,
         lead: StoredLead,
+        trace_id: str,
         disposition: Disposition,
         decision: RoutingDecision | None,
         destination: str | None,
@@ -457,6 +554,7 @@ class QualificationPipeline:
             is_new_lead=lead.is_new,
             metering=metering,
             latency_ms=max(0, self._clock.monotonic_ms() - started_ms),
+            trace_id=trace_id,
         )
 
 
