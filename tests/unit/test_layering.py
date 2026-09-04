@@ -104,19 +104,29 @@ def _imported_paths(path: Path) -> set[str]:
     return names
 
 
-def test_only_the_ses_adapter_imports_boto3() -> None:
-    """``CLAUDE.md``: one file per external system, and ``boto3`` belongs to that one.
+def test_only_named_adapters_import_boto3() -> None:
+    """``CLAUDE.md``: one file per external system, and ``boto3`` belongs to those files.
 
-    Stated separately from the rule above because it binds the *adapters* too: SES is
-    reached from ``adapters/notify_ses.py`` and nowhere else, so swapping email for a Slack
-    notifier is a wiring change and an operator can find every AWS call by opening one file.
+    Stated separately from the rule above because it binds the *adapters* too. The
+    allowlist is per AWS service rather than a blanket "adapters may use boto3": SES is
+    reached from one file and SQS from one file, so swapping email for a Slack notifier,
+    or the queue for something else, stays a wiring change - and an operator can still
+    find every call to a given AWS service by opening a single module.
+
+    Adding a name here should be a deliberate act with a service behind it.
     """
-    owner = "adapters/notify_ses.py"
-    assert "boto3" in imported_modules(SRC / owner), "the adapter is supposed to own the SDK"
+    owners = {
+        "adapters/notify_ses.py": "SES",
+        "adapters/queue_sqs.py": "SQS",
+    }
+    for owner, service in owners.items():
+        assert "boto3" in imported_modules(SRC / owner), (
+            f"{owner} is supposed to own the {service} client"
+        )
     for path in python_sources():
         relative = path.relative_to(SRC).as_posix()
-        if relative == owner:
+        if relative in owners:
             continue
         assert "boto3" not in imported_modules(path), (
-            f"{relative} imports boto3; AWS belongs in {owner} alone"
+            f"{relative} imports boto3; AWS access belongs in {sorted(owners)} alone"
         )

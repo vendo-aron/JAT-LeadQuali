@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  JAT-LeadQuali: API Gateway + ingest Lambda -> SQS -> qualification worker.
+  The queue is what lets a form post return in under 200 ms while a Claude call that
+  takes several seconds happens elsewhere, and it is where "a lead is never silently
+  dropped" stops being a principle and becomes infrastructure.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage. Also the API Gateway stage name.
+  WorkerTimeoutSeconds:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    MaxValue: 600
+    Description: >
+      Worker Lambda timeout. Must comfortably exceed one Claude call with adaptive
+      thinking at max_tokens 8000, plus enrichment, plus the database writes. The
+      Anthropic client is built with its own 120 s timeout, so this is that plus headroom
+      rather than an independent guess.
+  WorkerReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: >
+      Hard cap on concurrent workers. This is the Postgres decision's bill (plan section
+      4): each container holds one connection, so this number is the worst-case
+      connection count against RDS Proxy. Raising it without raising the database's
+      connection budget is how a burst of leads takes the database down. Owned with #27.
+  IngestCredentialsSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN for the per-tenant ingest credentials JSON. An ARN, never the
+      value: a secret passed as a template parameter shows up in the stack's Parameters
+      tab, in drift detection, and in any CI log that echoes the deploy command.
+  AnthropicApiKeySecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the Anthropic API key.
+  DatabaseUrlSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the SQLAlchemy database URL.
+  FeedbackTokenSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN for the feedback-link signing secret. Distinct from any ingest
+      signing secret: one key, one purpose.
+  SesSender:
+    Type: String
+    Description: Verified SES sender address (docs/runbooks/ses-setup.md).
+  SesConfigurationSet:
+    Type: String
+    Default: ""
+    Description: SES configuration set for bounce and complaint tracking. Optional.
+  EscalationDestination:
+    Type: String
+    Description: >
+      Last-resort address for an escalated lead whose tenant has no destination for the
+      tier it landed in. Required, because an escalation with nowhere to go is a dropped
+      lead by another name (#14).
+  FeedbackTokenTtlDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: How long a one-click feedback link stays valid.
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Private subnets for the worker (#27). Empty deploys it outside a VPC, which works
+      only against a publicly reachable database - fine for dev, never for prod.
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Security groups for the worker (#27).
+
+Conditions:
+  InVpc: !Not [!Equals [!Join ["", !Ref VpcSubnetIds], ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        ENV: !Ref Stage
+        LOG_LEVEL: INFO
+
+Resources:
+  LeadDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "leadquali-${Stage}-leads-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  LeadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "leadquali-${Stage}-leads"
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt LeadDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "leadquali-${Stage}-ingest"
+      CodeUri: ../
+      Handler: leadquali.api.handlers.ingest_handler
+      MemorySize: 512
+      Timeout: 10
+      Environment:
+        Variables:
+          LEAD_QUEUE_URL: !Ref LeadQueue
+          INGEST_CREDENTIALS_SECRET_ARN: !Ref IngestCredentialsSecretArn
+          DATABASE_URL_SECRET_ARN: !Ref DatabaseUrlSecretArn
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt LeadQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref IngestCredentialsSecretArn
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DatabaseUrlSecretArn
+      Events:
+        Ingest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LeadApi
+            Path: /leads
+            Method: post
+        Health:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LeadApi
+            Path: /health
+            Method: get
+        Feedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LeadApi
+            Path: /feedback/{token}
+            Method: any
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "leadquali-${Stage}-worker"
+      CodeUri: ../
+      Handler: leadquali.api.worker.lambda_handler
+      MemorySize: 1024
+      Timeout: !Ref WorkerTimeoutSeconds
+      ReservedConcurrentExecutions: !Ref WorkerReservedConcurrency
+      VpcConfig: !If
+        - InVpc
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          ANTHROPIC_API_KEY_SECRET_ARN: !Ref AnthropicApiKeySecretArn
+          DATABASE_URL_SECRET_ARN: !Ref DatabaseUrlSecretArn
+          FEEDBACK_TOKEN_SECRET_ARN: !Ref FeedbackTokenSecretArn
+          SES_SENDER: !Ref SesSender
+          SES_CONFIGURATION_SET: !Ref SesConfigurationSet
+          ESCALATION_DESTINATION: !Ref EscalationDestination
+          FEEDBACK_TOKEN_TTL_DAYS: !Ref FeedbackTokenTtlDays
+          FEEDBACK_BASE_URL: !Sub "https://${LeadApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AnthropicApiKeySecretArn
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DatabaseUrlSecretArn
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref FeedbackTokenSecretArn
+        - SESCrudPolicy:
+            IdentityName: !Ref SesSender
+        - VPCAccessPolicy: {}
+      Events:
+        Leads:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt LeadQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  MigrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "leadquali-${Stage}-migrate"
+      CodeUri: ../
+      Handler: leadquali.api.migrate.lambda_handler
+      MemorySize: 512
+      Timeout: 300
+      VpcConfig: !If
+        - InVpc
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          DATABASE_URL_SECRET_ARN: !Ref DatabaseUrlSecretArn
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DatabaseUrlSecretArn
+        - VPCAccessPolicy: {}
+
+  LeadApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency_ms":"$context.responseLatency"}
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/leadquali-${Stage}"
+      RetentionInDays: 30
+
+Outputs:
+  IngestUrl:
+    Description: The endpoint the website form posts to (#30's cutover runbook).
+    Value: !Sub "https://${LeadApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/leads"
+  QueueUrl:
+    Value: !Ref LeadQueue
+  DeadLetterQueueArn:
+    Description: Watched by #29's DLQ-depth alarm.
+    Value: !GetAtt LeadDeadLetterQueue.Arn
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+  MigrationFunctionName:
+    Description: Invoke once per deploy, before traffic, to run alembic upgrade head.
+    Value: !Ref MigrationFunction
