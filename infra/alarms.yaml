@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  JAT-LeadQuali alarms and dashboard. Deployed after the application stack, because every
+  alarm names a resource that stack creates. Kept separate for the same reason #27's
+  network is separate: alarm thresholds are tuned by an operator on a different cadence
+  from application deploys, and a threshold change should not be able to replace a Lambda.
+
+  Every metric name here comes from docs/observability.md, which #21 owns. A test
+  cross-checks them against leadquali.observability.metrics, so a typo fails the build
+  rather than producing an alarm that silently never fires - the worst possible outcome
+  for monitoring, because it looks like health.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  AlarmEmail:
+    Type: String
+    Description: >
+      Where alarms go. A deploy-time fact, not a code fact. An alarm with no subscriber is
+      a dashboard widget nobody sees at 3am.
+    AllowedPattern: ".+@.+\\..+"
+  DeadLetterQueueName:
+    Type: String
+    Description: From the application stack's DeadLetterQueueArn output.
+  LeadQueueName:
+    Type: String
+  WorkerFunctionName:
+    Type: String
+  IngestFunctionName:
+    Type: String
+  DatabaseIdentifier:
+    Type: String
+    Description: From the network stack. Empty skips the database alarms.
+    Default: ""
+  DatabaseConnectionBudget:
+    Type: Number
+    Default: 84
+    Description: >
+      #27's arithmetic: floor(max_connections 112 x proxy share 75%) = 84. Alarming at the
+      budget rather than at max_connections leaves the operator's psql session room to
+      diagnose the problem.
+  DailyCostBaselineUsd:
+    Type: Number
+    Default: 1.0
+    Description: >
+      Expected daily model spend. Plan section 8 estimates ~$25/month at 1,000
+      leads/month, so ~$0.83/day; 1.0 rounds up. The alarm fires at twice this.
+  MinimumLeadsForRateAlarms:
+    Type: Number
+    Default: 20
+    Description: >
+      Denominator floor for ratio alarms. A 5% failure rate on the first lead of the
+      morning is one lead, and an alarm that cries wolf at 07:05 every day trains people
+      to ignore it - which is worse than not having it at all.
+  TierDriftBandStartDate:
+    Type: String
+    Default: ""
+    Description: >
+      Leave empty for the first week. The hot-share alarm needs a 7-day baseline that
+      cannot exist on day one; until then it is created DISABLED rather than firing on
+      noise or, worse, sitting green against a baseline of nothing.
+
+Conditions:
+  HasDatabase: !Not [!Equals [!Ref DatabaseIdentifier, ""]]
+  TierBandReady: !Not [!Equals [!Ref TierDriftBandStartDate, ""]]
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "leadquali-${Stage}-alarms"
+      DisplayName: !Sub "LeadQuali ${Stage} alarms"
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ------------------------------------------------------------------- 1. the backstop
+
+  DeadLetterQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-dlq-not-empty"
+      AlarmDescription: >
+        A lead reached the dead-letter queue. Every other alarm is an early warning; this
+        one means a lead has already failed three times and is sitting unqualified.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Ref DeadLetterQueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      # notBreaching: no data means no messages, which is the good case. This is the one
+      # alarm where missing data is genuinely reassuring.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # --------------------------------------------------------- 2. dispatch failures
+
+  DispatchFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-dispatch-failures"
+      AlarmDescription: >
+        A qualified lead could not be delivered to sales. SQS will redeliver, but a
+        sustained failure means the routing email is not arriving.
+      Namespace: LeadQuali
+      MetricName: DispatchFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ------------------------------------- 3. assessment failure rate, with a floor
+
+  AssessmentFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-assessment-failure-rate"
+      AlarmDescription: >
+        More than 5% of assessments failed over 15 minutes, on at least a floor of leads.
+        Group by EscalationReason on the dashboard: a rise in api_error is operational, a
+        rise in model_refusal is a change in the traffic.
+      Metrics:
+        - Id: failures
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: AssessmentFailures
+            Period: 900
+            Stat: Sum
+        - Id: total
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: Assessments
+            Period: 900
+            Stat: Sum
+        # The floor is the point. Without `IF(total >= floor, ...)` this fires on the
+        # first failed lead of a quiet morning, when the rate is 1/1 = 100%.
+        - Id: rate
+          Label: Assessment failure rate (floored)
+          Expression: !Sub "IF(total >= ${MinimumLeadsForRateAlarms}, 100*failures/total, 0)"
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ------------------------------------------------- 3b. the pipeline has stopped
+
+  NoLeadsAssessedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-pipeline-silent"
+      AlarmDescription: >
+        No lead has been assessed for an hour during the working day. This is the alarm
+        that catches a broken queue, a wedged worker, or a form that stopped posting -
+        none of which produce errors, because nothing is running to produce them.
+      Namespace: LeadQuali
+      MetricName: Assessments
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # breaching, deliberately and unlike every other alarm here: for THIS metric,
+      # missing data IS the outage. An alarm that goes INSUFFICIENT_DATA instead of ALARM
+      # is how a silent pipeline survives a weekend.
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # ------------------------------------------------------------------ 4. latency
+
+  ModelLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-model-latency-p99"
+      AlarmDescription: >
+        p99 of the Claude call itself. Read beside the pipeline p99 on the dashboard: if
+        both rise together it is Anthropic, if only the pipeline rises it is us.
+      Namespace: LeadQuali
+      MetricName: ModelLatencyMs
+      ExtendedStatistic: p99
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  PipelineLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-pipeline-latency-p99"
+      AlarmDescription: p99 of the whole qualification, model call included.
+      Namespace: LeadQuali
+      MetricName: PipelineLatencyMs
+      ExtendedStatistic: p99
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 90000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # --------------------------------------------------------------------- 5. spend
+
+  DailySpendAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-daily-spend"
+      AlarmDescription: >
+        Daily model spend above twice the expected baseline. Usually a traffic spike or a
+        prompt that grew; occasionally a loop.
+      Namespace: LeadQuali
+      MetricName: CostUsd
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref DailyCostBaselineUsd
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  CacheReadsCollapsedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-cache-reads-collapsed"
+      AlarmDescription: >
+        Cache reads fell to zero across a whole day while leads were still being assessed.
+        Something volatile has leaked into the cacheable prompt prefix - the cost model in
+        plan section 8 no longer holds, and nothing else will tell you.
+      Metrics:
+        - Id: reads
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: CacheReadTokens
+            Period: 86400
+            Stat: Sum
+        - Id: assessed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: Assessments
+            Period: 86400
+            Stat: Sum
+        # Only meaningful when leads actually flowed: zero reads on a zero-lead day is
+        # not a caching problem, it is a quiet day, and NoLeadsAssessedAlarm owns that.
+        - Id: reads_per_lead
+          Label: Cache-read tokens per assessed lead
+          Expression: "IF(assessed > 0, reads/assessed, 1000)"
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------- 6. tier drift
+
+  HotShareDriftAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: TierBandReady
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-hot-share-drift"
+      AlarmDescription: >
+        The share of leads scored hot moved sharply. Plan section 8 calls this the leading
+        indicator that a prompt or the upstream form changed - a sudden jump is rarely a
+        great sales week. Valid because Assessments is emitted before the
+        suppress/dispatch branch, so it counts decisions rather than dispatches.
+      Metrics:
+        - Id: hot
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: Assessments
+              Dimensions:
+                - Name: Tier
+                  Value: hot
+            Period: 3600
+            Stat: Sum
+        - Id: all_tiers
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: Assessments
+            Period: 3600
+            Stat: Sum
+        - Id: hot_share
+          Label: Hot share (%)
+          Expression: !Sub "IF(all_tiers >= ${MinimumLeadsForRateAlarms}, 100*hot/all_tiers, 0)"
+          ReturnData: true
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 40
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ---------------------------------------------------------------- 7. enrichment
+
+  EnrichmentUnavailableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-enrichment-unavailable"
+      AlarmDescription: >
+        Enrichment failed for more than 10% of leads in an hour. #18's failure mode is
+        invisible by design - the pipeline degrades rather than failing - so without this
+        alarm every lead is silently enriched with nothing. In a VPC the usual cause is
+        DNS: see #27's resolver egress rules.
+      Metrics:
+        - Id: unavailable
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: EnrichmentUnavailable
+            Period: 3600
+            Stat: Sum
+        - Id: assessed_hour
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: LeadQuali
+              MetricName: Assessments
+            Period: 3600
+            Stat: Sum
+        - Id: unavailable_share
+          Label: Enrichment unavailable (%)
+          Expression: !Sub "IF(assessed_hour >= ${MinimumLeadsForRateAlarms}, 100*unavailable/assessed_hour, 0)"
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ------------------------------------------------------ 9. database connections
+
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDatabase
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-database-connections"
+      AlarmDescription: >
+        Connections approached #27's budget of 84 of 112. Deferred here by #27 on purpose.
+        Alarming at the budget rather than at max_connections leaves an operator room to
+        open psql and find out what is holding them.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseIdentifier
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref DatabaseConnectionBudget
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ------------------------------------------------------------- Lambda errors
+
+  WorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-worker-errors"
+      AlarmDescription: Unhandled worker errors - distinct from a handled assessment failure.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  IngestErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "leadquali-${Stage}-ingest-errors"
+      AlarmDescription: >
+        Errors on the public edge. Every one of these is a form post that did not get a
+        202, which the visitor may well read as "the form is broken".
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ------------------------------------------------------------------- dashboard
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "leadquali-${Stage}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,
+             "properties":{"title":"Queue depth and dead letters (look here first)",
+               "region":"${AWS::Region}","stat":"Maximum","period":300,
+               "metrics":[
+                 ["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${LeadQueueName}",{"label":"queued"}],
+                 ["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${DeadLetterQueueName}",{"label":"dead letters"}]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,
+             "properties":{"title":"p99 latency: model vs whole pipeline (the gap is the diagnosis)",
+               "region":"${AWS::Region}","stat":"p99","period":300,
+               "metrics":[
+                 ["LeadQuali","ModelLatencyMs",{"label":"model"}],
+                 ["LeadQuali","PipelineLatencyMs",{"label":"pipeline"}]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,
+             "properties":{"title":"Tier distribution (drift = prompt or form changed)",
+               "region":"${AWS::Region}","stat":"Sum","period":3600,"view":"timeSeries","stacked":true,
+               "metrics":[
+                 ["LeadQuali","Assessments","Tier","hot"],
+                 ["LeadQuali","Assessments","Tier","warm"],
+                 ["LeadQuali","Assessments","Tier","cold"],
+                 ["LeadQuali","Assessments","Tier","disqualified"]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,
+             "properties":{"title":"Daily spend and cache reads",
+               "region":"${AWS::Region}","stat":"Sum","period":86400,
+               "metrics":[
+                 ["LeadQuali","CostUsd",{"label":"USD/day"}],
+                 ["LeadQuali","CacheReadTokens",{"label":"cache-read tokens","yAxis":"right"}]]}},
+            {"type":"metric","x":0,"y":12,"width":12,"height":6,
+             "properties":{"title":"Failures and escalations",
+               "region":"${AWS::Region}","stat":"Sum","period":900,
+               "metrics":[
+                 ["LeadQuali","AssessmentFailures"],
+                 ["LeadQuali","DispatchFailures"],
+                 ["LeadQuali","Escalations"],
+                 ["LeadQuali","EnrichmentUnavailable"]]}},
+            {"type":"metric","x":12,"y":12,"width":12,"height":6,
+             "properties":{"title":"Suppressions by cause (spam and low-score have different owners)",
+               "region":"${AWS::Region}","stat":"Sum","period":86400,
+               "metrics":[
+                 ["LeadQuali","Suppressions","SuppressionCause","spam"],
+                 ["LeadQuali","Suppressions","SuppressionCause","below_threshold"],
+                 ["LeadQuali","Duplicates"],
+                 ["LeadQuali","FallbackDestinations"]]}}
+          ]
+        }
+
+Outputs:
+  AlarmTopicArn:
+    Description: Subscribe a pager here as well as the email, before cutover (#30).
+    Value: !Ref AlarmTopic
+  DashboardName:
+    Value: !Ref Dashboard
