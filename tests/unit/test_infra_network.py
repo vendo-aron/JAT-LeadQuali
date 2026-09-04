@@ -407,16 +407,22 @@ def test_every_function_that_touches_postgres_has_a_concurrency_cap(
     the feedback links in `api/feedback.py` — so an uncapped ingest is an uncapped
     connection count no matter what the worker is set to.
     """
+    checked = 0
     for logical_id, resource in resources(application).items():
         if resource.get("Type") != "AWS::Serverless::Function":
             continue
         properties = resource["Properties"]
         env = properties.get("Environment", {}).get("Variables", {})
-        if "DATABASE_URL_SECRET_ARN" not in env:
+        if "DATABASE_SECRET_ARN" not in env:
             continue
+        checked += 1
         assert "ReservedConcurrentExecutions" in properties, (
             f"{logical_id} connects to Postgres with no cap on how many of it exist"
         )
+    assert checked == 3, (
+        "no function matched: the marker this loop selects on has been renamed, and the "
+        "test is passing by examining nothing"
+    )
 
 
 def test_every_function_that_touches_postgres_is_in_the_vpc(
@@ -428,17 +434,20 @@ def test_every_function_that_touches_postgres_is_in_the_vpc(
     a `VpcConfig` fails on its first query, which for the ingest function is the first
     lead the site ever posts.
     """
+    checked = 0
     for logical_id, resource in resources(application).items():
         if resource.get("Type") != "AWS::Serverless::Function":
             continue
         properties = resource["Properties"]
         env = properties.get("Environment", {}).get("Variables", {})
-        if "DATABASE_URL_SECRET_ARN" not in env:
+        if "DATABASE_SECRET_ARN" not in env:
             continue
+        checked += 1
         vpc = properties.get("VpcConfig")
         assert vpc is not None, f"{logical_id} reads Postgres from outside the VPC"
         assert vpc["Fn::If"][0] == "InVpc"
         assert vpc["Fn::If"][1]["SubnetIds"] == {"Fn::Ref": "VpcSubnetIds"}
+    assert checked == 3, "no function matched; see the note in the test above"
 
 
 def test_migrations_run_one_at_a_time(application: dict[str, Any]) -> None:

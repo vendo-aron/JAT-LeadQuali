@@ -108,7 +108,15 @@ _PIPELINE: Any = None
 
 
 def _build_pipeline() -> Any:  # pragma: no cover - requires AWS and a database
-    """Wire the real adapters. Deliberately not run in tests: every line needs a service."""
+    """Wire the real adapters. Deliberately not run in tests: every line needs a service.
+
+    This is also where the container's secrets are resolved (#28). Each ``require_*``
+    below reads Secrets Manager once and the resolver caches the value for
+    ``SECRETS_CACHE_TTL_SECONDS``, so a warm container pays nothing per lead and a
+    rotation is picked up within the TTL without a redeploy. A secret that cannot be read
+    raises here, before the pipeline exists, which is deliberate: the alternative is a
+    worker that starts and then escalates every lead it is handed.
+    """
     from leadquali.adapters.clock_system import SystemClock
     from leadquali.adapters.enrich_null import NullEnricher
     from leadquali.adapters.llm_anthropic import AnthropicLeadAssessor, build_anthropic_client

@@ -118,6 +118,11 @@ def test_only_named_adapters_import_boto3() -> None:
     owners = {
         "adapters/notify_ses.py": "SES",
         "adapters/queue_sqs.py": "SQS",
+        # Secrets Manager is its own entry rather than a general "adapters may use boto3"
+        # widening, and it is the one that matters most: the whole value of #28's
+        # resolution layer is that there is exactly one place a secret is read from AWS,
+        # so an audit of "what can this deployment decrypt" is one file long.
+        "adapters/secrets_manager.py": "Secrets Manager",
     }
     for owner, service in owners.items():
         assert "boto3" in imported_modules(SRC / owner), (
@@ -130,3 +135,23 @@ def test_only_named_adapters_import_boto3() -> None:
         assert "boto3" not in imported_modules(path), (
             f"{relative} imports boto3; AWS access belongs in {sorted(owners)} alone"
         )
+
+
+def test_config_does_not_import_the_aws_sdk_at_module_scope() -> None:
+    """``leadquali.config`` resolves secrets from AWS without importing ``boto3``.
+
+    The rule above already forbids ``import boto3`` here. This is the other half of it:
+    ``config`` must not import the *adapter* at module scope either, because that pulls
+    the SDK into the import graph of every process that reads a setting — a CLI run, a
+    unit test, a developer with a ``.env`` and no AWS account. The import belongs inside
+    ``Settings.secret_resolver``, which is only called when an ARN is actually configured.
+    """
+    tree = ast.parse((SRC / "config.py").read_text(encoding="utf-8"))
+    module_scope = {
+        node.module for node in tree.body if isinstance(node, ast.ImportFrom) and node.module
+    } | {alias.name for node in tree.body if isinstance(node, ast.Import) for alias in node.names}
+    leaked = {name for name in module_scope if name.startswith("leadquali.adapters")}
+    assert not leaked, f"config.py imports {sorted(leaked)} at module scope"
+    assert "leadquali.adapters.secrets_manager" in _imported_paths(SRC / "config.py"), (
+        "config.py is supposed to reach the resolver lazily; if this moved, move the test"
+    )

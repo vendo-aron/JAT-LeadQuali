@@ -773,6 +773,169 @@ Resources:
         SessionPinningFilters:
           - EXCLUDE_VARIABLE_SETS
 
+  # ---------------------------------------------------------------------------------
+  # Application secrets (#28)
+  #
+  # They live in this stack rather than in infra/template.yaml for the reason stated at
+  # the top of this file: the application stack is deployed on every merge, and a stack
+  # that is deployed twenty times a week must not be able to replace a secret. Their ARNs
+  # are Outputs here and Parameters there, which is the seam #26 already built.
+  #
+  # Three different origins, and the difference is the whole design:
+  #
+  #   created and generated  FeedbackTokenSecret. Opaque random material with exactly one
+  #                          holder (us), so CloudFormation can mint it and no human ever
+  #                          has to see it. GenerateSecretString runs at create only —
+  #                          never on an update — so a later edit to this template cannot
+  #                          silently roll the key and invalidate every live feedback link.
+  #   created without a value IngestCredentialsSecret. The value is a per-tenant map, half
+  #                          of which is shared with a customer's website, so it is written
+  #                          by tenant onboarding (#31) and never by this template. Created
+  #                          empty precisely so that CloudFormation has no SecretString to
+  #                          overwrite: a template that carried a placeholder would wipe
+  #                          every tenant's credentials the first time someone edited the
+  #                          resource's description. Until onboarding writes it, the ingest
+  #                          function fails at cold start with the ARN in the message,
+  #                          which is the correct behaviour for a system with no tenants.
+  #   referenced only        The Anthropic API key. It comes from the Anthropic console, so
+  #                          a human creates it per #43's runbook and hands the ARN to the
+  #                          application stack's AnthropicApiKeySecretArn parameter. Create
+  #                          it with the KMS key below, or the functions cannot decrypt it.
+  #
+  # The database credentials are a fourth case and are not here either: RDS owns them
+  # (ManageMasterUserPassword above), generates them, rotates them, and exports the ARN as
+  # DatabaseMasterUserSecretArn. #28 assembles DATABASE_URL from that secret plus
+  # DatabaseEndpoint rather than storing a second copy of a password RDS is rotating.
+  # ---------------------------------------------------------------------------------
+  SecretsKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "leadquali-${Stage} application secrets"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Sub "leadquali-${Stage}-secrets-key"
+        Statement:
+          # A second CMK rather than reusing DatabaseKmsKey, at $1/month. Three reasons,
+          # in order of weight:
+          #
+          # (1) The Deny below can exist here and could never exist there. This key is
+          #     usable *only* through Secrets Manager; the RDS key must be usable by the
+          #     RDS service itself to encrypt volumes and snapshots, so the same statement
+          #     would break the database.
+          # (2) Blast radius. Granting a Lambda role kms:Decrypt on the RDS key would let
+          #     a compromised function decrypt a copied snapshot — the entire lead table,
+          #     personal data included — rather than one API key.
+          # (3) Lifecycle. Deleting the RDS key destroys every snapshot taken with it,
+          #     which is why it is Retain; the secrets key has no such coupling, and
+          #     "revoke access to the secrets" should not be a decision about backups.
+          #
+          # Who can decrypt, stated plainly: any IAM principal in this account that has
+          # been granted kms:Decrypt in its own identity policy, and only when the call
+          # goes through Secrets Manager. In this system that is exactly the three
+          # functions in infra/template.yaml, each of which can additionally only call
+          # GetSecretValue on the ARNs its own policies name.
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: DenyUseOutsideSecretsManager
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:ReEncrypt*
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+
+  SecretsKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/leadquali-${Stage}-secrets"
+      TargetKeyId: !Ref SecretsKmsKey
+
+  IngestCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "leadquali/${Stage}/ingest-credentials"
+      Description: >-
+        Per-tenant ingest API keys and HMAC signing secrets, as
+        {"<tenant_id>": {"api_key_sha256": "<64 hex>", "signing_secret": "..."}}.
+        Written by tenant onboarding, never by CloudFormation. The api_key_sha256 field
+        is a hash: the key itself exists only in the customer's site configuration.
+      KmsKeyId: !Ref SecretsKmsKey
+
+  FeedbackTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "leadquali/${Stage}/feedback-token"
+      Description: >-
+        HMAC key for the one-click feedback links in #19's routing email. Must never be
+        one of the ingest signing secrets (#60): those are held by customers' websites,
+        and this one authorises writes to the training data. config.Settings enforces it.
+      KmsKeyId: !Ref SecretsKmsKey
+      GenerateSecretString:
+        # 64 characters against a 32-character minimum (app/feedback.MIN_TOKEN_SECRET_CHARS),
+        # and punctuation excluded so the value survives being pasted into a shell for a
+        # local reproduction without quoting games. At 62 characters of alphabet that is
+        # ~380 bits, far past what HMAC-SHA256 can use.
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # Resource policies. The identity side of least privilege lives in the application
+  # template — each function is granted GetSecretValue on its own ARNs and no others, so
+  # the ingest function cannot read the Anthropic key and the worker cannot read the
+  # ingest credentials. What an identity policy cannot express is the account boundary,
+  # because it is written by whoever holds the role rather than by whoever owns the
+  # secret. That is what these add, and it is why they are Deny: a resource policy that
+  # only allowed would be additive to IAM and would forbid nothing.
+  IngestCredentialsSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref IngestCredentialsSecret
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyPrincipalsOutsideThisAccount
+            Effect: Deny
+            Principal: "*"
+            Action: "secretsmanager:*"
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
+  FeedbackTokenSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref FeedbackTokenSecret
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyPrincipalsOutsideThisAccount
+            Effect: Deny
+            Principal: "*"
+            Action: "secretsmanager:*"
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
 Outputs:
   VpcId:
     Description: For anything later that needs to attach to this network.
@@ -833,3 +996,20 @@ Outputs:
     Value: !Ref DatabaseProxy
   DatabaseKmsKeyArn:
     Value: !GetAtt DatabaseKmsKey.Arn
+  SecretsKmsKeyArn:
+    Description: >-
+      The key every application secret is encrypted with. Create the Anthropic API key
+      secret (#43) with this key, or the functions will get an AccessDenied on decrypt.
+    Value: !GetAtt SecretsKmsKey.Arn
+    Export:
+      Name: !Sub "leadquali-${Stage}-secrets-key-arn"
+  IngestCredentialsSecretArn:
+    Description: The application stack's IngestCredentialsSecretArn parameter.
+    Value: !Ref IngestCredentialsSecret
+    Export:
+      Name: !Sub "leadquali-${Stage}-ingest-credentials-secret-arn"
+  FeedbackTokenSecretArn:
+    Description: The application stack's FeedbackTokenSecretArn parameter.
+    Value: !Ref FeedbackTokenSecret
+    Export:
+      Name: !Sub "leadquali-${Stage}-feedback-token-secret-arn"
