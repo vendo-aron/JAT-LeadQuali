@@ -101,7 +101,10 @@ def test_no_secret_is_a_plaintext_parameter_or_environment_variable(
     for resource in _resources(template).values():
         env = resource.get("Properties", {}).get("Environment", {}).get("Variables", {})
         for key, value in env.items():
-            if key.endswith("_TTL_DAYS"):
+            # A duration cannot carry a secret. FEEDBACK_TOKEN_TTL_DAYS contains "token"
+            # and SECRETS_CACHE_TTL_SECONDS contains "secret"; both are numbers of
+            # seconds or days. Same carve-out as the Number check on parameters above.
+            if key.endswith(("_TTL_DAYS", "_TTL_SECONDS")):
                 continue
             if any(word in key.lower() for word in secretish):
                 assert key.endswith("_SECRET_ARN"), (
