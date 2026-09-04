@@ -10,51 +10,17 @@ dead letter, a plaintext secret, a handler path that no longer matches the code.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
-TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "infra" / "template.yaml"
-
-
-class _SamLoader(yaml.SafeLoader):
-    """SafeLoader that tolerates CloudFormation's `!Ref`/`!Sub`/`!GetAtt` short forms."""
-
-
-def _tag(loader: yaml.Loader, tag_suffix: str, node: yaml.Node) -> dict[str, Any]:
-    if isinstance(node, yaml.ScalarNode):
-        value: Any = loader.construct_scalar(node)
-    elif isinstance(node, yaml.SequenceNode):
-        value = loader.construct_sequence(node, deep=True)
-    elif isinstance(node, yaml.MappingNode):
-        value = loader.construct_mapping(node, deep=True)
-    else:  # pragma: no cover - the three node kinds above are exhaustive in PyYAML
-        raise TypeError(f"unexpected node {type(node).__name__} for tag !{tag_suffix}")
-    return {f"Fn::{tag_suffix}": value}
-
-
-_SamLoader.add_multi_constructor("!", _tag)
+from tests.unit.cfn import APPLICATION_TEMPLATE_PATH, load_template
+from tests.unit.cfn import resources as _resources
 
 
 @pytest.fixture(scope="module")
 def template() -> dict[str, Any]:
-    # S506 is about untrusted YAML instantiating arbitrary objects. `_SamLoader` derives
-    # from `SafeLoader` and only adds constructors that turn CloudFormation's `!Ref`-style
-    # tags into plain dicts, and the input is a file from this repository.
-    loaded = yaml.load(
-        TEMPLATE_PATH.read_text(encoding="utf-8"),
-        Loader=_SamLoader,  # noqa: S506
-    )
-    assert isinstance(loaded, dict)
-    return loaded
-
-
-def _resources(template: dict[str, Any]) -> dict[str, Any]:
-    resources = template["Resources"]
-    assert isinstance(resources, dict)
-    return resources
+    return load_template(APPLICATION_TEMPLATE_PATH)
 
 
 def test_the_template_exists_and_is_a_sam_template(template: dict[str, Any]) -> None:

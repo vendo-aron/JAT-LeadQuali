@@ -1,0 +1,835 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  JAT-LeadQuali network and data tier (#27): VPC, private subnets, egress, RDS Postgres,
+  RDS Proxy. This is the bill for the Postgres decision (plan section 4) — an accepted
+  cost, priced in the comments below rather than discovered on an invoice.
+
+  Deployed as its own stack, separately from infra/template.yaml, for three reasons.
+  (1) #26 already made the subnets and security groups *parameters* of the application
+  template; honouring that seam is what this stack is for. (2) Lifecycle: the application
+  stack is deployed on every merge, and a stack that is deployed twenty times a week must
+  not be able to replace a database. Everything stateful lives here, behind Snapshot
+  deletion policies, and is touched deliberately. (3) Time: a NAT gateway and an RDS
+  Proxy take fifteen to twenty-five minutes to create. Coupling that to a two-minute
+  Lambda deploy makes every deploy slow and every rollback frightening.
+
+  Its Outputs are the application stack's Parameters. Deploy this first, once.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage. Must match the application stack's Stage.
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
+    Description: >
+      VPC address range. /16 is deliberate slack, not need: the workload is three Lambda
+      functions and a database, but resizing a VPC means rebuilding it.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium]
+    Description: >
+      Plan section 4 names db.t4g.micro. The allowed set is exactly the set of classes
+      whose max_connections is recorded in the InstanceCapacity mapping below, because the
+      connection arithmetic in this stack is only valid for a class it has a number for.
+  DbEngineVersion:
+    Type: String
+    Default: "16.4"
+    Description: >
+      Postgres major.minor. Its major version must match DbParameterGroupFamily; a
+      mismatch is rejected by RDS at create time and by tests/unit/test_infra_network.py
+      before that.
+  DbParameterGroupFamily:
+    Type: String
+    Default: postgres16
+    Description: Parameter group family. Tied to DbEngineVersion's major version.
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Initial gp3 storage in GiB. 20 is the RDS minimum.
+  DbMaxAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 4000
+    Description: >
+      Storage autoscaling ceiling. Leads are small rows; the ceiling exists so a runaway
+      write cannot fill the volume and take the database read-only at 3am.
+  DbBackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: >
+      Automated backup retention. MinValue is 1, not 0: zero disables automated backups
+      entirely, and this template must not be able to express that.
+  DbMultiAz:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Multi-AZ doubles the instance cost (see the cost note below) to remove an AZ failure
+      from the failure list. At hundreds of leads a day behind SQS, an AZ failure delays
+      qualification and drops nothing, so the default is off. Turn it on when a customer's
+      contract says so, not before.
+  EnableRdsProxy:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      RDS Proxy in front of the database. The default is "true" because #27 mandates it.
+      It is a parameter, and not a hardcoded resource, because it is the single most
+      expensive line in this stack (~$87.60/month — see the cost note) and its price is
+      set by a vCPU floor that has nothing to do with our volume. Turning it off points
+      the application at the instance endpoint instead; the connection arithmetic below
+      holds either way, because it is bounded by reserved concurrency, not by the proxy.
+  ProxyMaxConnectionsPercent:
+    Type: Number
+    Default: 75
+    MinValue: 10
+    MaxValue: 100
+    Description: >
+      Share of the database's max_connections that RDS Proxy may hold as backend
+      connections. Deliberately below 100: the migration Lambda connects directly (it must
+      not go through the proxy — see MigrationSecurityGroup), Postgres reserves
+      superuser_reserved_connections, and an operator with psql during an incident needs a
+      slot that a saturated proxy has not already taken.
+  ProxyMaxIdleConnectionsPercent:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    Description: >
+      Share of max_connections the proxy may keep idle for reuse. Idle backend
+      connections are what make a Lambda cold start cheap; keeping half the budget warm
+      is the trade this proxy exists to make.
+
+Mappings:
+  # max_connections per instance class, from the RDS Postgres default
+  # `LEAST({DBInstanceClassMemory/9531392}, 5000)`. These numbers are not left to that
+  # formula at runtime: DbParameterGroup below pins max_connections to exactly this value,
+  # so the number the arithmetic depends on is a number this template sets, not one a
+  # memory calculation happens to produce on the day. Pinning at or below the
+  # memory-derived default is safe; above it trades OOM for connections.
+  InstanceCapacity:
+    db.t4g.micro:   # 1 GiB
+      MaxConnections: "112"
+    db.t4g.small:   # 2 GiB
+      MaxConnections: "225"
+    db.t4g.medium:  # 4 GiB
+      MaxConnections: "450"
+
+Conditions:
+  ProxyEnabled: !Equals [!Ref EnableRdsProxy, "true"]
+  ProxyDisabled: !Equals [!Ref EnableRdsProxy, "false"]
+
+Resources:
+  # ---------------------------------------------------------------------------------
+  # Network
+  #
+  # EnableDnsSupport and EnableDnsHostnames are both required, and the first one is not
+  # optional in the way it looks. A Lambda in a private subnet resolves names through the
+  # Amazon-provided resolver at the VPC's base address plus two (and the link-local
+  # 169.254.169.253). That resolver only exists when EnableDnsSupport is true. Turn it
+  # off and every outbound lookup — Anthropic, SES, Secrets Manager — times out rather
+  # than failing fast; #18's enrichment circuit breaker opens, every lead is enriched with
+  # nothing, every lead is still delivered, and no alarm fires because nothing errored.
+  # That is the specific silent failure this VPC is built to not have.
+  #
+  # Note that DNS *resolution* does not traverse the NAT gateway: the resolver is inside
+  # the VPC and reaches public DNS on its own. The NAT is for the HTTPS connection that
+  # follows the lookup. No Route 53 Resolver outbound endpoint is needed — that is for
+  # resolving on-premises names, which this workload has none of.
+  # ---------------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # The only public subnet, and the only thing in it is the NAT gateway.
+  # MapPublicIpOnLaunch is false so that anything else accidentally launched here is not
+  # reachable from the internet by default.
+  NatSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-nat"
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-private-a"
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-private-b"
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-nat"
+
+  # ---------------------------------------------------------------------------------
+  # Egress: one NAT gateway. The decision, and the arithmetic behind it.
+  #
+  # #27 states a preference for interface VPC endpoints over a NAT gateway. That
+  # preference was written before the worker's full egress list was traced through, and
+  # the arithmetic reverses it. The list is: Anthropic (api.anthropic.com), SES, Secrets
+  # Manager, CloudWatch Logs, X-Ray. Four of those five have interface endpoints. The
+  # first does not and never will — it is a third-party public API, so *some* route to the
+  # public internet is required no matter what. Endpoints are therefore not a substitute
+  # for the NAT here; they are an addition to it.
+  #
+  # us-east-1 list prices, 730 hours:
+  #
+  #   Option A — NAT only (chosen)
+  #     NAT gateway            730 h x $0.045/h            = $32.85
+  #     NAT data processing    ~0.05 GB x $0.045/GB        =  $0.01
+  #     Public IPv4 (EIP)      730 h x $0.005/h            =  $3.65
+  #                                                   total  ~$36.51/month
+  #
+  #   Option B — interface endpoints for the AWS services, plus NAT for Anthropic
+  #     4 endpoints x 2 AZs    8 x 730 h x $0.01/h         = $58.40
+  #     endpoint data          ~0.05 GB x $0.01/GB         =  $0.00
+  #     NAT gateway (still required for Anthropic)         = $36.51
+  #                                                   total  ~$94.91/month
+  #
+  # Option B costs 2.6x Option A and buys, at this volume, a few milliseconds off the
+  # Secrets Manager call on a cold start. It would win if the AWS-service traffic were
+  # large enough for endpoint data rates ($0.01/GB) to beat NAT processing ($0.045/GB) —
+  # the crossover is around 1.7 TB/month, and this workload moves about 50 MB. Option A.
+  #
+  # One NAT, not one per AZ. A second NAT in the other AZ costs another $36.51/month and
+  # removes one failure: an outage of the NAT's own AZ. What that failure actually does
+  # here is stop egress for the workers in both private subnets, which means Claude calls
+  # fail, which means SQS redelivers, which means leads queue up and are qualified when
+  # egress returns. Nothing is dropped — invariant 3 is held by the queue, not by the NAT.
+  # Paying $438/year to convert a delay into no delay is not the best available use of
+  # that money at this volume. Revisit if leads/day crosses the threshold in plan §12.
+  #
+  # Cross-AZ cost: traffic from PrivateSubnetB to the NAT in AZ A is billed at $0.01/GB
+  # each way. At ~50 MB/month that is under a cent.
+  # ---------------------------------------------------------------------------------
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref NatSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-nat"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-public"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  NatSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref NatSubnet
+
+  # One private route table shared by both private subnets, because there is one NAT.
+  # If a second NAT is ever added, this splits into one table per AZ — that is the change,
+  # and it is why the association resources are named per subnet already.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-private"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # ---------------------------------------------------------------------------------
+  # Security groups.
+  #
+  # Written as identities rather than addresses. Every rule that can name a security
+  # group names one, because "port 5432 from sg-lambda" keeps meaning the right thing
+  # after someone renumbers a subnet, and "port 5432 from 10.42.1.0/24" only happens to
+  # be right today. The two exceptions are the rules that genuinely are about addresses:
+  # HTTPS to the public internet, and DNS to the VPC resolver.
+  #
+  # The shape is a chain, and each link is one direction only:
+  #
+  #   LambdaSecurityGroup    --5432-->  ProxySecurityGroup  --5432-->  DatabaseSecurityGroup
+  #   MigrationSecurityGroup ------------------5432------------------>
+  #
+  # The worker and the ingest function share LambdaSecurityGroup and can reach the proxy
+  # and nothing else on 5432. They cannot reach the database directly. That is not
+  # decoration: the connection budget in this stack is enforced by the proxy's
+  # MaxConnectionsPercent, and a function that could open a direct connection could walk
+  # straight past it.
+  #
+  # The migration function gets its own group and is the only thing allowed to bypass the
+  # proxy, because a migration is exactly the workload RDS Proxy is bad at — one long
+  # session holding DDL locks and an advisory lock, which pins a backend connection for
+  # the duration and defeats multiplexing for everyone else. It runs once per deploy at a
+  # reserved concurrency of one, so it costs exactly one connection.
+  #
+  # DatabaseSecurityGroup has no CIDR ingress rule of any kind. There is no rule to get
+  # wrong, and PubliclyAccessible: false below means there is no public address to point
+  # one at either.
+  # ---------------------------------------------------------------------------------
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Postgres. Ingress only from the proxy and the migration function, both by group id.
+      VpcId: !Ref Vpc
+      # CloudFormation adds an allow-all egress rule to any security group that does not
+      # declare one, so this declares one. A database initiates nothing; the loopback
+      # destination is the conventional way to say "no egress" in CloudFormation, which
+      # has no way to express an empty egress list.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 127.0.0.1/32
+          Description: No egress. Postgres never initiates a connection.
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-db"
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Worker and ingest Lambda functions. Egress only: HTTPS out, DNS to the VPC
+        resolver, Postgres to the proxy.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: >-
+            HTTPS via the NAT gateway: api.anthropic.com, SES, Secrets Manager, CloudWatch
+            Logs, X-Ray. Anthropic is a third-party public endpoint with no fixed address
+            range, so this cannot be narrowed to a prefix list.
+        # The two DNS rules are the finding from #18 written as configuration. Egress
+        # rules apply to DNS queries as much as to anything else, so a security group
+        # locked to 443 resolves no names at all: every lookup times out, the enrichment
+        # circuit breaker opens, leads are enriched with nothing, and nothing errors
+        # loudly enough to page anyone. Both destinations are needed — the Amazon-provided
+        # resolver sits at the VPC base address plus two, and the link-local address is
+        # the alias for it.
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: DNS to the Amazon-provided resolver (VPC base + 2).
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: DNS over TCP, for responses that do not fit in a UDP datagram.
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 169.254.169.253/32
+          Description: DNS to the link-local resolver alias.
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 169.254.169.253/32
+          Description: DNS over TCP to the link-local resolver alias.
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-lambda"
+
+  MigrationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Migration Lambda. The only group permitted to reach Postgres directly, bypassing
+        the proxy, because alembic holds one long transaction and would pin a backend.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: Postgres, direct. One connection, reserved concurrency of one.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Secrets Manager and CloudWatch Logs via the NAT gateway.
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: DNS to the Amazon-provided resolver.
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCidr
+          Description: DNS over TCP.
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-migrate"
+
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Proxy. In from the Lambda group, out to the database group.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Worker and ingest, by group id.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+          Description: The pooled backend connections.
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-proxy"
+
+  # Declared as standalone rules rather than inline, because inline rules in both
+  # directions between two groups are a circular dependency CloudFormation refuses.
+  LambdaToProxyEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref ProxySecurityGroup
+      Description: Postgres via RDS Proxy. The only database path the worker has.
+
+  DatabaseIngressFromProxy:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref ProxySecurityGroup
+      Description: Pooled connections from RDS Proxy.
+
+  DatabaseIngressFromMigration:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref MigrationSecurityGroup
+      Description: alembic upgrade head, once per deploy.
+
+  # Only when the proxy is switched off: the worker then needs the direct path the proxy
+  # would otherwise have provided. Both halves are conditional, so turning the proxy back
+  # on removes the bypass rather than leaving it behind.
+  LambdaDirectToDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: ProxyDisabled
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+      Description: Direct Postgres, only while EnableRdsProxy is false.
+
+  DatabaseIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ProxyDisabled
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Direct Postgres, only while EnableRdsProxy is false.
+
+  # ---------------------------------------------------------------------------------
+  # Data tier
+  # ---------------------------------------------------------------------------------
+  DatabaseKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "leadquali-${Stage} RDS encryption at rest"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Sub "leadquali-${Stage}-db-key"
+        Statement:
+          # A customer-managed key rather than the account's aws/rds key, because plan
+          # section 8 treats leads as personal data: a CMK is what makes "revoke access to
+          # the data" and "prove the key is rotated" answerable. It costs $1/month.
+          # DeletionPolicy Retain is deliberate — deleting the key destroys every snapshot
+          # taken with it, which would make the Snapshot policy on the instance a lie.
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  DatabaseKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/leadquali-${Stage}-db"
+      TargetKeyId: !Ref DatabaseKmsKey
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: >-
+        Private subnets, two availability zones. RDS requires two AZs even for a
+        single-AZ instance, so that a failover or a class change has somewhere to land.
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}-db"
+
+  # ---------------------------------------------------------------------------------
+  # THE CONNECTION ARITHMETIC. This is the relationship a future person will break.
+  #
+  # It is written here as parameters and pinned settings rather than as a remembered
+  # number, and tests/unit/test_infra_network.py recomputes it from both templates on
+  # every test run.
+  #
+  #   Given (this stack):
+  #     max_connections                    112   pinned below, from InstanceCapacity
+  #     superuser_reserved_connections       3   pinned below
+  #     ProxyMaxConnectionsPercent          75%
+  #
+  #   Derived:
+  #     proxy backend budget = floor(112 x 75 / 100)                        =  84
+  #     migration function, direct, ReservedConcurrentExecutions = 1        =   1
+  #     Postgres superuser reserve                                          =   3
+  #     ------------------------------------------------------------------------
+  #     committed                                                              88
+  #     operator headroom (psql during an incident, monitoring)              =  24
+  #                                                                     total  112
+  #
+  #   Required of the application stack (infra/template.yaml):
+  #     each Lambda container holds exactly one connection, because
+  #     store_postgres.engine_for uses pool_size=1 and max_overflow=0, so
+  #
+  #       WorkerReservedConcurrency + IngestReservedConcurrency <= 84
+  #
+  #     CloudFormation cannot express a constraint across two parameters, so it is split
+  #     into per-parameter MaxValues that sum below the budget — 50 + 30 = 80 <= 84 —
+  #     which means a deploy that violates it is rejected by CloudFormation itself, not
+  #     merely by a test. The test asserts the sum, which is the half CloudFormation
+  #     cannot see. Defaults are 5 and 20, so the everyday peak is 25 of 84.
+  #
+  #   Raising DbInstanceClass raises max_connections (see InstanceCapacity) and therefore
+  #   the budget; the MaxValues in the application stack must then be raised deliberately,
+  #   and the test will say so if they are not.
+  # ---------------------------------------------------------------------------------
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub "leadquali-${Stage}: pinned connection budget and session hygiene"
+      Family: !Ref DbParameterGroupFamily
+      Parameters:
+        # Pinned, not left to the default formula LEAST({DBInstanceClassMemory/9531392},
+        # 5000). The whole budget above depends on this number, and a number that is
+        # computed from instance memory at boot is a number nobody can read off a
+        # template. Pinning it at the class's memory-derived default changes nothing about
+        # capacity and makes the arithmetic auditable.
+        max_connections: !FindInMap [InstanceCapacity, !Ref DbInstanceClass, MaxConnections]
+        superuser_reserved_connections: "3"
+        # Five minutes. A session that has held a transaction open that long has leaked
+        # one: it holds locks the redelivered SQS message will wait on, and it is the
+        # state that makes RDS Proxy pin a client to a backend. The store commits every
+        # unit of work before returning, so nothing legitimate here comes close; the
+        # migration Lambda's own timeout is 300 s, so it cannot be caught by this either.
+        idle_in_transaction_session_timeout: "300000"
+        rds.force_ssl: "1"
+        log_min_duration_statement: "1000"
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Snapshot, not Delete: the feedback loop in this database is the product's moat
+    # (plan section 4), and a stack deletion must not be able to take it.
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "leadquali-${Stage}"
+      DBName: leadquali
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      # No public address exists. This is the acceptance criterion, and it is also what
+      # makes the migration story in #26 honest: migrations run from a Lambda inside the
+      # VPC because there is no other way in, not because someone remembered not to.
+      PubliclyAccessible: false
+      MultiAZ: !Ref DbMultiAz
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: !Ref DbMaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt DatabaseKmsKey.Arn
+      # The master password is never in this template, never a stack parameter and never
+      # in a CI log: RDS generates it into Secrets Manager and rotates it there. #28
+      # composes the application's DATABASE_URL from this secret and DatabaseEndpoint.
+      ManageMasterUserPassword: true
+      MasterUsername: leadquali
+      BackupRetentionPeriod: !Ref DbBackupRetentionDays
+      PreferredBackupWindow: "03:10-03:40"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      CopyTagsToSnapshot: true
+      DeletionProtection: true
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}"
+
+  DatabaseProxyRole:
+    Type: AWS::IAM::Role
+    Condition: ProxyEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-master-user-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: kms:Decrypt
+                # The RDS-managed master user secret is encrypted with the account's
+                # aws/secretsmanager key, whose ARN this template cannot name. The
+                # ViaService condition is what keeps this from being a general decrypt
+                # grant: the role can only use KMS through Secrets Manager.
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+
+  # RDS Proxy. Its price is the surprise in this stack and is stated here rather than
+  # left for the first invoice: RDS Proxy bills $0.015 per vCPU-hour of the underlying
+  # instance, with a floor of 8 vCPUs for T-family instances. That is
+  # 8 x 730 x $0.015 = $87.60/month in front of a database that costs $11.68/month —
+  # seven times the instance, and more than three times the entire per-lead token budget
+  # in plan section 8. The floor is fixed, so this does not get cheaper with volume; it
+  # gets *relatively* cheaper, and only when volume grows.
+  #
+  # What it buys at today's volume, honestly: not connection headroom. With pool_size=1
+  # and a reserved concurrency of 5, the worker holds 5 of 112 connections, and the
+  # database would survive without a proxy. What it buys is (a) connection establishment
+  # taken off the cold-start path, which matters because Lambda churns containers, (b)
+  # failover transparency, and (c) the ability to raise reserved concurrency later without
+  # a second conversation about connections. #27 mandates it, so it is on by default; the
+  # EnableRdsProxy parameter exists so the owner can see the price and decide, and so the
+  # decision is a parameter change rather than a template rewrite.
+  DatabaseProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: ProxyEnabled
+    Properties:
+      DBProxyName: !Sub "leadquali-${Stage}"
+      EngineFamily: POSTGRESQL
+      RoleArn: !GetAtt DatabaseProxyRole.Arn
+      VpcSubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      VpcSecurityGroupIds:
+        - !Ref ProxySecurityGroup
+      RequireTLS: true
+      # 1800 s, comfortably above the adapter's pool_recycle of 300 s. The ordering is the
+      # point: the client must give up a connection before the proxy does, or a warm
+      # container wakes onto a socket the proxy has already closed. pool_pre_ping turns
+      # that into a reconnect rather than a failure, but a reconnect on the request path
+      # is latency nobody asked for.
+      IdleClientTimeout: 1800
+      DebugLogging: false
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+          IAMAuth: DISABLED
+          ClientPasswordAuthType: POSTGRES_SCRAM_SHA_256
+      Tags:
+        - Key: Name
+          Value: !Sub "leadquali-${Stage}"
+
+  DatabaseProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Condition: ProxyEnabled
+    Properties:
+      DBProxyName: !Ref DatabaseProxy
+      # "default" is the only name RDS accepts for a proxy target group.
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+        - !Ref Database
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: !Ref ProxyMaxConnectionsPercent
+        MaxIdleConnectionsPercent: !Ref ProxyMaxIdleConnectionsPercent
+        # Seconds a client waits for a backend connection before the proxy gives up. Kept
+        # short on purpose: the worker is behind SQS, so failing fast and letting the
+        # message be redelivered is strictly better than holding a Lambda invocation open
+        # and paying for it. It is also the signal that the concurrency cap is set wrong.
+        ConnectionBorrowTimeout: 30
+        # Prepared statements are the classic pinning trigger. store_postgres already
+        # disables them at the client with prepare_threshold=None; this is the same
+        # statement made on the proxy side, so a future client that forgets degrades to
+        # pinning-with-a-warning rather than to silent serialisation.
+        SessionPinningFilters:
+          - EXCLUDE_VARIABLE_SETS
+
+Outputs:
+  VpcId:
+    Description: For anything later that needs to attach to this network.
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "leadquali-${Stage}-vpc-id"
+  PrivateSubnetIds:
+    Description: >-
+      The application stack's VpcSubnetIds parameter. Two AZs, no route to an internet
+      gateway.
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export:
+      Name: !Sub "leadquali-${Stage}-private-subnet-ids"
+  LambdaSecurityGroupId:
+    Description: The application stack's VpcSecurityGroupIds parameter (worker + ingest).
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "leadquali-${Stage}-lambda-sg-id"
+  MigrationSecurityGroupId:
+    Description: >-
+      The application stack's MigrationSecurityGroupIds parameter. Separate because this
+      is the only group that may reach Postgres without going through the proxy.
+    Value: !Ref MigrationSecurityGroup
+    Export:
+      Name: !Sub "leadquali-${Stage}-migration-sg-id"
+  DatabaseEndpoint:
+    Description: >-
+      What #28 puts in DATABASE_URL. The proxy endpoint when the proxy is enabled, the
+      instance endpoint when it is not, so that the switch is invisible to the application.
+      Append sslmode=require — the instance sets rds.force_ssl and the proxy sets
+      RequireTLS, so a URL that negotiates plaintext will simply be refused.
+    Value: !If
+      - ProxyEnabled
+      - !GetAtt DatabaseProxy.Endpoint
+      - !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub "leadquali-${Stage}-db-endpoint"
+  DatabasePort:
+    Value: !GetAtt Database.Endpoint.Port
+  DatabaseName:
+    Value: leadquali
+  DatabaseMasterUserSecretArn:
+    Description: >-
+      RDS-managed, rotated by RDS. #28 reads username and password from here and composes
+      the DATABASE_URL secret; nothing else should hand this ARN to application code.
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub "leadquali-${Stage}-db-secret-arn"
+  DatabaseIdentifier:
+    Description: >-
+      For #29's DatabaseConnections alarm. The threshold is the arithmetic in this
+      template: alarm when connections approach the proxy backend budget, which for
+      db.t4g.micro at 75% is 84 of a pinned max_connections of 112.
+    Value: !Ref Database
+  DatabaseProxyName:
+    Condition: ProxyEnabled
+    Description: For #29's proxy-side connection and borrow-timeout alarms.
+    Value: !Ref DatabaseProxy
+  DatabaseKmsKeyArn:
+    Value: !GetAtt DatabaseKmsKey.Arn
