@@ -26,11 +26,41 @@ Parameters:
     Type: Number
     Default: 5
     MinValue: 1
+    MaxValue: 50
     Description: >
       Hard cap on concurrent workers. This is the Postgres decision's bill (plan section
       4): each container holds one connection, so this number is the worst-case
       connection count against RDS Proxy. Raising it without raising the database's
       connection budget is how a burst of leads takes the database down. Owned with #27.
+
+      MaxValue is the half of #27's connection arithmetic that CloudFormation can enforce
+      by itself. The whole relationship is:
+
+        (WorkerReservedConcurrency + IngestReservedConcurrency) x connections-per-container
+          <= floor(max_connections x ProxyMaxConnectionsPercent / 100)
+        (50                       + 30)                         x 1
+          <= floor(112            x 75                          / 100) = 84
+
+      connections-per-container is 1 because store_postgres.engine_for builds its engine
+      with pool_size=1 and max_overflow=0; max_connections is 112 because
+      infra/network.yaml pins it there for a db.t4g.micro rather than leaving it to the
+      instance-memory formula. CloudFormation has no way to constrain two parameters
+      against each other, so the ceiling is split into two MaxValues that sum below the
+      budget, and tests/unit/test_infra_network.py asserts the sum. Raise either one only
+      together with DbInstanceClass in the network stack.
+  IngestReservedConcurrency:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 30
+    Description: >
+      Hard cap on concurrent ingest containers, for the same reason the worker has one:
+      api/main.py builds a PostgresLeadStore for the idempotency check and api/feedback.py
+      a PostgresFeedbackStore for the one-click links, so every warm ingest container also
+      holds a database connection. Without this the API side of the connection budget is
+      unbounded, and the cap on the worker only bounds half the problem. The default of 20
+      is sized to the API's own throttle above (50 rps steady, 100 burst) at roughly
+      200 ms per request; MaxValue is set by the arithmetic on WorkerReservedConcurrency.
   IngestCredentialsSecretArn:
     Type: String
     Description: >
@@ -75,10 +105,25 @@ Parameters:
   VpcSecurityGroupIds:
     Type: CommaDelimitedList
     Default: ""
-    Description: Security groups for the worker (#27).
+    Description: >
+      Security groups for the worker and ingest functions (#27). In the network stack this
+      is LambdaSecurityGroupId, which reaches RDS Proxy on 5432 and cannot reach Postgres
+      directly - the proxy's connection cap is only a cap if it cannot be walked around.
+  MigrationSecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Security groups for the migration function (#27's MigrationSecurityGroupId). It is
+      separate because migrations are the one workload allowed to bypass RDS Proxy: alembic
+      holds a single long transaction with DDL and advisory locks, which pins a backend
+      connection and defeats the multiplexing the proxy exists for. Left empty, the
+      migration function falls back to VpcSecurityGroupIds and goes through the proxy,
+      which works and is merely worse.
 
 Conditions:
   InVpc: !Not [!Equals [!Join ["", !Ref VpcSubnetIds], ""]]
+  MigrationHasDedicatedSg:
+    !Not [!Equals [!Join ["", !Ref MigrationSecurityGroupIds], ""]]
 
 Globals:
   Function:
@@ -117,6 +162,25 @@ Resources:
       Handler: leadquali.api.handlers.ingest_handler
       MemorySize: 512
       Timeout: 10
+      ReservedConcurrentExecutions: !Ref IngestReservedConcurrency
+      # Ingest is in the VPC for the same reason the worker is, and it is easy to miss:
+      # this function talks to Postgres. api/main.py builds a PostgresLeadStore so that a
+      # duplicate submission_id is rejected at the door, and api/feedback.py builds a
+      # PostgresFeedbackStore for the one-click links in #19's emails. With the database
+      # not publicly accessible - which is the whole point of #27 - a function outside the
+      # VPC cannot reach it at all, so leaving ingest outside would not be a performance
+      # choice, it would be a stack that returns 500 on the first lead.
+      #
+      # The cost is a cold start behind a synchronous HTTP request. Since Lambda moved to
+      # shared Hyperplane ENIs this is tens of milliseconds rather than the ten seconds it
+      # used to be, and the p99 target in plan section 8 has room for it - but it is the
+      # one latency number in this stack that only a real deploy can settle, so measure it
+      # before promising anything about it.
+      VpcConfig: !If
+        - InVpc
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
       Environment:
         Variables:
           LEAD_QUEUE_URL: !Ref LeadQueue
@@ -129,6 +193,7 @@ Resources:
             SecretArn: !Ref IngestCredentialsSecretArn
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref DatabaseUrlSecretArn
+        - VPCAccessPolicy: {}
       Events:
         Ingest:
           Type: Api
@@ -200,10 +265,18 @@ Resources:
       Handler: leadquali.api.migrate.lambda_handler
       MemorySize: 512
       Timeout: 300
+      # Exactly one. Not a parameter, because there is no value other than one that is
+      # correct: two concurrent alembic runs contend for the same DDL and advisory locks,
+      # and the loser spends the Lambda's whole 300 s waiting to do nothing. It is also
+      # the single direct connection reserved for migrations in #27's budget.
+      ReservedConcurrentExecutions: 1
       VpcConfig: !If
         - InVpc
         - SubnetIds: !Ref VpcSubnetIds
-          SecurityGroupIds: !Ref VpcSecurityGroupIds
+          SecurityGroupIds: !If
+            - MigrationHasDedicatedSg
+            - !Ref MigrationSecurityGroupIds
+            - !Ref VpcSecurityGroupIds
         - !Ref AWS::NoValue
       Environment:
         Variables:
