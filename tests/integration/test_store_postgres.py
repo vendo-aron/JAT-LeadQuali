@@ -863,6 +863,7 @@ def test_an_invalid_rubric_is_a_config_error_not_a_silent_default(
     connection.execute(
         insert(Tenant).values(
             id=tenant_id_for(slug),
+            slug=slug,
             name="Broken",
             icp_config={"tenant_id": slug, "name": "Broken"},
         )
@@ -878,6 +879,7 @@ def test_a_row_whose_config_names_a_different_tenant_is_refused(
     connection.execute(
         insert(Tenant).values(
             id=tenant_id_for(slug),
+            slug=slug,
             name="Mislabelled",
             icp_config={**default_config_document, "tenant_id": "someone-else"},
         )

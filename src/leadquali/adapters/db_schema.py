@@ -64,15 +64,20 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 __all__ = [
     "ASSESSMENT_STATUSES",
+    "DEFAULT_RATE_LIMIT_BURST",
+    "DEFAULT_RATE_LIMIT_PER_MINUTE",
     "ESCALATION_REASONS",
     "LEAD_STATUSES",
     "ROUTING_ACTIONS",
+    "TENANT_SLUG_SQL_PATTERN",
+    "TENANT_STATUSES",
     "Assessment",
     "Base",
     "Feedback",
     "Lead",
     "RoutingEvent",
     "Tenant",
+    "TenantApiKey",
     "metadata",
 ]
 
@@ -118,6 +123,26 @@ escalation reason is not by itself evidence of a failure."""
 
 ROUTING_ACTIONS: tuple[str, ...] = ("email_sales", "escalate_human", "suppress")
 """Mirrors ``leadquali.domain.Action``."""
+
+TENANT_STATUSES: tuple[str, ...] = ("active", "suspended", "disabled")
+"""Mirrors ``leadquali.api.signing.TENANT_STATUSES``. Only ``active`` may ingest; the
+difference between ``suspended`` (temporary, e.g. non-payment) and ``disabled`` (gone) is
+policy rather than mechanism, and the ingest path treats them the same."""
+
+TENANT_SLUG_SQL_PATTERN: str = "^[a-z0-9][a-z0-9_-]{0,62}$"
+"""``leadquali.domain.tenant_config.TENANT_ID_PATTERN``, restated as a SQL literal.
+
+Duplicated for the same reason the vocabularies above are: a CHECK constraint has to be a
+literal in the DDL, and a migration must keep working when the domain moves on.
+``tests/unit/test_db_schema.py`` pins the two together."""
+
+DEFAULT_RATE_LIMIT_PER_MINUTE: int = 60
+"""One lead per second, sustained. Comfortably above what an honest web form produces and
+low enough that a runaway integration is throttled rather than billed for."""
+
+DEFAULT_RATE_LIMIT_BURST: int = 10
+"""How far above the sustained rate a tenant may spike — a marketing email landing at 9am
+puts a handful of submissions in the same second, and refusing those would lose leads."""
 
 
 def _sql_in(column: str, values: tuple[str, ...]) -> str:
@@ -184,6 +209,13 @@ class Tenant(Base):
     __tablename__ = "tenants"
 
     id: Mapped[uuid.UUID] = _pk()
+    # The external identity, and the only one anything outside the database uses: it is
+    # what a form sends in X-LeadQuali-Tenant and what an operator types. `id` is
+    # `uuid5(TENANT_ID_NAMESPACE, slug)` (leadquali.app.tenant_ids), which the *service*
+    # enforces on create because a database cannot compute a uuid5 in a CHECK. Before #31
+    # the slug was only recoverable from `icp_config->>'tenant_id'`, so a config rewrite
+    # could silently orphan every key and every lead the tenant owned.
+    slug: Mapped[str] = mapped_column(Text, nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
     # ICP description, dimension weights, tier thresholds and routing rules. Invariant 1:
@@ -193,14 +225,97 @@ class Tenant(Base):
     # at 3am against live traffic instead of at the insert that caused it. Seed a tenant
     # with `scripts/seed.py`, which supplies a real config.
     icp_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    # Argon2 hash of the tenant's API key. The key itself is never stored.
-    api_key_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Secrets Manager ARN for the webhook HMAC secret — a reference, not the secret.
     hmac_secret_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Per-tenant throttle, enforced by api/ratelimit.TenantRateLimiter. On the row rather
+    # than in an API Gateway usage plan: a usage plan is keyed by a *second* credential the
+    # customer would have to embed in their page, the account default caps the customer
+    # count at 300, and provisioning one is a control-plane call in the middle of
+    # onboarding. See docs/tenant-onboarding.md for the whole argument.
+    rate_limit_per_minute: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text(str(DEFAULT_RATE_LIMIT_PER_MINUTE))
+    )
+    rate_limit_burst: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text(str(DEFAULT_RATE_LIMIT_BURST))
+    )
     created_at: Mapped[dt.datetime] = _created_at()
+    # Touched by every admin write. "When did this tenant's rubric last change?" is the
+    # first question after a routing surprise, and without this column the only answer is
+    # a CloudTrail search.
+    updated_at: Mapped[dt.datetime] = _created_at()
 
     __table_args__ = (
-        CheckConstraint("status IN ('active', 'suspended', 'disabled')", name="status_known"),
+        # The slug is the join between the outside world and this row, so it is unique and
+        # shape-checked in the database as well as in TenantConfig: a row inserted by psql
+        # during an incident has to be as well-formed as one the service wrote.
+        UniqueConstraint("slug", name="uq_tenants_slug"),
+        CheckConstraint(f"slug ~ '{TENANT_SLUG_SQL_PATTERN}'", name="slug_is_a_slug"),
+        CheckConstraint(_sql_in("status", TENANT_STATUSES), name="status_known"),
+        CheckConstraint(
+            "rate_limit_per_minute > 0 AND rate_limit_burst > 0", name="rate_limits_are_positive"
+        ),
+    )
+
+
+class TenantApiKey(Base):
+    """One issued ingest API key, stored as a hash of its secret half and nothing more.
+
+    A tenant may hold several rows at once, which is what makes rotation a non-event: the
+    new key is issued, the old row gets an ``expires_at`` a week out, the customer redeploys
+    their form whenever they like, and nothing is refused in between.
+
+    ``key_id`` is the clear-text lookup handle carried inside the key itself (see
+    :mod:`leadquali.app.api_keys`). It is not a secret, it is uniquely indexed, and it is
+    what makes an argon2 verification affordable on the request path: the row is found by
+    an indexed read, and the KDF runs only for a caller who already holds a real handle.
+
+    ``key_hash`` is an encoded argon2id string over the key's **secret half only**. The key
+    itself is shown once, at issue, and exists nowhere in this system afterwards — which is
+    the acceptance criterion "keys are unrecoverable from the database", stated as a schema
+    fact rather than as a promise.
+    """
+
+    __tablename__ = "tenant_api_keys"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        # CASCADE, unlike `leads`: a key is not an audit record. #37's erasure deletes the
+        # tenant, and leaving credentials behind that authenticate against nothing would be
+        # the one kind of orphan row that is a security problem rather than a tidiness one.
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    key_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # `lq_live_<key_id>`: everything about the key that is not secret, so a listing can show
+    # an operator which key a customer is quoting without ever holding the key.
+    key_prefix: Mapped[str] = mapped_column(Text, nullable=False)
+    key_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    # Free text from whoever issued it, e.g. "acme marketing site". Optional, because a key
+    # with no label is still a key, and refusing to issue one over a missing note would be
+    # the sort of friction that gets worked around with a shared key.
+    label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = _created_at()
+    # Set by rotation: the end of the overlap window during which both keys work.
+    expires_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # Set by revocation, and effective on the very next request: the row is read fresh from
+    # Postgres every time, and nothing about it is cached anywhere.
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # Best-effort and deliberately coarse; written by
+    # store_tenants.PostgresIngestCredentials._touch. A write per request would
+    # put a row-level lock contended by every concurrent request for the same key on the
+    # hot path, to answer a question nobody asks to the minute.
+    last_used_at: Mapped[dt.datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        # The lookup. Unique across every tenant, because a key names its own row and two
+        # rows answering to one handle would make "whose key is this" depend on scan order.
+        UniqueConstraint("key_id", name="uq_tenant_api_keys_key_id"),
+        # The listing: WHERE tenant_id = ? ORDER BY created_at DESC.
+        Index("ix_tenant_api_keys_tenant_id_created_at", "tenant_id", "created_at"),
+        CheckConstraint("key_id <> '' AND key_hash <> ''", name="key_material_not_blank"),
     )
 
 

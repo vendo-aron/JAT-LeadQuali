@@ -174,3 +174,48 @@ def test_the_api_access_log_carries_no_request_body_or_headers(
     fmt = _resources(template)["LeadApi"]["Properties"]["AccessLogSetting"]["Format"]
     for forbidden in ("$input.body", "requestOverride", "authorization", "x-leadquali-key"):
         assert forbidden.lower() not in fmt.lower()
+
+
+def test_the_stage_has_an_account_wide_throttle(template: dict[str, Any]) -> None:
+    """The backstop behind #31's per-tenant limits.
+
+    ``TenantRateLimiter`` counts inside one Python process, so under N warm containers a
+    tenant can get up to N times its configured allowance. This throttle is what bounds the
+    absolute worst case, in front of the runtime, where a flood costs no invocations and no
+    database connections. It is deliberately the *only* API Gateway throttling in the
+    stack: per-tenant usage plans were considered and rejected (docs/tenant-onboarding.md).
+    """
+    settings = _resources(template)["LeadApi"]["Properties"]["MethodSettings"]
+    default = [entry for entry in settings if entry["ResourcePath"] == "/*"]
+    assert default, "the stage needs a default throttle covering every route"
+    for entry in default:
+        assert entry["HttpMethod"] == "*"
+        assert entry["ThrottlingRateLimit"] > 0
+        assert entry["ThrottlingBurstLimit"] >= entry["ThrottlingRateLimit"]
+
+
+def test_the_ingest_function_may_read_every_tenants_signing_secret(
+    template: dict[str, Any],
+) -> None:
+    """Onboarding creates one Secrets Manager secret per customer, so the grant has to be
+    by path: naming them individually would make adding a customer a stack update, which is
+    the deploy that invariant 1 says onboarding must never be.
+
+    The scope is asserted as well as the existence of the grant — one action, and one
+    prefix that carries the stage — because a wildcard on ``secretsmanager:*`` here would
+    let a compromised ingest function read the Anthropic key and the database password.
+    """
+    policies = _resources(template)["IngestFunction"]["Properties"]["Policies"]
+    statements = [
+        statement
+        for policy in policies
+        if isinstance(policy, dict) and "Statement" in policy
+        for statement in policy["Statement"]
+    ]
+    granted = [s for s in statements if s.get("Action") == "secretsmanager:GetSecretValue"]
+    assert len(granted) == 1, "expected exactly one path-scoped tenant-secret grant"
+
+    resource = granted[0]["Resource"]
+    assert "/tenant/" in str(resource)
+    assert "${Stage}" in str(resource), "the grant must not cross environments"
+    assert "secretsmanager:*" not in str(granted[0]["Action"])

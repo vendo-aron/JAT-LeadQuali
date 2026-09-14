@@ -110,6 +110,23 @@ _ACTIONS_NEEDING_A_DESTINATION: Final[frozenset[Action]] = frozenset(
 )
 
 
+def _numeric(value: object, *, field: str) -> object:
+    """Refuse a boolean where a number belongs, before Pydantic coerces it.
+
+    ``bool`` is a subclass of ``int`` in Python and Pydantic will happily read ``true`` as
+    ``1.0``. Every place that matters here, that is silently catastrophic rather than
+    merely wrong: ``"min_confidence": true`` is a confidence gate of 1.0 that no assessment
+    can ever pass, so every one of that tenant's leads escalates to a human and nothing
+    reports an error. ``"hot": true`` is the same shape of accident on a tier bound.
+
+    A ``mode="before"`` validator because by the time the field is typed the boolean is
+    already a float and the mistake is unrecoverable.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number, not a boolean")
+    return value
+
+
 class TierThresholds(BaseModel):
     """The lower bound, inclusive, of each tier on the 0-100 scale.
 
@@ -127,6 +144,12 @@ class TierThresholds(BaseModel):
     hot: float = Field(default=80.0, ge=0.0, le=MAX_TOTAL_SCORE, allow_inf_nan=False)
     warm: float = Field(default=55.0, ge=0.0, le=MAX_TOTAL_SCORE, allow_inf_nan=False)
     cold: float = Field(default=30.0, ge=0.0, le=MAX_TOTAL_SCORE, allow_inf_nan=False)
+
+    @field_validator("hot", "warm", "cold", mode="before")
+    @classmethod
+    def _bounds_are_numbers(cls, value: object) -> object:
+        """A tier bound of ``true`` is a band nothing lands in. See :func:`_numeric`."""
+        return _numeric(value, field="a tier threshold")
 
     @model_validator(mode="after")
     def _strictly_ordered(self) -> Self:
@@ -241,6 +264,21 @@ class TenantConfig(BaseModel):
     )
 
     # ------------------------------------------------------------------ validation
+
+    @field_validator("min_confidence", mode="before")
+    @classmethod
+    def _confidence_is_a_number(cls, value: object) -> object:
+        """``"min_confidence": true`` would be a gate of 1.0. See :func:`_numeric`."""
+        return _numeric(value, field="min_confidence")
+
+    @field_validator("weights", mode="before")
+    @classmethod
+    def _weights_are_numbers(cls, value: object) -> object:
+        """``"authority": true`` would weight a dimension at 1.0 by accident, not by intent."""
+        if isinstance(value, Mapping):
+            for dimension, weight in value.items():
+                _numeric(weight, field=f"weight for {dimension}")
+        return value
 
     @field_validator("name", "icp_description", mode="after")
     @classmethod

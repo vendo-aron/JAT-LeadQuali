@@ -23,6 +23,7 @@ from leadquali.adapters.db_schema import metadata
 pytestmark = pytest.mark.integration
 
 TENANTS = metadata.tables["tenants"]
+TENANT_API_KEYS = metadata.tables["tenant_api_keys"]
 LEADS = metadata.tables["leads"]
 ASSESSMENTS = metadata.tables["assessments"]
 ROUTING_EVENTS = metadata.tables["routing_events"]
@@ -63,10 +64,27 @@ A_FAILED_ASSESSMENT: dict[str, object] = {
 # feedback.rater is an opaque subject id, never a contact address. See db_schema.py.
 A_RATER = "user_01hqzp4n8k"
 
+# A real argon2id encoded hash, so the column holds what production will put in it. Its
+# plaintext is not recorded anywhere, because nothing here needs to verify it.
+AN_ARGON2_HASH = (
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR5c2FsdA$Tw1p6z5oI5gSm0h4t8vQe1mVxC6tLg9hEu5aZo1QsPI"
+)
 
-def _new_tenant(db: Connection, name: str = "Acme") -> uuid.UUID:
+
+def _new_tenant(db: Connection, name: str = "Acme", slug: str | None = None) -> uuid.UUID:
+    """Insert a tenant with a unique slug.
+
+    The slug is generated rather than derived from ``name`` because several tests create
+    two tenants in one transaction, and ``tenants.slug`` is UNIQUE — which is the point of
+    it: the slug is the identity every signed request arrives under.
+    """
     row: uuid.UUID = db.execute(
-        TENANTS.insert().returning(TENANTS.c.id), {"name": name, "icp_config": AN_ICP_CONFIG}
+        TENANTS.insert().returning(TENANTS.c.id),
+        {
+            "slug": slug if slug is not None else f"t{uuid.uuid4().hex[:16]}",
+            "name": name,
+            "icp_config": AN_ICP_CONFIG,
+        },
     ).scalar_one()
     return row
 
@@ -276,7 +294,7 @@ def test_a_tenant_cannot_be_created_without_a_rubric(db: Connection) -> None:
     traffic, a long way from the insert that caused it.
     """
     with pytest.raises(IntegrityError) as caught, db.begin_nested():
-        db.execute(TENANTS.insert(), {"name": "no rubric"})
+        db.execute(TENANTS.insert(), {"slug": "no-rubric", "name": "no rubric"})
 
     assert "icp_config" in str(caught.value)
 
@@ -287,6 +305,147 @@ def test_a_tenant_created_with_a_rubric_round_trips(db: Connection) -> None:
     stored = db.execute(select(TENANTS.c.icp_config).where(TENANTS.c.id == tenant_id)).scalar_one()
 
     assert stored == AN_ICP_CONFIG
+
+
+def test_two_tenants_cannot_share_a_slug(db: Connection) -> None:
+    """The slug is what a customer's form sends and what every port-level ``tenant_id``
+    means, so two rows answering to one would make "whose lead is this?" depend on scan
+    order. Enforced by the database, not only by the service that usually writes it."""
+    _new_tenant(db, slug="acme-demo")
+
+    with pytest.raises(IntegrityError) as caught, db.begin_nested():
+        _new_tenant(db, name="Impostor", slug="acme-demo")
+
+    assert "slug" in str(caught.value)
+
+
+@pytest.mark.parametrize("slug", ["Acme", "acme demo", "-acme", "", "a" * 64])
+def test_a_malformed_slug_is_refused_by_the_database(db: Connection, slug: str) -> None:
+    """A row inserted by ``psql`` during an incident has to be as well-formed as one the
+    service wrote, so the shape rule lives in a CHECK and not only in ``TenantConfig``."""
+    with pytest.raises(IntegrityError) as caught, db.begin_nested():
+        _new_tenant(db, slug=slug)
+
+    assert "slug_is_a_slug" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [{"rate_limit_per_minute": 0}, {"rate_limit_burst": 0}, {"rate_limit_per_minute": -1}],
+)
+def test_a_rate_limit_that_would_refuse_everything_is_rejected(
+    db: Connection, limits: dict[str, int]
+) -> None:
+    """A bucket that never refills, or one that holds nothing, is a customer whose leads
+    silently stop — which is exactly the failure nobody notices until a quarterly review."""
+    with pytest.raises(IntegrityError) as caught, db.begin_nested():
+        db.execute(
+            TENANTS.insert(),
+            {
+                "slug": f"t{uuid.uuid4().hex[:16]}",
+                "name": "Acme",
+                "icp_config": AN_ICP_CONFIG,
+                **limits,
+            },
+        )
+
+    assert "rate_limits_are_positive" in str(caught.value)
+
+
+def test_a_new_tenant_gets_the_documented_default_allowance(db: Connection) -> None:
+    tenant_id = _new_tenant(db)
+    row = db.execute(
+        select(TENANTS.c.rate_limit_per_minute, TENANTS.c.rate_limit_burst).where(
+            TENANTS.c.id == tenant_id
+        )
+    ).one()
+    assert (row.rate_limit_per_minute, row.rate_limit_burst) == (60, 10)
+
+
+# --- tenant_api_keys ------------------------------------------------------------------
+
+
+def _new_key(db: Connection, tenant_id: uuid.UUID, key_id: str, **overrides: Any) -> uuid.UUID:
+    row: uuid.UUID = db.execute(
+        TENANT_API_KEYS.insert().returning(TENANT_API_KEYS.c.id),
+        {
+            "tenant_id": tenant_id,
+            "key_id": key_id,
+            "key_prefix": f"lq_live_{key_id}",
+            "key_hash": AN_ARGON2_HASH,
+            **overrides,
+        },
+    ).scalar_one()
+    return row
+
+
+def test_a_key_id_is_unique_across_every_tenant(db: Connection) -> None:
+    """A key names its own row, so the lookup is by ``key_id`` alone. Two rows answering to
+    one handle would make which tenant a key belongs to depend on scan order — and that is
+    a cross-tenant authentication bug, not a tidiness one."""
+    first = _new_tenant(db)
+    second = _new_tenant(db, name="Other")
+    _new_key(db, first, "3f1c9a02b7d45e68")
+
+    with pytest.raises(IntegrityError) as caught, db.begin_nested():
+        _new_key(db, second, "3f1c9a02b7d45e68")
+
+    assert "key_id" in str(caught.value)
+
+
+def test_a_key_cannot_belong_to_a_tenant_that_does_not_exist(db: Connection) -> None:
+    with pytest.raises(IntegrityError) as caught, db.begin_nested():
+        _new_key(db, uuid.uuid4(), "3f1c9a02b7d45e68")
+
+    assert "fk_tenant_api_keys_tenant_id_tenants" in str(caught.value)
+
+
+def test_deleting_a_tenant_takes_its_keys_with_it(db: Connection) -> None:
+    """CASCADE, unlike ``leads``: credentials that authenticate against nothing are the one
+    kind of orphan row that is a security problem rather than an untidy one."""
+    tenant_id = _new_tenant(db)
+    _new_key(db, tenant_id, "3f1c9a02b7d45e68")
+
+    db.execute(TENANTS.delete().where(TENANTS.c.id == tenant_id))
+
+    remaining = db.execute(
+        select(func.count())
+        .select_from(TENANT_API_KEYS)
+        .where(TENANT_API_KEYS.c.tenant_id == tenant_id)
+    ).scalar_one()
+    assert remaining == 0
+
+
+@pytest.mark.parametrize("blank", [{"key_id": ""}, {"key_hash": ""}])
+def test_a_key_row_cannot_be_blank_where_it_matters(db: Connection, blank: dict[str, str]) -> None:
+    tenant_id = _new_tenant(db)
+    with pytest.raises(IntegrityError) as caught, db.begin_nested():
+        _new_key(db, tenant_id, "3f1c9a02b7d45e68", **blank)
+
+    assert "key_material_not_blank" in str(caught.value)
+
+
+def test_a_fresh_key_has_no_expiry_revocation_or_last_use(db: Connection) -> None:
+    """All three are set by something later — rotation, revocation, a request — so a new
+    row must not claim any of them."""
+    tenant_id = _new_tenant(db)
+    key_row = _new_key(db, tenant_id, "3f1c9a02b7d45e68", label="acme website")
+
+    row = db.execute(
+        select(
+            TENANT_API_KEYS.c.expires_at,
+            TENANT_API_KEYS.c.revoked_at,
+            TENANT_API_KEYS.c.last_used_at,
+            TENANT_API_KEYS.c.label,
+            TENANT_API_KEYS.c.created_at,
+        ).where(TENANT_API_KEYS.c.id == key_row)
+    ).one()
+
+    assert row.expires_at is None
+    assert row.revoked_at is None
+    assert row.last_used_at is None
+    assert row.label == "acme website"
+    assert row.created_at is not None
 
 
 # --- assessments: success, failure, and nothing in between ----------------------------

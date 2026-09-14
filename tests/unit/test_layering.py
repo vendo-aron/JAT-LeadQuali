@@ -21,6 +21,15 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "leadquali"
 #: The one module allowed to import the SDK, relative to the package root.
 SDK_OWNER = "adapters/llm_anthropic.py"
 
+#: The one module allowed to import ``argon2``, relative to the package root.
+#:
+#: Same rule, same reason, different library. ``api/signing.py`` is standard-library only
+#: on purpose — #30's browser-side form signer imports it, and a reimplementation in
+#: another language has to be able to read :func:`signing_string` without installing a KDF
+#: — so the hashing lives behind ``SecretVerifierPort`` and only this file knows the
+#: algorithm. Changing the parameters, or the algorithm, is then one file's diff.
+KEY_HASHER_OWNER = "adapters/keyhash_argon2.py"
+
 
 def imported_modules(path: Path) -> set[str]:
     """Every top-level module name imported by ``path``, from its AST."""
@@ -54,9 +63,86 @@ def test_only_the_anthropic_adapter_imports_anthropic(path: Path) -> None:
     )
 
 
+def test_only_the_key_hasher_imports_argon2() -> None:
+    """``argon2`` belongs to ``adapters/keyhash_argon2.py`` and to nothing else.
+
+    The rule earns its keep here more than anywhere: a second module reaching for
+    ``PasswordHasher`` would be a second set of cost parameters, a second memo, and a
+    second answer to "how expensive is verifying a key" — on a request path whose whole
+    argument for affording argon2 at all is that the KDF runs at most once per key per
+    process.
+    """
+    assert "argon2" in imported_modules(SRC / KEY_HASHER_OWNER), (
+        "the key hasher is supposed to own the KDF"
+    )
+    for path in python_sources():
+        relative = path.relative_to(SRC).as_posix()
+        if relative == KEY_HASHER_OWNER:
+            continue
+        assert "argon2" not in imported_modules(path), (
+            f"{relative} imports argon2; the KDF belongs in {KEY_HASHER_OWNER} alone"
+        )
+
+
+def test_neither_domain_nor_app_nor_adapters_imports_the_api_layer() -> None:
+    """``domain`` <- ``app`` <- ``adapters``/``api``, and the arrows only point one way.
+
+    Added by #31, which broke it and had to be put back: the Postgres credential resolver
+    needed ``IngestCredential``, ``AuthFailure`` and ``SecretVerifierPort``, and those had
+    been declared in ``api/signing.py``. An adapter importing ``api`` is not a stylistic
+    complaint — it makes the FastAPI module's import graph a dependency of every worker and
+    every CLI that touches the store, and it is the direction in which an import cycle
+    becomes a matter of which file was imported first. The types now live in
+    ``app/credentials.py``, which is where both sides can reach them.
+    """
+    for path in python_sources():
+        relative = path.relative_to(SRC).as_posix()
+        if not relative.startswith(("domain/", "app/", "adapters/")):
+            continue
+        reached = {
+            name
+            for name in _imported_paths(path)
+            if name == "leadquali.api" or name.startswith("leadquali.api.")
+        }
+        assert not reached, (
+            f"{relative} imports {sorted(reached)}; the api layer sits on top of this one, "
+            "so anything both need belongs in app/"
+        )
+
+
+def test_the_credentials_module_stays_standard_library_only() -> None:
+    """``app/credentials.py`` is imported by ``api/signing.py``, which #30's browser-side
+    form signer imports in turn. Anything third-party in here — or anything from
+    ``domain``, which is pydantic all the way down — breaks the property that the whole
+    construction is reimplementable from one file and a spec."""
+    imported = imported_modules(SRC / "app" / "credentials.py")
+    assert imported <= {"__future__", "dataclasses", "datetime", "enum", "typing"}, (
+        f"app/credentials.py imports {sorted(imported)}"
+    )
+
+
+def test_the_signing_module_stays_standard_library_only() -> None:
+    """``api/signing.py`` is imported by #30's form-side signer and by the Lambda handler,
+    and its construction must be reimplementable from the module alone. Anything
+    third-party in here — a KDF, an SDK, a HTTP client — breaks both."""
+    imported = imported_modules(SRC / "api" / "signing.py")
+    assert imported <= {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "hashlib",
+        "hmac",
+        "json",
+        "leadquali",
+        "re",
+        "typing",
+    }, f"api/signing.py imports {sorted(imported)}"
+
+
 def test_domain_and_app_import_no_third_party_sdk() -> None:
     """The same rule, stated for its siblings: no ``boto3``/``sqlalchemy``/``stripe`` either."""
-    forbidden = {"anthropic", "boto3", "sqlalchemy", "stripe", "psycopg", "fastapi"}
+    forbidden = {"anthropic", "argon2", "boto3", "sqlalchemy", "stripe", "psycopg", "fastapi"}
     for path in python_sources():
         relative = path.relative_to(SRC).as_posix()
         if not relative.startswith(("domain/", "app/")):

@@ -192,19 +192,30 @@ To roll one tenant's credentials without an outage, add the new entry alongside 
 one, let the customer switch, then remove the old:
 
 1. Read the current map:
-   ```bash
-   aws secretsmanager get-secret-value \
-     --secret-id leadquali/<stage>/ingest-credentials --query SecretString --output text
-   ```
-2. Add a second entry for the tenant (`<tenant>-2`) with a fresh 32+ character
-   `signing_secret` and the SHA-256 of a fresh API key, and `put-secret-value` the whole
-   map back.
-3. Give the customer the new key and secret. Both entries authenticate while they deploy.
-4. When their traffic is on the new credentials, remove the old entry and
-   `put-secret-value` again.
+   **Superseded by #31.** Ingest credentials no longer live in
+   `leadquali/<stage>/ingest-credentials`, and that secret is read by nothing. A tenant's
+   API keys are rows in `tenant_api_keys` (only an argon2 hash of each is stored) and its
+   HMAC signing secret has its own entry at `leadquali/<stage>/tenant/<slug>/hmac`.
 
-Never write a raw API key into the secret: the map holds `api_key_sha256`, and the key
-itself exists only in the customer's site configuration.
+   Rotate a key with a seven-day overlap, which breaks nothing:
+
+   ```bash
+   python -m leadquali.tenantctl rotate-key <slug> <key_id>
+   ```
+
+   Revoke one immediately — effective on the very next request, because nothing about the
+   row is cached:
+
+   ```bash
+   python -m leadquali.tenantctl revoke-key <slug> <key_id>
+   ```
+
+   Rotating a tenant's **HMAC signing secret** is a different and *breaking* operation with
+   no overlap, and must be coordinated with the customer. The full procedure, and why the
+   two differ, is in `docs/tenant-onboarding.md`.
+
+A raw API key is never written anywhere: only an argon2 hash of its secret half is stored,
+and the key itself exists only in the customer's site configuration.
 
 ## Checks
 

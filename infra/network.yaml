@@ -870,10 +870,12 @@ Resources:
     Properties:
       Name: !Sub "leadquali/${Stage}/ingest-credentials"
       Description: >-
-        Per-tenant ingest API keys and HMAC signing secrets, as
-        {"<tenant_id>": {"api_key_sha256": "<64 hex>", "signing_secret": "..."}}.
-        Written by tenant onboarding, never by CloudFormation. The api_key_sha256 field
-        is a hash: the key itself exists only in the customer's site configuration.
+        LEGACY as of #31 and read by nothing: ingest now authenticates against the tenants
+        and tenant_api_keys tables, and each tenant's HMAC secret has its own entry at
+        leadquali/<stage>/tenant/<slug>/hmac. Retained rather than deleted because the
+        resource carries DeletionPolicy Retain and removing it is a separate, deliberate
+        change; it must be emptied, not repurposed. To revoke a key, use
+        `tenantctl revoke-key` - see docs/tenant-onboarding.md.
       KmsKeyId: !Ref SecretsKmsKey
 
   FeedbackTokenSecret:

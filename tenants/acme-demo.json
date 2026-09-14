@@ -1,0 +1,36 @@
+{
+  "tenant_id": "acme-demo",
+  "name": "Acme Industrial Automation (demo)",
+  "prompt_version": "rubric_v1",
+  "icp_description": "Discrete manufacturers in Germany, Austria and Switzerland running between two and twenty production lines, typically 200-2000 employees, who already own PLC and SCADA infrastructure and are replacing hand-written line-side reporting. The best-fit contact is a plant manager, a head of operations or a controls engineering lead with a named budget line for plant digitalisation and a board-level OEE target to hit this financial year. Buying is slow, committee-driven and almost always preceded by a paid pilot on one line, so an enquiry naming a specific line, a specific downtime problem or an existing pilot budget matters far more than enthusiasm. System integrators and consultancies enquiring on behalf of an unnamed end customer are poor fits, as are companies with a single line, and as is anything outside discrete manufacturing.",
+  "weights": {
+    "authority": 2.0,
+    "budget_signal": 1.75,
+    "icp_fit": 1.5,
+    "intent": 0.75,
+    "urgency": 0.5
+  },
+  "thresholds": {
+    "hot": 65.0,
+    "warm": 40.0,
+    "cold": 20.0
+  },
+  "min_confidence": 0.75,
+  "routing_rules": {
+    "hot": {
+      "action": "email_sales",
+      "destination": "neugeschaeft@acme-demo.invalid"
+    },
+    "warm": {
+      "action": "escalate_human",
+      "destination": "inside-sales-triage@acme-demo.invalid"
+    },
+    "cold": {
+      "action": "email_sales",
+      "destination": "marketing-nurture@acme-demo.invalid"
+    },
+    "disqualified": {
+      "action": "suppress"
+    }
+  }
+}

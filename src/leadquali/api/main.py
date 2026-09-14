@@ -12,7 +12,9 @@ cost, cheapest and most sceptical first:
    signature, stale timestamp, replayed nonce — is the same 401 with the same body. A
    different status, a different message or a measurably different response time would
    turn the endpoint into an oracle for which tenants exist.
-3. **Rate limit**, per authenticated tenant. A hook; #26's usage plans do the real work.
+3. **Rate limit**, per authenticated tenant, from the allowance on that tenant's row. The
+   stage-level throttle in ``infra/template.yaml`` is the account-wide backstop behind it;
+   see ``docs/tenant-onboarding.md`` for why these are not API Gateway usage plans.
 4. **Schema validation.** Only now is the body parsed.
 5. **Persist, screen, enqueue** — :class:`~leadquali.app.ingest.IngestService`.
 6. **202**, with the submission id echoed back.
@@ -51,10 +53,12 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from leadquali.adapters.clock_system import SystemClock
+from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
-from leadquali.adapters.store_postgres import PostgresLeadStore
+from leadquali.adapters.store_postgres import PostgresLeadStore, session_factory_from_env
+from leadquali.adapters.store_tenants import PostgresIngestCredentials, PostgresTenantAdminStore
 from leadquali.api.feedback import FeedbackDeps, register_feedback_routes
-from leadquali.api.ratelimit import NoRateLimit, RateLimiterPort
+from leadquali.api.ratelimit import NoRateLimit, RateLimiterPort, TenantRateLimiter
 from leadquali.api.schemas import (
     MAX_BODY_BYTES,
     ErrorResponse,
@@ -68,7 +72,6 @@ from leadquali.api.signing import (
     AuthRejected,
     IngestCredentialSource,
     ReplayGuard,
-    load_credentials,
     verify,
 )
 from leadquali.app.ingest import IngestRequest, IngestService
@@ -92,6 +95,23 @@ HEALTH_PATH: Final[str] = "/health"
 #: The one thing a rejected caller is told. No variation, ever: "unknown tenant" and
 #: "wrong key" must be indistinguishable, or the endpoint enumerates its own customers.
 _UNAUTHORISED_DETAIL: Final[str] = "authentication failed"
+
+#: The one exception, and it is not an oracle. A caller that reaches this has already
+#: presented a valid, unrevoked key *and passed the argon2 check* for the tenant it named,
+#: so there is nothing left to enumerate — and the integrator on the customer's side needs
+#: to know that the account, not their integration, is what stopped working. See
+#: :mod:`leadquali.app.credentials` for why the status is checked after the KDF.
+_SUSPENDED_DETAIL: Final[str] = "tenant is not active"
+
+#: A dependency of ours is down, not a problem with the request. Answered 503 rather than
+#: 401 or 500: a 401 would tell a good customer their key is bad, and a browser form that
+#: receives a 500 does not retry — the lead would simply be gone, which is invariant 3
+#: broken by an outage in something else.
+_UNAVAILABLE_DETAIL: Final[str] = "temporarily unable to accept submissions; retry shortly"
+
+#: How long a 503'd sender is asked to wait. Comfortably longer than a Secrets Manager
+#: throttle takes to clear and shorter than a visitor will keep a tab open.
+_UNAVAILABLE_RETRY_AFTER: Final[int] = 5
 
 _NO_STORE: Final[dict[str, str]] = {"Cache-Control": "no-store"}
 
@@ -118,6 +138,13 @@ def build_deps(
 ) -> IngestDeps:
     """Wire the production dependencies: Postgres, the in-process queue, the real clock.
 
+    Credentials come from the database (``tenants`` + ``tenant_api_keys``), not from the
+    ``INGEST_CREDENTIALS`` environment secret. That is the whole point of #31: a revocation
+    is then one ``UPDATE`` that takes effect on the next request, where editing a JSON
+    secret would have to propagate to every warm container and would leave the old value
+    live for the length of a cache TTL. ``StaticCredentials`` is still there for the tests
+    and for a laptop, but nothing assembles it here.
+
     The queue is ``InProcessLeadQueue`` because there is no SQS yet — #26 owns the producer
     and swaps it in here, behind :class:`~leadquali.app.ingest.LeadQueuePort`, with no
     change to the route. Until then a lead accepted on one process is qualified by that
@@ -125,23 +152,29 @@ def build_deps(
     the whole pipeline on a laptop and not enough to run it in production.
 
     Raises:
-        RuntimeError: ``DATABASE_URL`` or ``INGEST_CREDENTIALS`` is not configured.
-        IngestCredentialsError: the credentials are configured but unreadable. Failing at
-            startup is the point: a process that started with no credentials would reject
-            every real customer, and one that treated "none configured" as "no auth
+        RuntimeError: ``DATABASE_URL`` is not configured. Loud at wiring time rather than
+            at the first lead: a process that started without a credential store would
+            reject every real customer, and one that treated "no store" as "no auth
             needed" would accept every stranger.
     """
     resolved = settings if settings is not None else get_settings()
     clock = SystemClock()
+    sessions = session_factory_from_env(resolved)
+    # One hasher per process, because its memo and its per-key failure gate are what keep
+    # argon2 off the hot path; a fresh one per request would defeat both.
+    verifier = Argon2KeyHasher()
     return IngestDeps(
         service=IngestService(
-            store=PostgresLeadStore.from_env(resolved),
+            store=PostgresLeadStore(sessions),
             queue=InProcessLeadQueue(),
             clock=clock,
             spam_policy=spam_policy,
         ),
-        credentials=load_credentials(resolved.require_ingest_credentials()),
+        credentials=PostgresIngestCredentials(
+            sessions, verifier=verifier, resolver=resolved.secret_resolver()
+        ),
         clock=clock,
+        rate_limiter=TenantRateLimiter(PostgresTenantAdminStore(sessions)),
     )
 
 
@@ -218,9 +251,14 @@ def create_app(
         responses={
             202: {"model": IngestAccepted, "description": "Recorded. The verdict is not public."},
             401: {"model": ErrorResponse, "description": "Key or signature rejected."},
+            403: {"model": ErrorResponse, "description": "The tenant is suspended."},
             413: {"model": ErrorResponse, "description": "Body larger than the limit."},
             422: {"model": ValidationErrorResponse, "description": "Schema validation failed."},
             429: {"model": ErrorResponse, "description": "Rate limited."},
+            503: {
+                "model": ErrorResponse,
+                "description": "A dependency is unavailable; retry after the given delay.",
+            },
         },
     )
     async def ingest(request: Request) -> Response:
@@ -262,8 +300,7 @@ async def _handle_ingest_traced(request: Request, deps: IngestDeps, trace_id: st
         now=deps.clock.now(),
     )
     if isinstance(auth, AuthRejected):
-        _log_rejection(auth.failure, request)
-        return _error(401, _UNAUTHORISED_DETAIL)
+        return _refuse(auth.failure, request)
 
     limit = deps.rate_limiter.check(tenant_id=auth.tenant_id, now=deps.clock.now())
     if not limit.allowed:
@@ -342,12 +379,39 @@ async def _read_bounded_body(request: Request, limit: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def _log_rejection(failure: AuthFailure, request: Request) -> None:
+def _refuse(failure: AuthFailure, request: Request) -> JSONResponse:
+    """Turn a rejection into the one answer the caller is allowed to see.
+
+    Three answers, and the split matters more than it looks. Almost everything is an
+    identical 401, because a different status or a different message for "no such tenant"
+    than for "wrong key" is a free enumeration oracle. A suspended tenant is a 403 —
+    reachable only *after* the argon2 check, so only by someone who has proved they hold
+    the secret. And a dependency we could not read is a 503 with a ``Retry-After``: the
+    sender did nothing wrong and is the one party who can still save the lead by coming
+    back.
+    """
+    match failure:
+        case AuthFailure.TENANT_SUSPENDED:
+            status, detail, headers = 403, _SUSPENDED_DETAIL, None
+        case AuthFailure.UNAVAILABLE:
+            status, detail, headers = (
+                503,
+                _UNAVAILABLE_DETAIL,
+                {"Retry-After": str(_UNAVAILABLE_RETRY_AFTER)},
+            )
+        case _:
+            status, detail, headers = 401, _UNAUTHORISED_DETAIL, None
+    _log_rejection(failure, request, status)
+    return _error(status, detail, headers=headers)
+
+
+def _log_rejection(failure: AuthFailure, request: Request, status: int) -> None:
     """Record *why* a request was refused, where only we can see it.
 
     The tenant header is logged as claimed — it is an assertion by a stranger, not a fact,
     and it is the only handle an operator has on "a customer's form has the wrong key"
-    versus "someone is probing us".
+    versus "someone is probing us". The one case where it is a *fact* is a suspended
+    tenant, which is also the one case the caller is told anything about.
     """
     log_event(
         LOGGER,
@@ -356,7 +420,7 @@ def _log_rejection(failure: AuthFailure, request: Request) -> None:
         reason=failure.value,
         claimed_tenant=request.headers.get("x-leadquali-tenant", "-")[:64],
         client=request.client.host if request.client is not None else "-",
-        status=401,
+        status=status,
     )
 
 
