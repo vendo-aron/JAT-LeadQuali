@@ -2,18 +2,25 @@
 
 This is the one module in the system where a test failing open would be a security hole
 rather than a bug, so the assertions are about what is *rejected*: a forged signature, a
-signature over a different body, a stale clock, a replayed nonce, a key that belongs to
-another tenant. The happy path is one test; the rest is the attack surface.
+signature over a different body, a stale clock, a replayed nonce, a revoked key, an expired
+key, a key that belongs to another tenant. The happy path is one test; the rest is the
+attack surface.
+
+The verifier is the real :class:`~leadquali.adapters.keyhash_argon2.Argon2KeyHasher` rather
+than a double. A fake that always said "yes" would let a mistake in the credential source's
+ordering — running the KDF before the revocation check, say — pass every test here.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.api.signing import (
     HEADER_KEY,
     HEADER_NONCE,
@@ -26,32 +33,70 @@ from leadquali.api.signing import (
     Authenticated,
     AuthFailure,
     AuthRejected,
+    CredentialRejected,
     IngestCredential,
     IngestCredentialsError,
     ReplayGuard,
     StaticCredentials,
-    hash_api_key,
+    StaticTenantCredentials,
+    StoredApiKey,
     load_credentials,
     sign,
     signing_string,
     verify,
 )
+from leadquali.app.api_keys import ApiKeyParts, KeyEnvironment
 
 TENANT = "acme"
-API_KEY = "lq_live_2f7c1d6a9b4e5f80"
+KEY_ID = "2f7c1d6a9b4e5f80"
+KEY_SECRET = "kf8Qz1Rr2sK0dW7pYb3nJ4mVxC6tLg9hEu5aZo1QsPI"
+API_KEY = ApiKeyParts(environment=KeyEnvironment.LIVE, key_id=KEY_ID, secret=KEY_SECRET).text
 SECRET = "s3cr3t-signing-material-at-least-32-chars"
+OTHER_SECRET = "Zx91QsPIkf8Qz1Rr2sK0dW7pYb3nJ4mVxC6tLg9hEu5"
 BODY = b'{"submission_id":"abc","form":{}}'
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 
-CREDENTIALS = StaticCredentials(
-    {
-        TENANT: IngestCredential(
-            tenant_id=TENANT,
-            api_key_sha256=hash_api_key(API_KEY),
-            signing_secret=SECRET.encode("utf-8"),
-        )
-    }
-)
+#: One process-wide hasher, so the whole file costs a handful of real KDF calls.
+VERIFIER = Argon2KeyHasher()
+KEY_HASH = VERIFIER.hash_secret(KEY_SECRET)
+OTHER_HASH = VERIFIER.hash_secret(OTHER_SECRET)
+
+
+def key_text(key_id: str, secret: str) -> str:
+    """The wire form of a key with these parts."""
+    return ApiKeyParts(environment=KeyEnvironment.LIVE, key_id=key_id, secret=secret).text
+
+
+def tenant_entry(
+    *,
+    tenant_id: str = TENANT,
+    key_id: str = KEY_ID,
+    key_hash: str = KEY_HASH,
+    revoked: bool = False,
+    expires_at: datetime | None = None,
+    status: str = "active",
+    secret: str = SECRET,
+) -> StaticTenantCredentials:
+    """One tenant's stored credentials, with any one piece overridable."""
+    return StaticTenantCredentials(
+        tenant_id=tenant_id,
+        signing_secret=secret.encode("utf-8"),
+        keys=(
+            StoredApiKey(key_id=key_id, key_hash=key_hash, revoked=revoked, expires_at=expires_at),
+        ),
+        status=status,
+    )
+
+
+def credentials(*entries: StaticTenantCredentials, now: datetime = NOW) -> StaticCredentials:
+    """A credential source over the given tenants, with the clock pinned."""
+    chosen = entries or (tenant_entry(),)
+    return StaticCredentials(
+        {entry.tenant_id: entry for entry in chosen}, verifier=VERIFIER, now=lambda: now
+    )
+
+
+CREDENTIALS = credentials()
 
 
 def headers(
@@ -99,6 +144,7 @@ def check(
     path: str = "/leads",
     now: datetime = NOW,
     guard: ReplayGuard | None = None,
+    source: StaticCredentials | None = None,
 ) -> Authenticated | AuthRejected:
     """Verify a request against ``POST /leads``, with one piece of it tampered with."""
     return verify(
@@ -115,7 +161,7 @@ def check(
             path=path,
         ),
         body=body,
-        credentials=CREDENTIALS,
+        credentials=source if source is not None else CREDENTIALS,
         replay_guard=guard if guard is not None else ReplayGuard(),
         now=now,
     )
@@ -183,6 +229,7 @@ def test_a_correctly_signed_request_is_accepted() -> None:
     result = check()
     assert isinstance(result, Authenticated)
     assert result.tenant_id == TENANT
+    assert result.key_id == KEY_ID
 
 
 def test_a_timestamp_at_the_edge_of_the_window_is_still_accepted() -> None:
@@ -190,15 +237,91 @@ def test_a_timestamp_at_the_edge_of_the_window_is_still_accepted() -> None:
     assert isinstance(check(timestamp=stamp), Authenticated)
 
 
+def test_a_second_key_lets_a_tenant_rotate_without_downtime() -> None:
+    """The property the whole ``tenant_api_keys`` table exists for."""
+    source = StaticCredentials(
+        {
+            TENANT: StaticTenantCredentials(
+                tenant_id=TENANT,
+                signing_secret=SECRET.encode(),
+                keys=(
+                    StoredApiKey(key_id=KEY_ID, key_hash=KEY_HASH),
+                    StoredApiKey(key_id="b" * 16, key_hash=OTHER_HASH),
+                ),
+            )
+        },
+        verifier=VERIFIER,
+        now=lambda: NOW,
+    )
+    assert isinstance(check(source=source), Authenticated)
+    assert isinstance(
+        check(source=source, api_key=key_text("b" * 16, OTHER_SECRET), nonce="nonce-0000000002"),
+        Authenticated,
+    )
+
+
 # ------------------------------------------------------------------------ rejection
 
 
-def test_an_unknown_tenant_is_rejected() -> None:
+def test_an_unknown_key_is_rejected() -> None:
+    """No row for this ``key_id``: one indexed miss, no KDF, no distinction on the wire."""
+    assert rejection(check(api_key=key_text("f" * 16, KEY_SECRET))) is AuthFailure.UNKNOWN_TENANT
+
+
+def test_an_unknown_tenant_header_with_a_real_key_is_rejected() -> None:
+    """A key holder cannot borrow a neighbour's name, and is told nothing about it."""
     assert rejection(check(tenant="nobody")) is AuthFailure.UNKNOWN_TENANT
 
 
-def test_a_wrong_api_key_is_rejected_even_with_a_valid_signature() -> None:
-    assert rejection(check(api_key="lq_live_wrong")) is AuthFailure.BAD_KEY
+def test_a_key_from_another_tenant_is_rejected() -> None:
+    """Tenant A's key presented under tenant B's header. Invariant 4 at the door."""
+    source = credentials(
+        tenant_entry(),
+        tenant_entry(tenant_id="other", key_id="b" * 16, key_hash=OTHER_HASH),
+    )
+    assert (
+        rejection(check(source=source, api_key=key_text("b" * 16, OTHER_SECRET)))
+        is AuthFailure.UNKNOWN_TENANT
+    )
+
+
+def test_a_wrong_secret_on_a_real_key_id_is_rejected() -> None:
+    assert rejection(check(api_key=key_text(KEY_ID, "a" * 43))) is AuthFailure.BAD_KEY
+
+
+def test_a_revoked_key_is_rejected_immediately() -> None:
+    """The acceptance criterion. Nothing about a row is cached, so this needs no expiry."""
+    assert rejection(check(source=credentials(tenant_entry(revoked=True)))) is (
+        AuthFailure.REVOKED_KEY
+    )
+
+
+def test_a_key_past_its_rotation_overlap_is_rejected() -> None:
+    source = credentials(tenant_entry(expires_at=NOW - timedelta(seconds=1)))
+    assert rejection(check(source=source)) is AuthFailure.REVOKED_KEY
+
+
+def test_a_key_inside_its_rotation_overlap_still_works() -> None:
+    source = credentials(tenant_entry(expires_at=NOW + timedelta(days=7)))
+    assert isinstance(check(source=source), Authenticated)
+
+
+@pytest.mark.parametrize("status", ["suspended", "disabled"])
+def test_a_tenant_that_is_not_active_is_refused_with_its_own_reason(status: str) -> None:
+    """Distinct from a bad key on purpose: this caller has already proved who it is."""
+    source = credentials(tenant_entry(status=status))
+    assert rejection(check(source=source)) is AuthFailure.TENANT_SUSPENDED
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    ["", "not-a-key", "lq_live_short_x", "lq_staging_" + "0" * 16 + "_" + "a" * 43],
+)
+def test_a_malformed_key_is_refused_without_touching_the_kdf(api_key: str) -> None:
+    """The cheapest rejection there is: no lookup, no KDF."""
+    before = VERIFIER.kdf_calls
+    assert rejection(check(api_key=api_key)) is AuthFailure.MALFORMED
+    assert VERIFIER.kdf_calls == before
 
 
 def test_a_missing_header_is_rejected_without_a_lookup() -> None:
@@ -291,20 +414,12 @@ def test_a_replay_is_only_recorded_for_a_request_that_actually_verified() -> Non
 
 def test_nonces_are_scoped_per_tenant() -> None:
     guard = ReplayGuard()
-    other = StaticCredentials(
-        {
-            "other": IngestCredential(
-                tenant_id="other",
-                api_key_sha256=hash_api_key(API_KEY),
-                signing_secret=SECRET.encode(),
-            )
-        }
-    )
+    other = credentials(tenant_entry(tenant_id="other", key_id="c" * 16, key_hash=OTHER_HASH))
     assert isinstance(check(guard=guard), Authenticated)
     result = verify(
         method="POST",
         path="/leads",
-        headers=headers(tenant="other"),
+        headers=headers(tenant="other", api_key=key_text("c" * 16, OTHER_SECRET)),
         body=BODY,
         credentials=other,
         replay_guard=guard,
@@ -335,27 +450,80 @@ def test_the_replay_guard_is_bounded_in_size() -> None:
     assert guard.size <= 10
 
 
+# ------------------------------------------------------- the order of the cheap checks
+
+
+def test_the_kdf_runs_only_after_every_free_check_has_passed() -> None:
+    """A revoked key, a suspended tenant and a foreign key_id must all cost nothing.
+
+    This is the property the whole "argon2 on the request path" argument rests on, so it is
+    asserted by counting KDF calls rather than by reading the code.
+    """
+    revoked = credentials(tenant_entry(revoked=True))
+    suspended = credentials(tenant_entry(status="suspended"))
+    before = VERIFIER.kdf_calls
+    assert rejection(check(source=revoked)) is AuthFailure.REVOKED_KEY
+    assert rejection(check(source=suspended)) is AuthFailure.TENANT_SUSPENDED
+    assert rejection(check(tenant="nobody")) is AuthFailure.UNKNOWN_TENANT
+    assert VERIFIER.kdf_calls == before
+
+
 # ----------------------------------------------------------------------- credentials
 
 
-def test_hash_api_key_is_the_sha256_of_the_key() -> None:
-    assert hash_api_key(API_KEY) == hashlib.sha256(API_KEY.encode()).hexdigest()
+def _doc(
+    *,
+    tenant: str = "acme",
+    tenant_fields: dict[str, object] | None = None,
+    **key_fields: object,
+) -> str:
+    """A well-formed credential document with one field overridden.
+
+    Built with ``json.dumps`` rather than string interpolation so that a test about
+    malformed JSON is the only place malformed JSON appears.
+    """
+    key: dict[str, object] = {"key_id": KEY_ID, "key_hash": KEY_HASH}
+    key.update(key_fields)
+    entry: dict[str, object] = {"signing_secret": SECRET, "keys": [key]}
+    entry.update(tenant_fields or {})
+    return json.dumps({tenant: entry})
 
 
 def test_credentials_load_from_json() -> None:
-    entry = f'{{"api_key_sha256": "{hash_api_key(API_KEY)}", "signing_secret": "{SECRET}"}}'
-    raw = f'{{"acme": {entry}}}'
-    credentials = load_credentials(raw)
-    stored = credentials.get("acme")
-    assert stored is not None
-    assert stored.signing_secret == SECRET.encode()
+    loaded = load_credentials(_doc(), verifier=VERIFIER)
+    resolved = loaded.resolve(tenant_id="acme", api_key=API_KEY)
+    assert isinstance(resolved, IngestCredential)
+    assert resolved.signing_secret == SECRET.encode()
+    assert resolved.key_id == KEY_ID
 
 
-def test_an_unknown_tenant_reads_back_as_none_not_an_error() -> None:
-    assert CREDENTIALS.get("nobody") is None
+def test_a_loaded_revoked_key_is_rejected() -> None:
+    loaded = load_credentials(_doc(revoked=True), verifier=VERIFIER)
+    assert loaded.resolve(tenant_id="acme", api_key=API_KEY) == CredentialRejected(
+        AuthFailure.REVOKED_KEY
+    )
 
 
-HASHED = hash_api_key(API_KEY)
+def test_a_loaded_expiry_is_honoured() -> None:
+    loaded = load_credentials(_doc(expires_at="2020-01-01T00:00:00+00:00"), verifier=VERIFIER)
+    assert loaded.resolve(tenant_id="acme", api_key=API_KEY) == CredentialRejected(
+        AuthFailure.REVOKED_KEY
+    )
+
+
+def test_an_unknown_tenant_reads_back_as_a_rejection_not_an_error() -> None:
+    assert CREDENTIALS.resolve(tenant_id="nobody", api_key=API_KEY) == CredentialRejected(
+        AuthFailure.UNKNOWN_TENANT
+    )
+
+
+def test_one_key_id_may_not_belong_to_two_tenants() -> None:
+    """It is the lookup handle; a duplicate would make ownership depend on dict order."""
+    with pytest.raises(IngestCredentialsError, match="more than one tenant"):
+        StaticCredentials(
+            {"a": tenant_entry(tenant_id="a"), "b": tenant_entry(tenant_id="b")},
+            verifier=VERIFIER,
+        )
 
 
 @pytest.mark.parametrize(
@@ -364,20 +532,58 @@ HASHED = hash_api_key(API_KEY)
         "not json",
         "[]",
         '{"acme": "just-a-string"}',
-        f'{{"acme": {{"signing_secret": "{SECRET}"}}}}',
-        f'{{"acme": {{"api_key_sha256": "zz", "signing_secret": "{SECRET}"}}}}',
-        f'{{"acme": {{"api_key_sha256": "{HASHED}", "signing_secret": "tooshort"}}}}',
-        f'{{"Bad Tenant": {{"api_key_sha256": "{HASHED}", "signing_secret": "{SECRET}"}}}}',
+        json.dumps({"acme": {"keys": [{"key_id": KEY_ID, "key_hash": KEY_HASH}]}}),
+        json.dumps({"acme": {"signing_secret": SECRET}}),
+        json.dumps({"acme": {"signing_secret": SECRET, "keys": []}}),
+        json.dumps({"acme": {"signing_secret": SECRET, "keys": ["nope"]}}),
+        _doc(key_id="ZZ"),
+        _doc(key_id=KEY_ID.upper()),
+        # A SHA-256 digest left behind by the pre-argon2 scheme.
+        _doc(key_hash="0" * 64),
+        json.dumps({"acme": {"signing_secret": "tooshort", "keys": [{"key_id": KEY_ID}]}}),
+        # A naive expiry would raise at request time rather than at load.
+        _doc(expires_at="2020-01-01T00:00:00"),
+        _doc(expires_at="not a date"),
+        _doc(expires_at=17),
+        _doc(revoked="yes"),
+        _doc(tenant_fields={"status": "asleep"}),
+        _doc(tenant="Bad Tenant"),
     ],
 )
 def test_malformed_credential_configuration_fails_loudly_at_load(raw: str) -> None:
     """A deployment with unreadable credentials must not start and accept everything."""
     with pytest.raises(IngestCredentialsError):
-        load_credentials(raw)
+        load_credentials(raw, verifier=VERIFIER)
+
+
+def test_two_keys_in_one_entry_may_not_share_a_key_id() -> None:
+    raw = json.dumps(
+        {
+            "acme": {
+                "signing_secret": SECRET,
+                "keys": [
+                    {"key_id": KEY_ID, "key_hash": KEY_HASH},
+                    {"key_id": KEY_ID, "key_hash": OTHER_HASH},
+                ],
+            }
+        }
+    )
+    with pytest.raises(IngestCredentialsError, match="duplicate key_id"):
+        load_credentials(raw, verifier=VERIFIER)
 
 
 def test_a_credential_never_renders_its_secret() -> None:
     """Invariant-adjacent: a repr lands in a traceback, and tracebacks land in logs."""
-    rendered = repr(CREDENTIALS.get(TENANT))
+    resolved = CREDENTIALS.resolve(tenant_id=TENANT, api_key=API_KEY)
+    assert isinstance(resolved, IngestCredential)
+    rendered = repr(resolved)
     assert SECRET not in rendered
     assert API_KEY not in rendered
+    assert KEY_SECRET not in rendered
+    assert KEY_ID in rendered
+
+
+def test_the_stored_records_never_render_secret_material() -> None:
+    entry = tenant_entry()
+    assert SECRET not in repr(entry)
+    assert KEY_HASH not in repr(entry.keys[0])

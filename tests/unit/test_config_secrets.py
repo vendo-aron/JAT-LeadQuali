@@ -333,8 +333,18 @@ def test_the_database_password_never_appears_in_an_error() -> None:
 
 
 def _ingest_map(signing_secret: str) -> str:
+    """One tenant's entry in the credential map, in #31's shape.
+
+    ``Settings`` never parses this — ``api.signing.load_credentials`` does — but a fixture
+    that describes a format the system stopped using is a lie a future reader will believe.
+    """
     return json.dumps(
-        {"acme": {"api_key_sha256": "a" * 64, "signing_secret": signing_secret}},
+        {
+            "acme": {
+                "signing_secret": signing_secret,
+                "keys": [{"key_id": "a" * 16, "key_hash": "$argon2id$v=19$m=19456,t=2,p=1$x$y"}],
+            }
+        },
     )
 
 

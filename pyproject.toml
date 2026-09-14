@@ -5,6 +5,9 @@ description = "AI lead qualification agent: qualify inbound web-form leads and r
 requires-python = ">=3.13"
 dependencies = [
     "anthropic",
+    # Password hashing for tenant API keys (#31). A runtime dependency of the ingest
+    # Lambda, not a dev tool: adapters/keyhash_argon2.py verifies every presented key.
+    "argon2-cffi",
     "fastapi",
     "uvicorn[standard]",
     "pydantic>=2",

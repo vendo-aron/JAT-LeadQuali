@@ -277,6 +277,18 @@ Resources:
             SecretArn: !Ref FeedbackTokenSecretArn
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref DatabaseSecretArn
+        # Every tenant's HMAC signing secret, by path rather than by ARN (#31). Onboarding
+        # creates these at leadquali/<stage>/tenant/<slug>/hmac and there is one per
+        # customer, so naming them individually would make adding a customer a stack
+        # update - which is exactly the "onboarding is a config write, not a deploy"
+        # property this phase exists to establish. The wildcard is scoped to this stage's
+        # tenant prefix and to GetSecretValue alone; the trailing * also covers the
+        # six-character suffix Secrets Manager appends to every secret ARN.
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub >-
+                arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:leadquali/${Stage}/tenant/*
         - !Ref DecryptSecretsPolicy
         - VPCAccessPolicy: {}
       Events:

@@ -4,10 +4,11 @@ The database half of seeding is covered in ``tests/integration/test_seed.py``. E
 here is about the part that runs before a connection is opened: reading the tenant config
 file, deciding it is usable, and failing legibly when it is not.
 
-The fixture document below mirrors the real ``tenants/default.json``, which ships with
-issue #8 and is not on this branch. That is the whole reason this script validates
-structurally instead of importing ``TenantConfig``; see the module docstring in
-``leadquali.adapters.seed``.
+Validation is ``TenantConfig``'s and nothing else's (#31 tightened this; the script used to
+do a shallow key-presence check because #8 was not on the branch yet). So the tests below
+are about what the *seed script* adds on top: a legible error for a missing file, for a
+file that is not JSON, and for a document the rubric model rejects — and the fact that an
+accepted document is stored byte-for-byte as it was read.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from leadquali.adapters.seed import (
     tenant_id_for,
 )
 
-# Shaped exactly like tenants/default.json on #8's branch.
+# Shaped exactly like tenants/default.json, and complete: every tier is routed, because
+# TenantConfig refuses a config that leaves one without a rule.
 A_TENANT_DOCUMENT: dict[str, Any] = {
     "tenant_id": "default",
     "name": "JAT-LeadQuali (internal)",
@@ -44,6 +46,8 @@ A_TENANT_DOCUMENT: dict[str, Any] = {
     "min_confidence": 0.6,
     "routing_rules": {
         "hot": {"action": "email_sales", "destination": "sales@example.invalid"},
+        "warm": {"action": "email_sales", "destination": "sales@example.invalid"},
+        "cold": {"action": "email_sales", "destination": "sales@example.invalid"},
         "disqualified": {"action": "suppress"},
     },
 }
@@ -100,13 +104,15 @@ def test_a_json_document_that_is_not_an_object_is_rejected(tmp_path: Path) -> No
         load_tenant_document(_write(tmp_path, ["not", "a", "config"]))
 
 
-@pytest.mark.parametrize(
-    "missing_key",
-    ["name", "icp_description", "weights", "thresholds", "min_confidence", "routing_rules"],
-)
-def test_a_document_missing_a_rubric_key_is_rejected(tmp_path: Path, missing_key: str) -> None:
+@pytest.mark.parametrize("missing_key", ["tenant_id", "name", "icp_description", "routing_rules"])
+def test_a_document_missing_a_required_rubric_key_is_rejected(
+    tmp_path: Path, missing_key: str
+) -> None:
     """Invariant 1: a tenant without a rubric is a tenant every config load rejects, so the
-    seed script must not be the thing that puts one in the database."""
+    seed script must not be the thing that puts one in the database.
+
+    These four have no defaults and cannot be guessed — a destination in particular, where
+    a placeholder would mean a whole tier's leads going nowhere with no error at all."""
     document = {k: v for k, v in A_TENANT_DOCUMENT.items() if k != missing_key}
 
     with pytest.raises(SeedError) as caught:
@@ -115,15 +121,55 @@ def test_a_document_missing_a_rubric_key_is_rejected(tmp_path: Path, missing_key
     assert missing_key in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "optional_key", ["weights", "thresholds", "min_confidence", "prompt_version"]
+)
+def test_the_rubric_numerics_fall_back_to_the_documented_defaults(
+    tmp_path: Path, optional_key: str
+) -> None:
+    """The other half of the same rule: onboarding is three fields plus a routing table,
+    and an unopinionated tenant inherits the house policy rather than being refused."""
+    document = {k: v for k, v in A_TENANT_DOCUMENT.items() if k != optional_key}
+    assert load_tenant_document(_write(tmp_path, document)) == document
+
+
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_a_blank_name_is_rejected(tmp_path: Path, blank: str) -> None:
-    with pytest.raises(SeedError, match="non-empty string"):
+    with pytest.raises(SeedError, match="name"):
         load_tenant_document(_write(tmp_path, {**A_TENANT_DOCUMENT, "name": blank}))
 
 
 def test_a_rubric_key_of_the_wrong_kind_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(SeedError, match="'weights' must be an object"):
+    with pytest.raises(SeedError, match="weights"):
         load_tenant_document(_write(tmp_path, {**A_TENANT_DOCUMENT, "weights": [1, 2, 3]}))
+
+
+def test_a_config_that_would_break_scoring_is_rejected(tmp_path: Path) -> None:
+    """The tightening #31 made: the seed script validates with ``TenantConfig`` and nothing
+    else, so a config the worker would refuse at 3am is refused here instead.
+
+    Overlapping tier bounds are the example because the old shallow check — "thresholds is
+    an object" — waved this through, and the result is every lead in the gap mis-routed."""
+    broken = {**A_TENANT_DOCUMENT, "thresholds": {"hot": 40.0, "warm": 55.0, "cold": 30.0}}
+    with pytest.raises(SeedError, match="thresholds overlap"):
+        load_tenant_document(_write(tmp_path, broken))
+
+
+def test_a_weight_for_a_dimension_the_model_does_not_score_is_rejected(tmp_path: Path) -> None:
+    """The other half of the same tightening: a typo in a weight name used to be stored."""
+    weights = {**A_TENANT_DOCUMENT["weights"], "vibes": 2.0}
+    with pytest.raises(SeedError, match="unknown dimension vibes"):
+        load_tenant_document(_write(tmp_path, {**A_TENANT_DOCUMENT, "weights": weights}))
+
+
+def test_every_shipped_tenant_file_is_seedable() -> None:
+    """The files in ``tenants/`` are what an operator seeds from; a broken one is an
+    onboarding that fails on the customer's first lead rather than on the command."""
+    tenants_dir = Path(__file__).resolve().parents[2] / "tenants"
+    shipped = sorted(tenants_dir.glob("*.json"))
+    assert shipped, "expected at least the default tenant's config to ship"
+    for path in shipped:
+        assert load_tenant_document(path)["tenant_id"] == path.stem
 
 
 @pytest.mark.parametrize("bad_confidence", [-0.1, 1.5, "high", True])

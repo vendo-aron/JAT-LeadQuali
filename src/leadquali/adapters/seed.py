@@ -10,25 +10,20 @@ A freshly migrated database therefore has no tenant at all, and nothing can be i
 until one exists. Seeding is not a convenience — it is the second half of "create the
 database".
 
-Cross-branch dependency (read this before changing the validation below)
------------------------------------------------------------------------
-The authoritative rubric model, ``TenantConfig``, and the file this script reads,
-``tenants/default.json``, both belong to issue #8, which is not merged with this branch
-yet. This module therefore **does not import** ``leadquali.domain.tenant_config`` — the
-import would not resolve here and mypy would fail on it.
+One validator, not two
+----------------------
+:func:`load_tenant_document` validates with ``TenantConfig`` and with nothing else. It
+used to do a shallow key-presence check instead, because #8 (which owns ``TenantConfig``
+and ``tenants/default.json``) was not on this branch; that check is gone, along with the
+``REQUIRED_CONFIG_KEYS`` list it read from. A second, independent copy of the rubric's
+validation rules living here would drift away from ``TenantConfig`` within a release, and
+the copy that disagreed would be the one that let a bad config into the database.
 
-What it does instead is deliberately shallow: it reads the JSON document, checks that the
-handful of keys the rubric is made of are present and of roughly the right kind, and stores
-the document verbatim in ``icp_config``. It is a *smoke test for an obviously wrong file*,
-not a schema validator, and it is written to stay that way. A second, independent copy of
-the rubric's validation rules living here would drift away from ``TenantConfig`` within a
-release, and the copy that disagreed would be the one that let a bad config into the
-database.
-
-Once #8 and #15 are both on the default branch, tighten this in one commit:
-:func:`load_tenant_document` should call ``TenantConfig.model_validate(document)`` and let
-the model be the only validator, and :data:`REQUIRED_CONFIG_KEYS` together with
-:func:`_check_shape` should be deleted rather than kept in sync.
+So a config that would break scoring — a gap between two tier bands, a weight for a
+dimension the model does not score, a tier with no routing rule — is refused by the seed
+script for exactly the same reason and with exactly the same message as it would be
+refused at load time by the worker. The same rule applies to the admin path
+(``leadquali.app.tenants.TenantService``), which validates through the same model.
 """
 
 from __future__ import annotations
@@ -42,14 +37,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-from sqlalchemy import Connection, create_engine, select
+from sqlalchemy import Connection, create_engine, func, select
 
 from leadquali.adapters.db_schema import Tenant, metadata
+from leadquali.app.tenant_ids import TENANT_ID_NAMESPACE, tenant_id_for
 from leadquali.config import Settings
+from leadquali.domain.tenant_config import TenantConfig, TenantConfigError
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",
     "DEFAULT_TENANT_SLUG",
+    "TENANT_ID_NAMESPACE",
     "SeedError",
     "SeedResult",
     "load_tenant_document",
@@ -58,22 +56,8 @@ __all__ = [
     "tenant_id_for",
 ]
 
-TENANT_ID_NAMESPACE: Final = uuid.UUID("c0ee1346-dad8-59ff-9326-afab90a0f177")
-"""UUID5 namespace for tenant slugs. Fixed forever: it is what makes seeding idempotent."""
-
 DEFAULT_TENANT_SLUG: Final = "default"
 """The slug of the internal tenant, matching ``tenant_id`` in ``tenants/default.json``."""
-
-REQUIRED_CONFIG_KEYS: Final[tuple[str, ...]] = (
-    "icp_description",
-    "weights",
-    "thresholds",
-    "min_confidence",
-    "routing_rules",
-    "prompt_version",
-)
-"""The rubric keys #8's ``TenantConfig`` is built from. See the module docstring: this is a
-presence check, not a schema — ``TenantConfig`` is the validator once it is available."""
 
 DEFAULT_CONFIG_PATH: Final = Path(__file__).resolve().parents[3] / "tenants" / "default.json"
 """``<repo>/tenants/default.json``, for running the script from a checkout. Only a default;
@@ -93,42 +77,6 @@ class SeedResult:
 
     created: bool
     """True if the row was inserted, False if an existing row was updated in place."""
-
-
-def tenant_id_for(slug: str) -> uuid.UUID:
-    """Return the stable tenant UUID for ``slug``.
-
-    Derived rather than random so that seeding is genuinely idempotent: re-running the
-    script updates the tenant it created last time instead of adding a second one, and the
-    default tenant has the same id in every developer's database and in every environment,
-    which makes a fixture or a support query portable.
-    """
-    return uuid.uuid5(TENANT_ID_NAMESPACE, slug)
-
-
-def _check_shape(document: Mapping[str, Any]) -> None:
-    """Reject a file that is obviously not a tenant config. See the module docstring."""
-    missing = [key for key in ("name", *REQUIRED_CONFIG_KEYS) if key not in document]
-    if missing:
-        raise SeedError(f"tenant config is missing required key(s): {', '.join(sorted(missing))}")
-
-    for key in ("name", "icp_description", "prompt_version"):
-        value = document[key]
-        if not isinstance(value, str) or not value.strip():
-            raise SeedError(f"tenant config key {key!r} must be a non-empty string")
-
-    for key in ("weights", "thresholds", "routing_rules"):
-        if not isinstance(document[key], dict):
-            raise SeedError(f"tenant config key {key!r} must be an object")
-
-    confidence = document["min_confidence"]
-    # bool is an int in Python, and `True` is not a confidence.
-    if isinstance(confidence, bool) or not isinstance(confidence, int | float):
-        raise SeedError("tenant config key 'min_confidence' must be a number")
-    if not 0.0 <= float(confidence) <= 1.0:
-        raise SeedError(
-            f"tenant config key 'min_confidence' must be between 0 and 1, got {confidence}"
-        )
 
 
 def load_tenant_document(path: Path) -> dict[str, Any]:
@@ -158,7 +106,10 @@ def load_tenant_document(path: Path) -> dict[str, Any]:
             f"tenant config file must contain a JSON object, got {type(document).__name__}: {path}"
         )
 
-    _check_shape(document)
+    try:
+        TenantConfig.from_dict(document)
+    except TenantConfigError as exc:
+        raise SeedError(f"tenant config file is not a valid rubric: {path} ({exc})") from exc
     return document
 
 
@@ -182,11 +133,18 @@ def seed_tenant(connection: Connection, document: Mapping[str, Any]) -> SeedResu
     ).scalar_one_or_none()
 
     if existing is None:
-        connection.execute(table.insert().values(id=tenant_id, name=name, icp_config=config))
+        connection.execute(
+            table.insert().values(id=tenant_id, slug=slug, name=name, icp_config=config)
+        )
         return SeedResult(tenant_id=tenant_id, created=True)
 
+    # `slug` is written on the update path too: the id is derived from the slug, so the two
+    # can never disagree here, and a row seeded before the column existed is repaired by the
+    # next seed run rather than staying half-migrated.
     connection.execute(
-        table.update().where(table.c.id == tenant_id).values(name=name, icp_config=config)
+        table.update()
+        .where(table.c.id == tenant_id)
+        .values(slug=slug, name=name, icp_config=config, updated_at=func.now())
     )
     return SeedResult(tenant_id=tenant_id, created=False)
 

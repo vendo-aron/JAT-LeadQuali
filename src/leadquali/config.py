@@ -171,9 +171,11 @@ class Settings(BaseSettings):
     ingest_credentials: SecretStr | None = Field(
         default=None,
         description=(
-            "Per-tenant ingest secrets as JSON: "
-            '{"<tenant_id>": {"api_key_sha256": "<64 hex>", "signing_secret": "..."}}. '
-            "Required by the public ingest API; see leadquali.api.signing."
+            "Per-tenant ingest secrets as JSON, for a laptop or a test: "
+            '{"<slug>": {"signing_secret": "...", "keys": [{"key_id": "<16 hex>", '
+            '"key_hash": "$argon2id$..."}]}}. A deployment leaves this unset and '
+            "authenticates against the tenants and tenant_api_keys tables instead, so "
+            "that a revocation is one UPDATE; see leadquali.api.signing."
         ),
     )
 
@@ -228,6 +230,15 @@ class Settings(BaseSettings):
     )
     database_name: str | None = Field(
         default=None, description="Database name; 'leadquali' in every deployed stack."
+    )
+    secrets_kms_key_id: str | None = Field(
+        default=None,
+        description=(
+            "Customer-managed KMS key that new per-tenant secrets are encrypted with "
+            "(#28's SecretsKmsKey). Read by tenant onboarding, never by the request path. "
+            "Unset falls back to the account's AWS-managed key, which is right for a "
+            "sandbox and wrong for production."
+        ),
     )
     secrets_cache_ttl_seconds: int = Field(
         default=DEFAULT_SECRETS_CACHE_TTL_SECONDS,

@@ -25,7 +25,19 @@ from tests.integration.conftest import (
 
 pytestmark = pytest.mark.integration
 
-EXPECTED_TABLES = {"tenants", "leads", "assessments", "routing_events", "feedback"}
+EXPECTED_TABLES = {
+    "tenants",
+    "tenant_api_keys",
+    "leads",
+    "assessments",
+    "routing_events",
+    "feedback",
+}
+
+LEAD_CHILD_TABLES = {"assessments", "routing_events", "feedback"}
+"""The tables that hang off a lead. ``tenant_api_keys`` hangs off a *tenant* instead, and
+carries a plain foreign key rather than the composite ownership key — a key is not owned by
+a lead, and there is no cross-tenant hole for a composite key to close."""
 
 
 def test_upgrade_head_creates_every_planned_table(migrated_engine: Engine) -> None:
@@ -81,7 +93,7 @@ def test_unique_and_foreign_key_constraints_survive_the_migration(migrated_engin
     }
     assert (("tenant_id",), "tenants", ("id",)) in lead_fks, "leads lost its tenant FK"
 
-    for table_name in EXPECTED_TABLES - {"tenants", "leads"}:
+    for table_name in LEAD_CHILD_TABLES:
         referred = {
             (tuple(fk["constrained_columns"]), fk["referred_table"], tuple(fk["referred_columns"]))
             for fk in inspector.get_foreign_keys(table_name)
@@ -105,9 +117,48 @@ def test_the_deletion_policy_survives_the_migration(migrated_engine: Engine) -> 
     ]
     assert tenant_fk["options"].get("ondelete") == "RESTRICT"
 
-    for table_name in EXPECTED_TABLES - {"tenants", "leads"}:
+    for table_name in LEAD_CHILD_TABLES:
         (lead_fk,) = inspector.get_foreign_keys(table_name)
         assert lead_fk["options"].get("ondelete") == "CASCADE"
+
+    # A key is a credential, not an audit record: #37's erasure deletes the tenant, and
+    # credentials that authenticate against nothing are the one kind of orphan row that is
+    # a security problem rather than a tidiness one.
+    (key_fk,) = inspector.get_foreign_keys("tenant_api_keys")
+    assert key_fk["referred_table"] == "tenants"
+    assert key_fk["options"].get("ondelete") == "CASCADE"
+
+
+def test_the_tenant_slug_and_key_id_are_unique_in_the_database(
+    migrated_engine: Engine,
+) -> None:
+    """Both are lookup handles the application resolves an identity through, so a
+    duplicate would make "whose is this?" depend on scan order. The models say so; this
+    asserts the server was told."""
+    inspector = inspect(migrated_engine)
+    tenant_unique = {tuple(c["column_names"]) for c in inspector.get_unique_constraints("tenants")}
+    assert ("slug",) in tenant_unique
+
+    key_unique = {
+        tuple(c["column_names"]) for c in inspector.get_unique_constraints("tenant_api_keys")
+    }
+    assert ("key_id",) in key_unique
+
+
+def test_the_key_listing_index_exists(migrated_engine: Engine) -> None:
+    """``WHERE tenant_id = ? ORDER BY created_at DESC`` is what ``list-keys`` runs."""
+    indexes = {
+        tuple(index["column_names"])
+        for index in inspect(migrated_engine).get_indexes("tenant_api_keys")
+    }
+    assert ("tenant_id", "created_at") in indexes
+
+
+def test_the_superseded_api_key_column_is_gone(migrated_engine: Engine) -> None:
+    """A second place a live key can live is how one gets missed during a revocation."""
+    columns = {c["name"] for c in inspect(migrated_engine).get_columns("tenants")}
+    assert "api_key_hash" not in columns
+    assert {"slug", "updated_at", "rate_limit_per_minute", "rate_limit_burst"} <= columns
 
 
 def test_downgrade_base_then_upgrade_head_round_trips(_database_url: URL) -> None:

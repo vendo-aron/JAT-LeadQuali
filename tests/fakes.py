@@ -13,9 +13,11 @@ proves nothing about invariant 3.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from leadquali.app.assessment_result import (
     AssessmentFailed,
@@ -25,6 +27,15 @@ from leadquali.app.assessment_result import (
 from leadquali.app.enrichment import Enrichment
 from leadquali.app.feedback import UnknownLeadError, Verdict
 from leadquali.app.ports import RecordedFeedback, RoutingOutcome, StoredLead
+from leadquali.app.tenant_ids import tenant_id_for
+from leadquali.app.tenants import (
+    ApiKeyRecord,
+    TenantAlreadyExistsError,
+    TenantRecord,
+    TenantStatus,
+    UnknownApiKeyError,
+    UnknownTenantError,
+)
 from leadquali.domain.models import Action, LeadAssessment, RoutingDecision
 from leadquali.domain.tenant_config import TenantConfig, TenantNotFoundError
 from leadquali.prompts.lead import LeadSubmission
@@ -381,3 +392,177 @@ class FakeClock:
         value = self.step_ms * self.ticks
         self.ticks += 1
         return value
+
+
+class InMemoryTenantAdminStore:
+    """A :class:`~leadquali.app.tenants.TenantAdminStorePort` over two dicts.
+
+    Behaves like the Postgres one in the ways the service depends on: a duplicate slug is
+    refused, a key is only reachable through its own tenant, and a listing never carries a
+    hash. It deliberately does *not* hold the key hashes it is given in anything the
+    service can read back, because the service must never be able to get at one.
+    """
+
+    def __init__(self) -> None:
+        self.tenants: dict[str, TenantRecord] = {}
+        #: ``key_id -> (slug, record)``. The hash lives in :attr:`hashes`, apart.
+        self.keys: dict[str, tuple[str, ApiKeyRecord]] = {}
+        self.hashes: dict[str, str] = {}
+        self._clock = datetime(2026, 9, 4, 9, 0, tzinfo=UTC)
+
+    # ------------------------------------------------------------------ tenant CRUD
+
+    def create_tenant(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        slug: str,
+        name: str,
+        config: Mapping[str, Any],
+        hmac_secret_ref: str | None,
+    ) -> TenantRecord:
+        if slug in self.tenants:
+            raise TenantAlreadyExistsError(f"tenant '{slug}' already exists")
+        record = TenantRecord(
+            id=tenant_id,
+            slug=slug,
+            name=name,
+            status=TenantStatus.ACTIVE,
+            config=dict(config),
+            hmac_secret_ref=hmac_secret_ref,
+            rate_limit_per_minute=60,
+            rate_limit_burst=10,
+            created_at=self._clock,
+            updated_at=self._clock,
+        )
+        self.tenants[slug] = record
+        return record
+
+    def get_tenant(self, *, slug: str) -> TenantRecord | None:
+        return self.tenants.get(slug)
+
+    def list_tenants(self) -> Sequence[TenantRecord]:
+        return sorted(self.tenants.values(), key=lambda record: (record.created_at, record.slug))
+
+    def update_config(self, *, slug: str, config: Mapping[str, Any]) -> TenantRecord:
+        return self._update(slug, config=dict(config))
+
+    def set_status(self, *, slug: str, status: TenantStatus) -> TenantRecord:
+        return self._update(slug, status=status)
+
+    def rate_limit_for(self, tenant_id: str) -> Any:
+        from leadquali.api.ratelimit import TenantRateLimit
+
+        found = self.tenants.get(tenant_id)
+        if found is None:
+            return None
+        return TenantRateLimit(per_minute=found.rate_limit_per_minute, burst=found.rate_limit_burst)
+
+    # -------------------------------------------------------------------------- keys
+
+    def add_key(
+        self, *, slug: str, key_id: str, key_prefix: str, key_hash: str, label: str | None
+    ) -> ApiKeyRecord:
+        if slug not in self.tenants:
+            raise UnknownTenantError(f"no tenant '{slug}'")
+        record = ApiKeyRecord(
+            key_id=key_id,
+            key_prefix=key_prefix,
+            label=label,
+            created_at=self._clock,
+            expires_at=None,
+            revoked_at=None,
+            last_used_at=None,
+        )
+        self.keys[key_id] = (slug, record)
+        self.hashes[key_id] = key_hash
+        return record
+
+    def list_keys(self, *, slug: str) -> Sequence[ApiKeyRecord]:
+        return [record for owner, record in self.keys.values() if owner == slug]
+
+    def expire_key(self, *, slug: str, key_id: str, expires_at: datetime) -> ApiKeyRecord:
+        return self._update_key(slug, key_id, expires_at=expires_at)
+
+    def revoke_key(self, *, slug: str, key_id: str, revoked_at: datetime) -> ApiKeyRecord:
+        owner, existing = self._owned(slug, key_id)
+        if existing.revoked_at is not None:
+            return existing
+        return self._update_key(owner, key_id, revoked_at=revoked_at)
+
+    # ----------------------------------------------------------------------- internals
+
+    def _update(self, slug: str, **changes: Any) -> TenantRecord:
+        existing = self.tenants.get(slug)
+        if existing is None:
+            raise UnknownTenantError(f"no tenant '{slug}'")
+        updated = replace(existing, updated_at=self._clock, **changes)
+        self.tenants[slug] = updated
+        return updated
+
+    def _owned(self, slug: str, key_id: str) -> tuple[str, ApiKeyRecord]:
+        found = self.keys.get(key_id)
+        if found is None or found[0] != slug:
+            raise UnknownApiKeyError(f"tenant '{slug}' has no key {key_id!r}")
+        return found
+
+    def _update_key(self, slug: str, key_id: str, **changes: Any) -> ApiKeyRecord:
+        owner, existing = self._owned(slug, key_id)
+        updated = replace(existing, **changes)
+        self.keys[key_id] = (owner, updated)
+        return updated
+
+
+class FakeSecretHasher:
+    """A :class:`~leadquali.app.tenants.SecretHasherPort` that is instant and reversible.
+
+    Reversible on purpose: a test that wants to prove the service never hands a secret to
+    the store can look at what the store received and see the secret in it, which is a
+    stronger assertion than "the argon2 string is opaque". The real hasher is exercised in
+    ``test_keyhash_argon2.py``.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def hash_secret(self, secret: str) -> str:
+        self.calls += 1
+        return f"$argon2id$fake${secret}"
+
+
+class FakeTenantSecrets:
+    """A :class:`~leadquali.app.tenants.TenantSecretsPort` with moto's idempotency but none
+    of its setup: a second create for the same tenant returns the first ARN."""
+
+    def __init__(self) -> None:
+        self.created: dict[str, str] = {}
+        self.calls = 0
+
+    def create_tenant_hmac_secret(self, slug: str) -> str:
+        self.calls += 1
+        return self.created.setdefault(slug, f"arn:aws:secretsmanager:eu-west-1:0:secret:{slug}")
+
+
+class ExplodingTenantSecrets:
+    """Provisioning that always fails, for the "nothing was written" assertions."""
+
+    def create_tenant_hmac_secret(self, slug: str) -> str:
+        raise RuntimeError(f"secrets manager is down (asked for {slug})")
+
+
+def tenant_row(slug: str, **overrides: Any) -> TenantRecord:
+    """A :class:`~leadquali.app.tenants.TenantRecord` with plausible defaults."""
+    values: dict[str, Any] = {
+        "id": tenant_id_for(slug),
+        "slug": slug,
+        "name": slug.title(),
+        "status": TenantStatus.ACTIVE,
+        "config": {},
+        "hmac_secret_ref": None,
+        "rate_limit_per_minute": 60,
+        "rate_limit_burst": 10,
+        "created_at": datetime(2026, 9, 4, 9, 0, tzinfo=UTC),
+        "updated_at": datetime(2026, 9, 4, 9, 0, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return TenantRecord(**values)

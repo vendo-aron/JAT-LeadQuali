@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from time import monotonic as _monotonic
@@ -62,6 +63,8 @@ from typing import Any, Final
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+
+from leadquali.config import Settings, get_settings
 
 LOGGER: Final = logging.getLogger(__name__)
 
@@ -76,9 +79,17 @@ _BOTO_CONFIG: Final[Config] = Config(retries={"max_attempts": 3, "mode": "standa
 
 __all__ = [
     "STALE_RETRY_SECONDS",
+    "TENANT_HMAC_SECRET_BYTES",
+    "SecretProvisioningError",
     "SecretResolutionError",
     "SecretsManagerResolver",
+    "TenantSecretsProvisioner",
 ]
+
+#: How much random material a tenant's HMAC signing secret carries. 48 bytes renders as 64
+#: url-safe characters — twice ``api.signing.MIN_SIGNING_SECRET_CHARS``, and well past what
+#: HMAC-SHA256 can use, which costs nothing and removes the question.
+TENANT_HMAC_SECRET_BYTES: Final[int] = 48
 
 
 class SecretResolutionError(RuntimeError):
@@ -292,3 +303,171 @@ class SecretsManagerResolver:
                 f"as configuration"
             )
         return value
+
+
+class SecretProvisioningError(RuntimeError):
+    """A tenant's secret could not be created or rotated. Never names the value."""
+
+
+class TenantSecretsProvisioner:
+    """Creates and rotates the per-tenant HMAC signing secret (#28's ``hmac_secret_ref``).
+
+    Lives in this module rather than in a file of its own because the layering rule is one
+    adapter per external system, and Secrets Manager is one system. Reading a secret and
+    creating one are the same client, the same credentials and the same failure modes.
+
+    **Creation is idempotent and never overwrites.** If the secret already exists this
+    returns the existing ARN and leaves the value alone. A customer's forms are signed with
+    that value; silently replacing it during a re-run of onboarding would break every one of
+    them, and "onboarding is safe to retry" is worth far more than "onboarding guarantees a
+    fresh secret".
+
+    **Rotation is a breaking change, on purpose.** :meth:`rotate_tenant_hmac_secret`
+    replaces the value outright. There is no dual-secret overlap for HMAC in v1 — unlike API
+    keys, where a tenant may hold several rows — so every form that signs with the old
+    secret starts failing the moment the new one propagates. That is a recorded limitation,
+    not an oversight: see ``docs/tenant-onboarding.md``, which says to coordinate it with the
+    customer. Adding an overlap means the verifier trying two secrets per request, which
+    doubles the HMAC work on the hot path to serve an operation performed roughly never.
+
+    Args:
+        client: A ``boto3`` Secrets Manager client, or anything with the same
+            ``create_secret``/``describe_secret``/``put_secret_value`` shape.
+        environment: The deployment name that goes in the secret's path, e.g. ``prod``.
+        kms_key_id: The customer-managed key to encrypt with (#28's ``SecretsKmsKey``).
+            ``None`` falls back to the account's AWS-managed key, which is correct for a
+            sandbox and wrong for production.
+    """
+
+    def __init__(self, client: Any, *, environment: str, kms_key_id: str | None = None) -> None:
+        self._client = client
+        self._environment = environment
+        self._kms_key_id = kms_key_id
+
+    @classmethod
+    def from_env(
+        cls,
+        settings: Settings | None = None,
+        *,
+        region_name: str | None = None,
+    ) -> TenantSecretsProvisioner:
+        """Build a provisioner from the process's settings and the ambient credentials.
+
+        Args:
+            settings: Configuration to read ``ENV``, ``SECRETS_KMS_KEY_ID`` and
+                ``AWS_REGION`` from. ``None`` reads the process-wide settings.
+            region_name: Explicit region, overriding the configured one.
+
+        Returns:
+            A provisioner ready to create secrets.
+        """
+        resolved = settings if settings is not None else get_settings()
+        return cls(
+            boto3.client(
+                "secretsmanager",
+                region_name=region_name or resolved.aws_region,
+                config=_BOTO_CONFIG,
+            ),
+            environment=resolved.env.value,
+            kms_key_id=resolved.secrets_kms_key_id,
+        )
+
+    def secret_name(self, slug: str) -> str:
+        """The path this tenant's signing secret lives at.
+
+        Derived rather than stored so that an operator can find a customer's secret in the
+        console from the customer's name alone, and so that an IAM policy can grant a whole
+        environment's tenant secrets with one wildcard.
+        """
+        return f"leadquali/{self._environment}/tenant/{slug}/hmac"
+
+    def create_tenant_hmac_secret(self, slug: str) -> str:
+        """Create this tenant's signing secret if it does not exist, and return its ARN.
+
+        Args:
+            slug: The tenant.
+
+        Returns:
+            The secret's ARN, whether it was created now or already existed.
+
+        Raises:
+            SecretProvisioningError: the call failed for any reason other than the secret
+                already existing. The message names the secret and never the value.
+        """
+        name = self.secret_name(slug)
+        try:
+            response = self._client.create_secret(
+                Name=name,
+                Description=f"LeadQuali ingest HMAC signing secret for tenant '{slug}'",
+                SecretString=secrets.token_urlsafe(TENANT_HMAC_SECRET_BYTES),
+                Tags=[{"Key": "leadquali:tenant", "Value": slug}],
+                **({"KmsKeyId": self._kms_key_id} if self._kms_key_id else {}),
+            )
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "Unknown")
+            if code == "ResourceExistsException":
+                return self._existing_arn(name)
+            raise SecretProvisioningError(
+                f"cannot create secret {name}: {code}. Check that this principal may "
+                f"secretsmanager:CreateSecret and kms:GenerateDataKey on the secrets key."
+            ) from None
+        except Exception as error:
+            raise SecretProvisioningError(
+                f"cannot create secret {name}: {type(error).__name__}"
+            ) from None
+        arn = response.get("ARN")
+        if not isinstance(arn, str):
+            raise SecretProvisioningError(f"create_secret for {name} returned no ARN")
+        LOGGER.info(
+            "secrets.tenant_hmac_created",
+            extra={"event": "secrets.tenant_hmac_created", "tenant_id": slug},
+        )
+        return arn
+
+    def rotate_tenant_hmac_secret(self, secret_arn: str) -> None:
+        """Replace a tenant's signing secret with fresh material.
+
+        Breaking for that tenant's forms: see the class docstring and the runbook. There is
+        no return value because there is nothing useful to return — the ARN does not change,
+        and the new value must not travel anywhere it could be logged.
+
+        Raises:
+            SecretProvisioningError: the write failed. The secret is unchanged.
+        """
+        try:
+            self._client.put_secret_value(
+                SecretId=secret_arn,
+                SecretString=secrets.token_urlsafe(TENANT_HMAC_SECRET_BYTES),
+            )
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "Unknown")
+            raise SecretProvisioningError(f"cannot rotate secret {secret_arn}: {code}") from None
+        except Exception as error:
+            raise SecretProvisioningError(
+                f"cannot rotate secret {secret_arn}: {type(error).__name__}"
+            ) from None
+        LOGGER.warning(
+            "secrets.tenant_hmac_rotated",
+            extra={"event": "secrets.tenant_hmac_rotated", "secret_arn": secret_arn},
+        )
+
+    def _existing_arn(self, name: str) -> str:
+        """The ARN of a secret that already exists, without reading its value."""
+        try:
+            described = self._client.describe_secret(SecretId=name)
+        except Exception as error:
+            raise SecretProvisioningError(
+                f"secret {name} already exists but could not be described: {type(error).__name__}"
+            ) from None
+        arn = described.get("ARN")
+        if not isinstance(arn, str):
+            raise SecretProvisioningError(f"describe_secret for {name} returned no ARN")
+        LOGGER.info(
+            "secrets.tenant_hmac_exists",
+            extra={"event": "secrets.tenant_hmac_exists", "secret_name": name},
+        )
+        return arn
+
+    def __repr__(self) -> str:
+        """Render the shape, never a value."""
+        return f"TenantSecretsProvisioner(environment={self._environment!r})"

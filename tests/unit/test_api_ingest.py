@@ -27,7 +27,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
+from leadquali.adapters.store_tenants import PostgresIngestCredentials
 from leadquali.adapters.tenant_config_json import JsonFileTenantConfigLoader, default_tenants_dir
 from leadquali.api.main import (
     HEALTH_PATH,
@@ -36,7 +38,7 @@ from leadquali.api.main import (
     build_deps,
     create_app,
 )
-from leadquali.api.ratelimit import FixedWindowRateLimiter
+from leadquali.api.ratelimit import FixedWindowRateLimiter, TenantRateLimiter
 from leadquali.api.schemas import MAX_BODY_BYTES
 from leadquali.api.signing import (
     HEADER_KEY,
@@ -45,34 +47,51 @@ from leadquali.api.signing import (
     HEADER_TENANT,
     HEADER_TIMESTAMP,
     MAX_CLOCK_SKEW_SECONDS,
-    IngestCredential,
+    IngestCredentialSource,
     StaticCredentials,
-    hash_api_key,
+    StaticTenantCredentials,
+    StoredApiKey,
     sign,
 )
+from leadquali.app.api_keys import ApiKeyParts, KeyEnvironment
 from leadquali.app.assessment_result import AssessmentFailed, AssessmentOutcome
 from leadquali.app.ingest import IngestService, QueuedLead
 from leadquali.app.ports import RoutingOutcome
-from leadquali.config import Settings
+from leadquali.config import Settings, set_secret_resolver
 from leadquali.domain.models import Action, EscalationReason
 from leadquali.domain.tenant_config import TenantConfig
 from tests.fakes import FakeClock, InMemoryLeadStore
 from tests.logcapture import capture_json_logs
 
 TENANT = "default"
-API_KEY = "lq_live_5b1f0a7c2e9d4368"
+KEY_ID = "5b1f0a7c2e9d4368"
+KEY_SECRET = "kf8Qz1Rr2sK0dW7pYb3nJ4mVxC6tLg9hEu5aZo1QsPI"
+API_KEY = ApiKeyParts(environment=KeyEnvironment.LIVE, key_id=KEY_ID, secret=KEY_SECRET).text
 SECRET = "local-signing-secret-of-adequate-length"
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 
-CREDENTIALS = StaticCredentials(
-    {
-        TENANT: IngestCredential(
-            tenant_id=TENANT,
-            api_key_sha256=hash_api_key(API_KEY),
-            signing_secret=SECRET.encode("utf-8"),
-        )
-    }
-)
+#: One hasher for the file, so the argon2 verification is paid for once and memoised.
+VERIFIER = Argon2KeyHasher()
+KEY_HASH = VERIFIER.hash_secret(KEY_SECRET)
+
+
+def credentials(*, status: str = "active") -> StaticCredentials:
+    """The tenant's stored credentials, optionally not active."""
+    return StaticCredentials(
+        {
+            TENANT: StaticTenantCredentials(
+                tenant_id=TENANT,
+                signing_secret=SECRET.encode("utf-8"),
+                keys=(StoredApiKey(key_id=KEY_ID, key_hash=KEY_HASH),),
+                status=status,
+            )
+        },
+        verifier=VERIFIER,
+        now=lambda: NOW,
+    )
+
+
+CREDENTIALS = credentials()
 
 VALID_FORM: dict[str, Any] = {
     "full_name": "Ada Lovelace",
@@ -104,13 +123,14 @@ class Harness:
         queue: InProcessLeadQueue | None = None,
         clock: FakeClock | None = None,
         deps_overrides: dict[str, Any] | None = None,
+        source: IngestCredentialSource | None = None,
     ) -> None:
         self.store = store if store is not None else InMemoryLeadStore()
         self.queue = queue if queue is not None else InProcessLeadQueue()
         self.clock = clock if clock is not None else FakeClock(start=NOW, step_ms=0)
         self.deps = IngestDeps(
             service=IngestService(store=self.store, queue=self.queue, clock=self.clock),
-            credentials=CREDENTIALS,
+            credentials=source if source is not None else CREDENTIALS,
             clock=self.clock,
             **(deps_overrides or {}),
         )
@@ -206,9 +226,17 @@ def test_a_bad_signature_is_rejected(harness: Harness) -> None:
 
 
 def test_an_unknown_tenant_and_a_bad_key_are_indistinguishable(harness: Harness) -> None:
-    """The endpoint must not be an oracle for which customers exist."""
+    """The endpoint must not be an oracle for which customers exist.
+
+    Under #31 these are literally the same code path — a lookup that finds no row and a
+    lookup whose argon2 check fails both return the same rejection — but the assertion
+    stays, because it is about the response and the response is what an attacker sees.
+    """
     unknown = harness.post(tenant="does-not-exist")
-    bad_key = harness.post(api_key="lq_live_wrong", nonce="nonce-000000000002")
+    bad_key = harness.post(
+        api_key=ApiKeyParts(environment=KeyEnvironment.LIVE, key_id=KEY_ID, secret="w" * 43).text,
+        nonce="nonce-000000000002",
+    )
 
     assert unknown.status_code == bad_key.status_code == 401
     assert unknown.json() == bad_key.json()
@@ -231,6 +259,25 @@ def test_every_auth_header_is_required(harness: Harness, header: str) -> None:
     del headers[header]
     response = harness.client.post(INGEST_PATH, content=raw, headers=headers)
     assert response.status_code == 401
+
+
+def test_a_suspended_tenant_is_told_so_with_a_403(harness: Harness) -> None:
+    """Not a 401. This caller has already proved who it is with a valid, live key, so
+    there is no enumeration oracle left to protect — and the integrator on the other side
+    needs to know it is the account and not their integration that stopped working."""
+    suspended = Harness(source=credentials(status="suspended"))
+    response = suspended.post()
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "tenant is not active"}
+    assert suspended.store.leads == {}
+    suspended.queue.close()
+
+
+def test_suspending_one_tenant_does_not_stop_another(harness: Harness) -> None:
+    """The acceptance criterion: ingest stops for that tenant only."""
+    assert Harness(source=credentials(status="suspended")).post().status_code == 403
+    assert harness.post().status_code == 202
 
 
 def test_a_body_changed_after_signing_is_rejected(harness: Harness) -> None:
@@ -583,10 +630,38 @@ def test_the_production_wiring_refuses_to_start_without_a_database() -> None:
         build_deps(Settings(database_url=None, ingest_credentials=None))
 
 
-def test_the_production_wiring_refuses_to_start_without_ingest_credentials() -> None:
-    """There is no "no keys configured means no authentication" mode. That is the point."""
-    with pytest.raises(RuntimeError, match="INGEST_CREDENTIALS"):
-        build_deps(Settings(database_url="postgresql+psycopg://x/y", ingest_credentials=None))
+def test_the_production_wiring_authenticates_against_the_database() -> None:
+    """There is no "no keys configured means no authentication" mode. That is the point.
+
+    Before #31 the credential map came from the ``INGEST_CREDENTIALS`` secret and this test
+    asserted that a missing one was fatal. Keys now live in ``tenant_api_keys``, so the
+    property that matters has moved with them: the wired credential source is the database,
+    it is never a permissive default, and it is never assembled from an environment
+    variable that could be absent. ``DATABASE_URL`` is still required, and the test above
+    still proves a deployment without one refuses to start.
+    """
+    set_secret_resolver(_StubResolver())
+    try:
+        deps = build_deps(
+            Settings(database_url="postgresql+psycopg://x/y", ingest_credentials=None)
+        )
+    finally:
+        set_secret_resolver(None)
+
+    assert isinstance(deps.credentials, PostgresIngestCredentials)
+    assert isinstance(deps.rate_limiter, TenantRateLimiter)
+
+
+class _StubResolver:
+    """Stands in for Secrets Manager so wiring can be built without AWS."""
+
+    def resolve(self, secret_arn: str) -> str:
+        del secret_arn
+        return SECRET
+
+    def resolve_mapping(self, secret_arn: str) -> dict[str, str]:
+        del secret_arn
+        return {}
 
 
 def test_importing_the_module_builds_an_app_without_touching_a_database() -> None:

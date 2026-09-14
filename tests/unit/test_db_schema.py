@@ -32,9 +32,17 @@ from leadquali.adapters.db_schema import (
     Lead,
     RoutingEvent,
     Tenant,
+    TenantApiKey,
 )
 
-EXPECTED_TABLES = {"tenants", "leads", "assessments", "routing_events", "feedback"}
+EXPECTED_TABLES = {
+    "tenants",
+    "tenant_api_keys",
+    "leads",
+    "assessments",
+    "routing_events",
+    "feedback",
+}
 
 CHILD_TABLES = ("assessments", "routing_events", "feedback")
 """The tables that hang off a lead, and therefore off a tenant through it."""
@@ -53,12 +61,32 @@ CHILD_TABLES = ("assessments", "routing_events", "feedback")
 # `raw` bucket having exactly one member is the property #37's retention job depends on.
 COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("tenants", "id"): "none",
+    ("tenants", "slug"): "none",
     ("tenants", "name"): "none",
     ("tenants", "status"): "none",
     ("tenants", "icp_config"): "none",
-    ("tenants", "api_key_hash"): "hashed",
     ("tenants", "hmac_secret_ref"): "none",
+    ("tenants", "rate_limit_per_minute"): "none",
+    ("tenants", "rate_limit_burst"): "none",
     ("tenants", "created_at"): "none",
+    ("tenants", "updated_at"): "none",
+    ("tenant_api_keys", "id"): "none",
+    ("tenant_api_keys", "tenant_id"): "none",
+    # The clear-text lookup handle. Not a secret and not personal data: 64 bits of
+    # machine randomness naming a row, which is why it is safe to log and to index.
+    ("tenant_api_keys", "key_id"): "none",
+    ("tenant_api_keys", "key_prefix"): "none",
+    ("tenant_api_keys", "key_hash"): "hashed",
+    # Operator-written, e.g. "acme marketing site". Free text, and classified "none" for
+    # the same reason `tenants.name` is: it describes a customer's *integration*, and
+    # nothing in the product ever puts a lead's data — or a person's — into it. It is not
+    # in the "raw" bucket because that bucket is what #37's retention job purges, and a
+    # purge that deleted key labels would erase the audit trail it is meant to preserve.
+    ("tenant_api_keys", "label"): "none",
+    ("tenant_api_keys", "created_at"): "none",
+    ("tenant_api_keys", "expires_at"): "none",
+    ("tenant_api_keys", "revoked_at"): "none",
+    ("tenant_api_keys", "last_used_at"): "none",
     ("leads", "id"): "none",
     ("leads", "tenant_id"): "none",
     ("leads", "submission_id"): "none",
@@ -139,7 +167,13 @@ def _lead_ownership_fk(table_name: str) -> ForeignKeyConstraint | None:
     return None
 
 
-def test_metadata_declares_exactly_the_five_planned_tables() -> None:
+def test_metadata_declares_exactly_the_planned_tables() -> None:
+    """Plan §4's five, plus ``tenant_api_keys`` (#31).
+
+    Credentials get a table of their own rather than a column on ``tenants`` because a
+    tenant holds several keys at once during a rotation, and because a key row carries its
+    own revocation and expiry.
+    """
     assert set(Base.metadata.tables) == EXPECTED_TABLES
 
 
@@ -151,6 +185,7 @@ def test_model_classes_map_to_the_expected_table_names() -> None:
         (Assessment, "assessments"),
         (RoutingEvent, "routing_events"),
         (Feedback, "feedback"),
+        (TenantApiKey, "tenant_api_keys"),
     ):
         assert model.__tablename__ == table_name
         # The class and the metadata entry are one object, so a repository written against
@@ -363,6 +398,8 @@ def test_the_tenant_rubric_has_no_usable_default() -> None:
         ("assessments", "ck_assessments_status_known"),
         ("assessments", "ck_assessments_escalation_reason_known"),
         ("tenants", "ck_tenants_status_known"),
+        ("tenants", "ck_tenants_slug_is_a_slug"),
+        ("tenants", "ck_tenants_rate_limits_are_positive"),
         ("feedback", "ck_feedback_verdict_known"),
     ],
 )
@@ -396,6 +433,8 @@ def test_the_enforced_vocabularies_match_the_domain() -> None:
     ("table_name", "column_name"),
     [
         ("tenants", "created_at"),
+        ("tenants", "updated_at"),
+        ("tenant_api_keys", "created_at"),
         ("leads", "received_at"),
         ("leads", "created_at"),
         ("assessments", "created_at"),
