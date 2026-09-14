@@ -152,11 +152,25 @@ Expected: `202` with a JSON body echoing the `submission_id`.
 
 | You got | It means |
 |---|---|
-| `401` | The key or the signature was rejected. Every reason looks the same on purpose. Check the key, the secret, the clock (five minutes of skew is allowed), and that the signed path is `/leads`. |
-| `403 {"detail":"tenant is not active"}` | The key is *fine*; the tenant is suspended or disabled. |
+| `401` | The key or the signature was rejected. Every reason looks the same on purpose. Check the key, the secret, the clock (five minutes of skew is allowed), and that the signed path is `/leads`. See also the note below about intermittent 401s. |
+| `403 {"detail":"tenant is not active"}` | The key is *fine* — it verified — and the tenant is suspended or disabled. |
 | `413` | The body is over the limit. |
 | `422` | Authenticated, but the payload does not match the schema. |
 | `429` | Over the tenant's rate limit; `Retry-After` says when to come back. |
+| `503` | Not the caller's fault: something we depend on (the tenant's signing secret, most likely) could not be read. `Retry-After` says when to come back, and the same request will work. |
+
+**An intermittent 401 that clears after a few seconds, with the *correct* key.** This is
+expected under one specific condition and is not a misconfiguration. A `key_id` is public —
+it travels in the clear in a header on every submission — so anyone who has seen one request
+can send wrong secrets for it. After ten wrong guesses in a minute, that `key_id` is
+throttled to one argon2 verification every six seconds *on the container that saw them*.
+A container that has already verified the key once is unaffected (the answer is memoised),
+so in practice this shows up only on a cold start during an attack, and one retry clears it.
+
+If a customer reports it: it means someone is guessing against their key, which is worth
+knowing. `ingest.rejected` log lines with `reason: "bad_key"` and their `claimed_tenant`
+will show the volume. Rotating the key does not help — the new `key_id` is just as public —
+and nothing needs to be done for the customer's traffic, which is getting through.
 
 ### 1.6 Confirm
 
@@ -241,10 +255,17 @@ python -m leadquali.tenantctl disable acme-demo    # gone for good
 ```
 
 A suspended tenant's submissions get **403 `tenant is not active`** — not the 401 every
-other rejection gets. That is deliberate: a caller who reaches this has already proved its
-identity with a valid, unrevoked key, so there is no enumeration oracle left to protect,
-and the integrator on the customer's side needs to know it is the account and not their
-integration that stopped working.
+other rejection gets. That is deliberate: a caller who reaches this has already presented a
+live key *and passed the argon2 check on it*, so there is no enumeration oracle left to
+protect, and the integrator on the customer's side needs to know it is the account and not
+their integration that stopped working.
+
+The status is checked **after** the key verifies, which costs an argon2 verification that a
+cheaper ordering would avoid. That is the point: a `key_id` is public, so checking the
+status first would let anyone who had ever seen one of the customer's requests find out
+whether that account had been suspended for non-payment — a business-sensitive fact about a
+third party — without holding the secret at all. Someone with a *wrong* key on a suspended
+tenant gets the ordinary, indistinguishable 401.
 
 Suspension affects **that tenant only**. Nothing already stored is touched, nothing is
 deleted, and the rubric is untouched — `resume` puts them back exactly as they were.

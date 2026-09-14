@@ -40,12 +40,25 @@ Caching failures would hand an attacker an eviction primitive: a flood of wrong 
 one real ``key_id`` would push every legitimate entry out of a bounded cache and put the
 KDF back on the hot path for everybody. So failures are counted instead. After
 :data:`FAILURE_THRESHOLD` consecutive failures for one ``key_id`` inside
-:data:`FAILURE_WINDOW_SECONDS`, that ``key_id`` is refused without running the KDF until
-the window passes. One correct secret resets the counter, so a customer with a stale form
-and a customer being attacked both recover the moment the right key arrives.
+:data:`FAILURE_WINDOW_SECONDS`, that ``key_id`` is **throttled**: at most one verification
+per :data:`GATED_RETRY_SECONDS`, rather than none at all.
+
+That distinction is the whole design, and getting it wrong is a remote outage for a paying
+customer. A ``key_id`` is **public** — it travels in the clear, in a header, on every
+submission the customer's form makes — so anybody who has seen one request can send ten
+wrong secrets for it. If the gate *denied*, that stranger could hold a legitimate tenant's
+key out of service for a minute at a time, for as long as they cared to, from anywhere,
+and each refused lead would be refused at the door with nothing escalating: invariant 3
+defeated by a third party. Two things stop that:
+
+* **the memo is consulted before the gate.** A memo hit is free and proves the secret is
+  right, so on a warm container the correct key is never affected by the gate at all;
+* **the gate throttles rather than denies.** On a cold container a legitimate client is
+  through after a retry measured in seconds, while the attacker's cost stays pinned at one
+  KDF per :data:`GATED_RETRY_SECONDS` per ``key_id``.
 
 Neither structure is authoritative and neither can grant access: the memo only skips work
-it has already done, and the gate only ever refuses. A cold container, or one whose caches
+it has already done, and the gate only ever *delays*. A cold container, or one whose caches
 were evicted, verifies from scratch and reaches the same answer.
 """
 
@@ -56,6 +69,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Final
 
 from argon2 import PasswordHasher
@@ -71,6 +85,7 @@ __all__ = [
     "ARGON2_TIME_COST",
     "FAILURE_THRESHOLD",
     "FAILURE_WINDOW_SECONDS",
+    "GATED_RETRY_SECONDS",
     "MEMO_ENTRIES",
     "Argon2KeyHasher",
     "KeyHashingError",
@@ -93,11 +108,32 @@ FAILURE_THRESHOLD: Final[int] = 10
 """Consecutive failures for one ``key_id`` before the KDF stops being run for it."""
 
 FAILURE_WINDOW_SECONDS: Final[float] = 60.0
-"""How long a tripped gate stays tripped, and how long a failure counts for."""
+"""How long a gate stays tripped, and how long a failure counts towards tripping it."""
+
+GATED_RETRY_SECONDS: Final[float] = FAILURE_WINDOW_SECONDS / FAILURE_THRESHOLD
+"""How often a throttled ``key_id`` may cost one more KDF — six seconds.
+
+Derived from the two constants above rather than chosen, so that the guarantee stays
+legible: a tripped ``key_id`` can never cost more than :data:`FAILURE_THRESHOLD`
+verifications per :data:`FAILURE_WINDOW_SECONDS`, which is exactly the rate that tripped it.
+"""
 
 FAILURE_ENTRIES: Final[int] = 4_096
 """Distinct ``key_id`` values the gate tracks. Bounded, because the values come from
 strangers; evicting the least recently seen only ever loses a *refusal*."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Failures:
+    """One ``key_id``'s recent wrong guesses, on a monotonic clock."""
+
+    count: int
+    window_opened: float
+    """When the current counting window started. The window is not extended by further
+    failures, so a steady trickle of wrong guesses never accumulates into a trip."""
+
+    last_attempt: float
+    """When this ``key_id`` last cost a KDF, for the throttle once the gate has tripped."""
 
 
 class KeyHashingError(RuntimeError):
@@ -144,7 +180,8 @@ class Argon2KeyHasher:
         self._failure_window = failure_window_seconds
         self._monotonic = monotonic
         self._verified: OrderedDict[tuple[str, str], None] = OrderedDict()
-        self._failures: OrderedDict[str, tuple[int, float]] = OrderedDict()
+        #: ``key_id -> (consecutive failures, when the window opened, last attempt)``.
+        self._failures: OrderedDict[str, _Failures] = OrderedDict()
         self._kdf_calls = 0
 
     @property
@@ -184,20 +221,25 @@ class Argon2KeyHasher:
 
         Args:
             key_id: The clear-text handle of the row the hash came from. Used only for the
-                per-key failure gate and for log lines; it is not secret.
+                per-key KDF throttle and for log lines; it is not secret, and it is never
+                part of the comparison.
             secret: The secret part of the presented key.
             key_hash: The encoded Argon2id string stored for that row.
 
         Returns:
-            ``True`` on a match. ``False`` for a mismatch, for a ``key_id`` whose failure
-            gate is currently tripped, and for a stored hash this library cannot read —
-            all three are the same answer to the caller, which is the same 401 on the wire.
+            ``True`` on a match. ``False`` for a mismatch, for a stored hash this library
+            cannot read, and for an attempt that the per-key throttle deferred — all three
+            are the same answer to the caller, which is the same 401 on the wire.
+
+        The memo is checked **first**, before the throttle: a memo hit is free and proves
+        the secret is right, so a legitimate holder on a warm container is never delayed by
+        somebody else's wrong guesses against the same public ``key_id``.
         """
         memo = (key_hash, hashlib.sha256(secret.encode("utf-8")).hexdigest())
         if self._remembered(memo):
             self._clear_failures(key_id)
             return True
-        if self._gated(key_id):
+        if self._deferred(key_id):
             return False
 
         self._kdf_calls += 1
@@ -225,7 +267,9 @@ class Argon2KeyHasher:
 
     def __repr__(self) -> str:
         """Render the shape, never the contents."""
-        gated = sum(1 for count, _ in self._failures.values() if count >= self._failure_threshold)
+        gated = sum(
+            1 for entry in self._failures.values() if entry.count >= self._failure_threshold
+        )
         return f"Argon2KeyHasher(memoised={len(self._verified)}, gated={gated})"
 
     # --------------------------------------------------------------------- the memo
@@ -244,26 +288,40 @@ class Argon2KeyHasher:
         while len(self._verified) > self._cache_size:
             self._verified.popitem(last=False)
 
-    # ---------------------------------------------------------------- the failure gate
+    # ------------------------------------------------------------------- the KDF throttle
 
-    def _gated(self, key_id: str) -> bool:
-        """Whether this ``key_id`` has burned its allowance inside the current window."""
+    def _deferred(self, key_id: str) -> bool:
+        """Whether this attempt should be deferred instead of costing a KDF.
+
+        A ``key_id`` that has burned its allowance inside the current window is allowed one
+        verification per :data:`GATED_RETRY_SECONDS`. It is never denied outright: a
+        ``key_id`` is public, so denial would let a stranger hold a paying customer's key
+        out of service. Deferral pins the attacker's cost without ever making a legitimate
+        holder wait more than one retry.
+        """
         entry = self._failures.get(key_id)
         if entry is None:
             return False
-        count, first_seen = entry
-        if self._monotonic() - first_seen >= self._failure_window:
+        now = self._monotonic()
+        if now - entry.window_opened >= self._failure_window:
             del self._failures[key_id]
             return False
-        return count >= self._failure_threshold
+        if entry.count < self._failure_threshold:
+            return False
+        if now - entry.last_attempt >= GATED_RETRY_SECONDS:
+            # Spend the retry slot whether or not this attempt turns out to be right, so
+            # that a flood cannot get two KDFs out of one slot by racing.
+            self._failures[key_id] = replace(entry, last_attempt=now)
+            return False
+        return True
 
     def _record_failure(self, key_id: str) -> None:
         now = self._monotonic()
         entry = self._failures.get(key_id)
-        if entry is None or now - entry[1] >= self._failure_window:
-            self._failures[key_id] = (1, now)
+        if entry is None or now - entry.window_opened >= self._failure_window:
+            self._failures[key_id] = _Failures(count=1, window_opened=now, last_attempt=now)
         else:
-            self._failures[key_id] = (entry[0] + 1, entry[1])
+            self._failures[key_id] = replace(entry, count=entry.count + 1, last_attempt=now)
         self._failures.move_to_end(key_id)
         while len(self._failures) > FAILURE_ENTRIES:
             self._failures.popitem(last=False)

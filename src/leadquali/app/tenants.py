@@ -52,6 +52,7 @@ __all__ = [
     "TenantAdminError",
     "TenantAdminStorePort",
     "TenantAlreadyExistsError",
+    "TenantRateLimit",
     "TenantRecord",
     "TenantSecretsPort",
     "TenantService",
@@ -69,6 +70,37 @@ holiday. Shorter would turn every rotation into an outage negotiation; much long
 leave a compromised key live for a month. Documented in ``docs/tenant-onboarding.md`` so
 the number a customer is told matches the number the code uses.
 """
+
+
+@dataclass(frozen=True, slots=True)
+class TenantRateLimit:
+    """One tenant's ingest allowance, as stored on its row.
+
+    In the application layer rather than beside the limiter that enforces it, because it is
+    a property of a tenant that the control plane writes and an adapter reads; an
+    ``adapters`` module reaching into ``leadquali.api`` to name it would invert the layering
+    rule (``tests/unit/test_layering.py``).
+
+    Args:
+        per_minute: Sustained requests per minute — the bucket's refill rate.
+        burst: How many requests may arrive at once — the bucket's capacity.
+    """
+
+    per_minute: int
+    burst: int
+
+    def __post_init__(self) -> None:
+        """Refuse a limit that would refuse everything.
+
+        ``per_minute = 0`` is a bucket that never refills and ``burst = 0`` one that holds
+        nothing; either would silently stop a customer's leads. The database has the same
+        CHECK, so this only catches a value that never came from a row.
+        """
+        if self.per_minute < 1 or self.burst < 1:
+            raise ValueError(
+                f"a tenant rate limit needs a positive rate and burst, got "
+                f"per_minute={self.per_minute}, burst={self.burst}"
+            )
 
 
 class TenantAdminError(Exception):
@@ -92,8 +124,12 @@ class TenantStatus(StrEnum):
 
     ACTIVE = "active"
     SUSPENDED = "suspended"
-    """Temporarily stopped — non-payment, an incident, a customer's own request. Ingest is
-    refused with a 403 and everything already stored is untouched."""
+    """Temporarily stopped — non-payment, an incident, a customer's own request.
+
+    A submission carrying a key that verifies is refused with a 403 saying so; one carrying
+    a key that does not is refused with the ordinary 401, because the 403 is the endpoint's
+    one non-uniform answer and may only be reached by a caller holding the secret. Nothing
+    already stored is touched, and ``ACTIVE`` puts the tenant back exactly as it was."""
 
     DISABLED = "disabled"
     """Gone for good, short of #37's erasure. Behaves like suspended at the door."""
