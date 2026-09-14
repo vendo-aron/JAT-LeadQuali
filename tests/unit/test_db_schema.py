@@ -10,11 +10,14 @@ assessment (invariant 3), and the absence of any raw-email column (invariant 5).
 from __future__ import annotations
 
 import decimal
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     ForeignKeyConstraint,
+    Integer,
     Numeric,
     Table,
     UniqueConstraint,
@@ -23,6 +26,7 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 
 from leadquali.adapters.db_schema import (
     ASSESSMENT_STATUSES,
+    DEFAULT_QUOTA_ALERT_FRACTION,
     ESCALATION_REASONS,
     LEAD_STATUSES,
     ROUTING_ACTIONS,
@@ -33,6 +37,10 @@ from leadquali.adapters.db_schema import (
     RoutingEvent,
     Tenant,
     TenantApiKey,
+    UsageDaily,
+)
+from leadquali.app.metering import (
+    DEFAULT_QUOTA_ALERT_FRACTION as METERING_DEFAULT_ALERT_FRACTION,
 )
 
 EXPECTED_TABLES = {
@@ -42,6 +50,7 @@ EXPECTED_TABLES = {
     "assessments",
     "routing_events",
     "feedback",
+    "usage_daily",
 }
 
 CHILD_TABLES = ("assessments", "routing_events", "feedback")
@@ -68,6 +77,10 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("tenants", "hmac_secret_ref"): "none",
     ("tenants", "rate_limit_per_minute"): "none",
     ("tenants", "rate_limit_burst"): "none",
+    # The soft quota (#33). A plan size and an alert threshold: commercial policy about a
+    # customer's *account*, with nothing of any lead in it.
+    ("tenants", "monthly_lead_quota"): "none",
+    ("tenants", "quota_alert_fraction"): "none",
     ("tenants", "created_at"): "none",
     ("tenants", "updated_at"): "none",
     ("tenant_api_keys", "id"): "none",
@@ -140,6 +153,21 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("feedback", "verdict"): "none",
     ("feedback", "notes"): "none",
     ("feedback", "created_at"): "none",
+    # usage_daily (#33) is counters and money, derived from the tables above. There is
+    # nothing here that came from a person: it is how many leads there were, not who they
+    # were, which is also why #37's retention purge can leave it alone.
+    ("usage_daily", "tenant_id"): "none",
+    ("usage_daily", "usage_date"): "none",
+    ("usage_daily", "leads_ingested"): "none",
+    ("usage_daily", "leads_assessed"): "none",
+    ("usage_daily", "leads_billable"): "none",
+    ("usage_daily", "assessments_failed"): "none",
+    ("usage_daily", "input_tokens"): "none",
+    ("usage_daily", "output_tokens"): "none",
+    ("usage_daily", "cache_read_tokens"): "none",
+    ("usage_daily", "cache_creation_tokens"): "none",
+    ("usage_daily", "cost_usd"): "none",
+    ("usage_daily", "computed_at"): "none",
 }
 
 
@@ -186,6 +214,7 @@ def test_model_classes_map_to_the_expected_table_names() -> None:
         (RoutingEvent, "routing_events"),
         (Feedback, "feedback"),
         (TenantApiKey, "tenant_api_keys"),
+        (UsageDaily, "usage_daily"),
     ):
         assert model.__tablename__ == table_name
         # The class and the metadata entry are one object, so a repository written against
@@ -400,6 +429,9 @@ def test_the_tenant_rubric_has_no_usable_default() -> None:
         ("tenants", "ck_tenants_status_known"),
         ("tenants", "ck_tenants_slug_is_a_slug"),
         ("tenants", "ck_tenants_rate_limits_are_positive"),
+        ("tenants", "ck_tenants_monthly_lead_quota_is_positive"),
+        ("tenants", "ck_tenants_quota_alert_fraction_is_a_fraction"),
+        ("usage_daily", "ck_usage_daily_usage_is_non_negative"),
         ("feedback", "ck_feedback_verdict_known"),
     ],
 )
@@ -440,6 +472,7 @@ def test_the_enforced_vocabularies_match_the_domain() -> None:
         ("assessments", "created_at"),
         ("routing_events", "created_at"),
         ("feedback", "created_at"),
+        ("usage_daily", "computed_at"),
     ],
 )
 def test_timestamps_are_timezone_aware_with_a_server_default(
@@ -451,11 +484,78 @@ def test_timestamps_are_timezone_aware_with_a_server_default(
     assert column.server_default is not None
 
 
-@pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES))
+#: The one table whose primary key is a natural key rather than a server-generated UUID.
+#: ``usage_daily`` is a rollup: ``(tenant_id, usage_date)`` *is* the identity of a row, a
+#: second row for one tenant-day is a bug rather than a new fact, and the composite key is
+#: also the conflict target the idempotent upsert needs. A surrogate ``id`` would let two
+#: rows for one day coexist while every billing read summed both.
+NATURAL_KEY_TABLES = {"usage_daily"}
+
+
+@pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES - NATURAL_KEY_TABLES))
 def test_primary_keys_are_uuids_generated_by_the_server(table_name: str) -> None:
     primary_key = list(_table(table_name).primary_key.columns)
     assert [c.name for c in primary_key] == ["id"]
     assert primary_key[0].server_default is not None
+
+
+def test_the_usage_rollup_is_keyed_by_the_tenant_and_the_day() -> None:
+    """The exception to the rule above, and the reason a re-run cannot double count."""
+    primary_key = [column.name for column in _table("usage_daily").primary_key.columns]
+    assert primary_key == ["tenant_id", "usage_date"]
+
+
+def test_the_usage_rollup_counts_tokens_in_bigints() -> None:
+    """``assessments.input_tokens`` is an ``integer`` and is right to be — no single call
+    approaches 2^31 — but a busy tenant passes two billion input tokens inside a year, and
+    a rollup that silently overflowed would be discovered on an invoice."""
+    table = _table("usage_daily")
+    for column_name in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+    ):
+        assert isinstance(table.c[column_name].type, BigInteger), column_name
+    # Counts of rows stay `integer`: two billion leads in a day from one tenant is not a
+    # capacity question, it is an incident.
+    assert isinstance(table.c["leads_ingested"].type, Integer)
+
+
+def test_the_usage_rollup_holds_a_wider_money_column_than_one_assessment() -> None:
+    """It holds a sum of them, and a scale that fits one call need not fit a day of them."""
+    day = _table("usage_daily").c["cost_usd"].type
+    call = _table("assessments").c["cost_usd"].type
+    assert isinstance(day, Numeric) and isinstance(call, Numeric)
+    assert day.precision is not None and call.precision is not None
+    assert day.precision > call.precision
+    assert day.scale == call.scale
+
+
+def test_the_usage_rollup_goes_when_its_tenant_does() -> None:
+    """CASCADE, unlike ``leads``, which restricts. Nothing here is a record of anything —
+    it is a cache of a SUM — so blocking a deletion on it would be theatre."""
+    foreign_keys = list(_table("usage_daily").c["tenant_id"].foreign_keys)
+    assert [fk.column.table.name for fk in foreign_keys] == ["tenants"]
+    assert foreign_keys[0].ondelete == "CASCADE"
+
+
+def test_a_quota_is_optional_and_a_tenant_without_one_is_unlimited() -> None:
+    """A quota that appeared by accident would start warning somebody about a customer who
+    never agreed to one, so NULL is both the default and the meaning "unlimited"."""
+    quota = _table("tenants").c["monthly_lead_quota"]
+    assert quota.nullable
+    assert quota.server_default is None
+    fraction = _table("tenants").c["quota_alert_fraction"]
+    assert not fraction.nullable
+    assert fraction.server_default is not None
+
+
+def test_the_alert_fraction_default_matches_the_application_constant() -> None:
+    """The database writes this default for a row inserted by psql; the service applies the
+    same number in Python. Two spellings of "alert at 80%" is how a tenant's alert ends up
+    depending on how its row was created."""
+    assert Decimal(DEFAULT_QUOTA_ALERT_FRACTION) == METERING_DEFAULT_ALERT_FRACTION
 
 
 def test_indexes_cover_the_queries_the_product_actually_runs() -> None:

@@ -53,6 +53,7 @@ One JSON object per line. Nothing is nested except `exception`.
 | `lead.suppressed` | `app.qualify` | `tier`, `suppression_cause` (`spam` / `below_threshold`), `total_score`, `latency_ms` |
 | `lead.duplicate` | `app.qualify` | `latency_ms` |
 | `lead.dispatch_failed` | `app.qualify` | `tier`, `destination_hash`, `error_type`, `exception` |
+| `tenant.quota_crossed` | `app.metering` | `period`, `quota_level` (`warning` / `exceeded`), `leads_billable`, `monthly_lead_quota`, `quota_fraction` |
 | `http.ingest` | `api.main` | `disposition`, `status`, `latency_ms` |
 | `ingest.rejected` | `api.main` | `reason`, `claimed_tenant`, `client`, `status` |
 | `ingest.rate_limited` | `api.main` | `retry_after_seconds` |
@@ -97,6 +98,16 @@ feeding an alarm. Off AWS the same line is ordinary JSON and the numbers stay qu
 | `DispatchFailures` | Count | `[TenantId]` | `lead.dispatch_failed` |
 | `IngestedLeads` | Count | `[TenantId, Disposition]` | `lead.accepted` |
 | `IngestSuppressions` | Count | `[TenantId, SpamReason]` | `lead.accepted` when a pre-filter fired |
+| `QuotaUsedLeads` | Count | `[TenantId]` | `tenant.quota_crossed` (#33) |
+| `QuotaFraction` | None | `[TenantId]` | `tenant.quota_crossed` (#33) |
+| `QuotaExceeded` | Count | `[TenantId]` | `tenant.quota_crossed` — `1` past the plan, `0` merely near it |
+
+The three quota metrics are emitted by `usagectl quota`, not by the request path: they are
+read from the rollup table by a scheduled command, and only when a tenant has actually
+crossed its alert fraction or its plan. Publishing them per lead would put a per-customer
+gauge on the path of every lead to answer a question asked daily at most. Deliberately
+**no per-tenant alarm** is defined for them — one alarm per customer does not scale, and
+#29's alarm set is fleet-wide on purpose.
 
 Dimension values are all bounded — `Tier` has four, `EscalationReason` five,
 `SuppressionCause` two, `Disposition` three — which keeps this at roughly twenty custom

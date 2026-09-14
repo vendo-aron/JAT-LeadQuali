@@ -44,6 +44,7 @@ from leadquali.observability.events import (
     EVENT_LEAD_DUPLICATE,
     EVENT_LEAD_ROUTED,
     EVENT_LEAD_SUPPRESSED,
+    EVENT_QUOTA_CROSSED,
     SuppressionCause,
     log_assessment,
     log_dispatch_failed,
@@ -51,6 +52,7 @@ from leadquali.observability.events import (
     log_lead_duplicate,
     log_lead_routed,
     log_lead_suppressed,
+    log_quota_crossed,
     suppression_cause,
 )
 from leadquali.observability.logs import (
@@ -80,6 +82,7 @@ __all__ = [
     "EVENT_LEAD_DUPLICATE",
     "EVENT_LEAD_ROUTED",
     "EVENT_LEAD_SUPPRESSED",
+    "EVENT_QUOTA_CROSSED",
     "LOG_FORMAT_HUMAN",
     "LOG_FORMAT_JSON",
     "METRIC_NAMESPACE",
@@ -105,6 +108,7 @@ __all__ = [
     "log_lead_duplicate",
     "log_lead_routed",
     "log_lead_suppressed",
+    "log_quota_crossed",
     "new_trace_id",
     "redact_emails",
     "suppression_cause",

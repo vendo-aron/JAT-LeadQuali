@@ -47,7 +47,9 @@ import uuid
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
+    Date,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -64,6 +66,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 __all__ = [
     "ASSESSMENT_STATUSES",
+    "DEFAULT_QUOTA_ALERT_FRACTION",
     "DEFAULT_RATE_LIMIT_BURST",
     "DEFAULT_RATE_LIMIT_PER_MINUTE",
     "ESCALATION_REASONS",
@@ -78,6 +81,7 @@ __all__ = [
     "RoutingEvent",
     "Tenant",
     "TenantApiKey",
+    "UsageDaily",
     "metadata",
 ]
 
@@ -143,6 +147,13 @@ low enough that a runaway integration is throttled rather than billed for."""
 DEFAULT_RATE_LIMIT_BURST: int = 10
 """How far above the sustained rate a tenant may spike — a marketing email landing at 9am
 puts a handful of submissions in the same second, and refusing those would lose leads."""
+
+DEFAULT_QUOTA_ALERT_FRACTION: str = "0.80"
+"""How much of a monthly plan may be used before somebody is told (#33), as a SQL literal.
+
+Mirrors ``leadquali.app.metering.DEFAULT_QUOTA_ALERT_FRACTION``; ``tests/unit/test_db_schema.py``
+pins the two together. A fraction rather than a count so that it survives a plan change:
+raising a customer's quota should not silently move their alert to 95% of the new one."""
 
 
 def _sql_in(column: str, values: tuple[str, ...]) -> str:
@@ -238,6 +249,16 @@ class Tenant(Base):
     rate_limit_burst: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text(str(DEFAULT_RATE_LIMIT_BURST))
     )
+    # The plan allowance, in *billable* leads per calendar month (#33). NULL means
+    # unlimited, and that is the default on purpose: a quota that appeared by accident
+    # would start warning somebody about a customer who never agreed to one. Nothing in
+    # the system refuses a lead because of this column — invariant 3 — it exists so that
+    # `usagectl quota` and a CloudWatch metric can prompt a commercial conversation.
+    monthly_lead_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # How much of that allowance may be used before the warning fires.
+    quota_alert_fraction: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(3, 2), nullable=False, server_default=text(DEFAULT_QUOTA_ALERT_FRACTION)
+    )
     created_at: Mapped[dt.datetime] = _created_at()
     # Touched by every admin write. "When did this tenant's rubric last change?" is the
     # first question after a routing surprise, and without this column the only answer is
@@ -253,6 +274,19 @@ class Tenant(Base):
         CheckConstraint(_sql_in("status", TENANT_STATUSES), name="status_known"),
         CheckConstraint(
             "rate_limit_per_minute > 0 AND rate_limit_burst > 0", name="rate_limits_are_positive"
+        ),
+        # A quota of zero would mean "this customer may send no leads", which is not a
+        # plan — it is a suspension, and there is a status column for that.
+        CheckConstraint(
+            "monthly_lead_quota IS NULL OR monthly_lead_quota > 0",
+            name="monthly_lead_quota_is_positive",
+        ),
+        # (0, 1]: an alert at 0% would fire on the first lead of every month, and one above
+        # 100% could never fire at all — a setting that silently does nothing is worse than
+        # one the database refuses.
+        CheckConstraint(
+            "quota_alert_fraction > 0 AND quota_alert_fraction <= 1",
+            name="quota_alert_fraction_is_a_fraction",
         ),
     )
 
@@ -513,6 +547,97 @@ class RoutingEvent(Base):
         # "How many leads did we suppress last week?" is only answerable if the column
         # holds the three actions the domain defines and not a fourth spelling of one.
         CheckConstraint(_sql_in("action", ROUTING_ACTIONS), name="action_known"),
+    )
+
+
+class UsageDaily(Base):
+    """One tenant's usage for one UTC calendar day: the billing rollup (#33).
+
+    Everything in here is **derived**. Every column can be recomputed from ``leads`` and
+    ``assessments``, and ``PostgresMeteringStore.rollup_day`` does exactly that and
+    replaces the whole row. The table exists so that a billing read
+    for "September, tenant acme" is a range scan over thirty small rows instead of an
+    aggregate over every assessment the tenant has ever had — a query whose cost otherwise
+    grows forever while the answer stays the same size.
+
+    Three decisions are load-bearing.
+
+    **The primary key is ``(tenant_id, usage_date)``, not a surrogate id.** The natural key
+    *is* the identity of the row: a second row for the same tenant-day is not a new fact,
+    it is a bug, and a surrogate key would let two of them coexist while every read summed
+    both. It is also the conflict target the idempotent upsert needs.
+
+    **The day is a UTC calendar day**, for every tenant, wherever they are. A billing job
+    that let a tenant in Sydney and a tenant in California each define "yesterday" would
+    double-count one of them at every month boundary.
+
+    **The token counters are ``bigint``.** ``assessments.input_tokens`` is an ``integer``
+    and is right to be — no single call approaches 2^31 — but a busy tenant passes two
+    billion input tokens inside a year, and a rollup that silently overflows would be
+    discovered on an invoice.
+
+    ``ON DELETE CASCADE`` to ``tenants``, unlike ``leads``, which restricts: this is a
+    derived table, so losing it with the tenant destroys nothing that could not be
+    recomputed, and the audit trail it would otherwise block the deletion of is in
+    ``assessments`` where it belongs.
+    """
+
+    __tablename__ = "usage_daily"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    usage_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+
+    # --- what happened, in three deliberately different numbers -----------------------
+    # `leads_ingested` counts submissions stored; `leads_assessed` counts attempts to
+    # qualify them; `leads_billable` counts the attempts that actually cost us tokens.
+    # The gap between the first and the third is the deterministic spam pre-filter, and
+    # it is not billed. See leadquali.app.metering and docs/metering-and-billing.md.
+    leads_ingested: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    leads_assessed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    leads_billable: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # A subset of `leads_assessed`, and mostly of `leads_billable` too: a refusal is an
+    # HTTP 200 that Anthropic charges for. Kept because "how much of what we billed was a
+    # failure?" is the first question of any billing dispute.
+    assessments_failed: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+
+    # --- what it cost -----------------------------------------------------------------
+    input_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    output_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    cache_read_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    cache_creation_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    # Numeric(14, 6), two digits wider than `assessments.cost_usd`: this column holds a sum
+    # of those, and a scale that fits one call does not necessarily fit a day of them.
+    cost_usd: Mapped[decimal.Decimal] = mapped_column(
+        Numeric(14, 6), nullable=False, server_default=text("0")
+    )
+
+    # When this row was last recomputed. Not "when the day happened" — that is
+    # `usage_date` — but the answer to "is this rollup stale?", which is the only question
+    # an operator asks of a derived table.
+    computed_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # Every counter is a count of rows or of tokens. A negative one means the rollup
+        # arithmetic is wrong, and it is far better to fail the write than to bill from it.
+        CheckConstraint(
+            "leads_ingested >= 0 AND leads_assessed >= 0 AND leads_billable >= 0"
+            " AND assessments_failed >= 0 AND input_tokens >= 0 AND output_tokens >= 0"
+            " AND cache_read_tokens >= 0 AND cache_creation_tokens >= 0 AND cost_usd >= 0",
+            name="usage_is_non_negative",
+        ),
+        # Billing reads a period for one tenant: WHERE tenant_id = ? AND usage_date
+        # BETWEEN ? AND ?. The primary key already serves that exactly, leading column
+        # first, so there is deliberately no second index here.
     )
 
 
