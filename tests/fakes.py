@@ -594,6 +594,11 @@ class MeteredAssessment:
 
     tenant_id: str
     created_at: datetime
+    lead_id: str
+    """Which lead this attempt was made on. Several attempts can share one — a dispatch
+    failure re-raises and SQS redelivers — and that is exactly what ``leads_billable``
+    has to collapse, so the double has to be able to express it."""
+
     status: str = "ok"
     input_tokens: int = 0
     output_tokens: int = 0
@@ -623,8 +628,11 @@ class InMemoryMeteringStore:
         self.rows: dict[tuple[str, date], UsageTotals] = {}
         #: Every ``rollup_day`` call, in order, so a test can prove how many were made.
         self.rollups: list[tuple[str, date]] = []
+        #: Every ``compute_day`` call — the live read the quota check makes.
+        self.computed: list[tuple[str, date]] = []
         self.quotas = dict(quotas or {})
         self._computed_at = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
+        self._attempts = 0
 
     # ------------------------------------------------------------------------ seeding
 
@@ -632,10 +640,22 @@ class InMemoryMeteringStore:
         """Record a submission, as ingest would."""
         self.leads.append(MeteredLead(tenant_id=tenant_id, received_at=received_at))
 
-    def add_assessment(self, *, tenant_id: str, created_at: datetime, **values: Any) -> None:
-        """Record an assessment attempt, as the worker would."""
+    def add_assessment(
+        self, *, tenant_id: str, created_at: datetime, lead_id: str | None = None, **values: Any
+    ) -> None:
+        """Record an assessment attempt, as the worker would.
+
+        ``lead_id`` defaults to a fresh one, so a test that does not care reads as "one
+        attempt, one lead". Pass the same id twice to model a redelivery.
+        """
+        self._attempts += 1
         self.assessments.append(
-            MeteredAssessment(tenant_id=tenant_id, created_at=created_at, **values)
+            MeteredAssessment(
+                tenant_id=tenant_id,
+                created_at=created_at,
+                lead_id=lead_id if lead_id is not None else f"lead-{self._attempts}",
+                **values,
+            )
         )
 
     def given_quota(self, quota: TenantQuota) -> None:
@@ -650,6 +670,13 @@ class InMemoryMeteringStore:
 
     def rollup_day(self, *, tenant_id: str, day: date) -> UsageTotals:
         self.rollups.append((tenant_id, day))
+        totals = self.compute_day(tenant_id=tenant_id, day=day)
+        # A replacement, never an increment — the property the real upsert exists for.
+        self.rows[(tenant_id, day)] = totals
+        return totals
+
+    def compute_day(self, *, tenant_id: str, day: date) -> UsageTotals:
+        self.computed.append((tenant_id, day))
         leads = [
             lead
             for lead in self.leads
@@ -665,7 +692,12 @@ class InMemoryMeteringStore:
             period=BillingPeriod.of_day(day),
             leads_ingested=len(leads),
             leads_assessed=len(assessed),
-            leads_billable=sum(1 for row in assessed if is_billable(input_tokens=row.input_tokens)),
+            # Distinct leads, not attempts: one lead redelivered three times after a
+            # dispatch failure is one billable lead. The token sums below still count
+            # every attempt, because we paid for every attempt.
+            leads_billable=len(
+                {row.lead_id for row in assessed if is_billable(input_tokens=row.input_tokens)}
+            ),
             assessments_failed=sum(1 for row in assessed if row.status == "failed"),
             input_tokens=sum(row.input_tokens for row in assessed),
             output_tokens=sum(row.output_tokens for row in assessed),
@@ -674,8 +706,6 @@ class InMemoryMeteringStore:
             cost_usd=sum((row.cost_usd for row in assessed), Decimal(0)),
             computed_at=self._computed_at,
         )
-        # A replacement, never an increment — the property the real upsert exists for.
-        self.rows[(tenant_id, day)] = totals
         return totals
 
     def usage_for_period(self, *, tenant_id: str, period: BillingPeriod) -> UsageTotals:
@@ -721,6 +751,13 @@ class InMemoryMeteringStore:
         )
         self.quotas[tenant_id] = quota
         return quota
+
+    def fleet_tenants_with_quota(self) -> Sequence[str]:
+        return sorted(
+            tenant_id
+            for tenant_id, quota in self.quotas.items()
+            if quota.monthly_lead_quota is not None
+        )
 
     def fleet_billable_leads(self, *, period: BillingPeriod) -> Mapping[str, int]:
         totals: dict[str, int] = {}

@@ -102,12 +102,24 @@ feeding an alarm. Off AWS the same line is ordinary JSON and the numbers stay qu
 | `QuotaFraction` | None | `[TenantId]` | `tenant.quota_crossed` (#33) |
 | `QuotaExceeded` | Count | `[TenantId]` | `tenant.quota_crossed` — `1` past the plan, `0` merely near it |
 
-The three quota metrics are emitted by `usagectl quota`, not by the request path: they are
-read from the rollup table by a scheduled command, and only when a tenant has actually
-crossed its alert fraction or its plan. Publishing them per lead would put a per-customer
-gauge on the path of every lead to answer a question asked daily at most. Deliberately
-**no per-tenant alarm** is defined for them — one alarm per customer does not scale, and
-#29's alarm set is fleet-wide on purpose.
+The three quota metrics are emitted by `usagectl quota` (or `quota --all`, the fleet
+sweep), not by the request path, and only when a tenant has actually crossed its alert
+fraction or its plan. Publishing them per lead would put a per-customer gauge on the path
+of every lead to answer a question asked daily at most.
+
+Two things about them are worth being plain about, because both are easy to assume and
+neither is true today:
+
+* **Nothing schedules the command.** `infra/template.yaml` has no timer for `usagectl`, so
+  these metrics appear when a person (or a cron somebody set up outside this repository)
+  runs it. Wiring a scheduled `quota --all` is the obvious follow-up to #33 and is not in
+  it.
+* **There is no alarm on them, and there cannot be a fleet-wide one as things stand.**
+  Deliberately no per-tenant alarm — one alarm per customer does not scale, and #29's
+  alarm set is fleet-wide on purpose — but the only dimension set here carries `TenantId`,
+  so CloudWatch has no dimensionless total to alarm on either. These are a dashboard and
+  Logs Insights signal; the thing that tells somebody is the `tenant.quota_crossed` log
+  events the sweep emits. `docs/metering-and-billing.md` is the procedure.
 
 Dimension values are all bounded — `Tier` has four, `EscalationReason` five,
 `SuppressionCause` two, `Disposition` three — which keeps this at roughly twenty custom

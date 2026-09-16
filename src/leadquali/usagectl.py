@@ -34,7 +34,7 @@ import contextlib
 import json
 import sys
 from collections.abc import Callable, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, TextIO
@@ -65,8 +65,10 @@ __all__ = [
     "main",
 ]
 
-#: A command that was understood and could not be carried out: no such tenant, a period
-#: that does not parse, an unreadable export.
+#: A command that was understood and could not be carried out: no such tenant, a quota
+#: that is not a plan, an export whose columns are not the ones this tool reads.
+#: ``reconcile`` also uses it for a variance outside tolerance. A period that does not
+#: parse, or a file that is not there, is :data:`EXIT_INPUT_ERROR` instead.
 EXIT_FAILED: Final[int] = 1
 
 #: A usage or input problem. The same code ``cli.py`` and ``tenantctl.py`` reserve for it.
@@ -84,6 +86,21 @@ ServiceFactory = Callable[[Settings], MeteringService]
 #: Commands that are not about a period at all. A plan is a property of the tenant, not of
 #: a month, so ``set-quota`` takes no ``--month`` and is not given one.
 PERIODLESS_COMMANDS: Final[frozenset[str]] = frozenset({"set-quota"})
+
+#: How far back ``rollup`` reaches when no period is given.
+#:
+#: Thirty-five days, and it is a **trailing window** rather than the current month for one
+#: reason: the month boundary. The runbook prescribes a daily run, and with a
+#: current-month default the run on the 1st finds no closed day in the new month and does
+#: nothing, while every later run of that month reaches back only to its own 1st — so the
+#: last day of every month would never be rolled up by any run, and every monthly invoice
+#: would quietly undercharge by a day.
+#:
+#: Thirty-five rather than two: the rollup is an idempotent whole-row replacement, so
+#: re-doing a day costs one index scan and changes nothing, and a window longer than a
+#: month means a week-long outage of the job repairs itself on the next run instead of
+#: needing somebody to notice and pick a range by hand.
+ROLLUP_LOOKBACK_DAYS: Final[int] = 35
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,7 +131,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(usage)
 
     quota = commands.add_parser("quota", help="A tenant's usage against its plan.")
-    quota.add_argument("slug")
+    quota.add_argument(
+        "slug",
+        nargs="?",
+        default=None,
+        help="The tenant. Omit with --all to sweep every tenant that has a plan.",
+    )
+    quota.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_tenants",
+        help=(
+            "Check every tenant that has an allowance, and emit the crossing metric for "
+            "each. This is the sweep to schedule; a per-tenant run reports one customer."
+        ),
+    )
     _add_period(quota)
     _add_json(quota)
 
@@ -136,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_quota.add_argument(
         "--alert-fraction",
-        type=Decimal,
+        type=_decimal_argument,
         default=None,
         help=(
             "How much of the allowance may be used before the warning fires, in (0, 1] "
@@ -164,7 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_period(reconcile)
     reconcile.add_argument(
         "--tolerance",
-        type=Decimal,
+        type=_decimal_argument,
         default=RECONCILIATION_TOLERANCE,
         help=(
             "Fractional variance to accept "
@@ -310,7 +341,11 @@ def _dispatch(
 
         case "usage":
             if args.daily:
-                rows = service.daily_usage(tenant_id=args.slug, period=_over(period))
+                rows = service.daily_usage(
+                    tenant_id=args.slug,
+                    period=_over(period),
+                    closed_days_only=not args.include_today,
+                )
                 if args.as_json:
                     print(json.dumps([_usage_json(row) for row in rows], indent=2), file=out)
                 else:
@@ -328,12 +363,26 @@ def _dispatch(
             return 0
 
         case "quota":
-            status = service.quota_status(tenant_id=args.slug, period=_over(period))
+            if (args.slug is None) == (not args.all_tenants):
+                print("usagectl: name a tenant, or pass --all; not both, not neither", file=err)
+                return EXIT_INPUT_ERROR
+            statuses = (
+                service.quota_statuses(period=_over(period))
+                if args.all_tenants
+                else [service.quota_status(tenant_id=args.slug, period=_over(period))]
+            )
             if args.as_json:
-                print(json.dumps(_quota_json(status), indent=2), file=out)
+                document: Any = (
+                    [_quota_json(status) for status in statuses]
+                    if args.all_tenants
+                    else _quota_json(statuses[0])
+                )
+                print(json.dumps(document, indent=2), file=out)
+            elif args.all_tenants:
+                _print_quota_sweep(statuses, out)
             else:
-                _print_quota(status, out)
-            if status.level is not QuotaLevel.OK:
+                _print_quota(statuses[0], out)
+            if any(status.level is not QuotaLevel.OK for status in statuses):
                 print(
                     "nothing has been blocked and nothing will be: a quota is a billing "
                     "conversation, not a switch. Every lead is still qualified.",
@@ -394,6 +443,14 @@ def _dispatch(
                 print(json.dumps(_reconcile_json(variance), indent=2), file=out)
             else:
                 _print_reconciliation(variance, out)
+            for day in variance.outlying_days:
+                print(
+                    f"note: {day.usage_date} is out by {_percent(day.variance_fraction)} "
+                    f"({_money(day.variance_usd, places='0.0001')}) — far more than the "
+                    "month. The tolerance is measured on the total, so a systematic "
+                    "day-shift cancels out there and shows up only here.",
+                    file=err,
+                )
             if variance.within_tolerance:
                 return 0
             print(
@@ -425,12 +482,21 @@ def _over(period: BillingPeriod | None) -> BillingPeriod:
 
 
 def _period(args: argparse.Namespace, *, today: date) -> BillingPeriod:
-    """The period a command was asked for.
+    """The period a command was asked for, or the right default for that command.
 
-    Defaults to the current UTC month, which is what makes ``usagectl rollup acme`` a
-    sensible thing to run from a daily cron: it recomputes every closed day of the month
-    so far, so a day that was missed while the job was broken is repaired by the next run
-    rather than needing a bespoke backfill.
+    Two defaults, because the commands want different things.
+
+    ``rollup`` defaults to a **trailing window** of :data:`ROLLUP_LOOKBACK_DAYS` days
+    ending today. That is what makes the daily cron in ``docs/metering-and-billing.md``
+    correct across a month boundary: a current-month default would do nothing on the 1st
+    (no day of the new month is closed yet) and would never reach back into the old month
+    on any later day, so the last day of every month would go unmetered forever and every
+    monthly invoice would undercharge by it. A trailing window rolls 30 September up on
+    1 October, and — because the rollup is an idempotent replacement — repairs a week of
+    missed runs at the same time.
+
+    Everything else defaults to the current UTC month, which is the period somebody
+    reading a usage or margin report almost always means.
 
     Raises:
         ValueError: the arguments do not describe a period.
@@ -440,6 +506,10 @@ def _period(args: argparse.Namespace, *, today: date) -> BillingPeriod:
     if args.month is not None:
         return BillingPeriod.parse_month(args.month)
     if args.since is None and args.until is None:
+        if args.command == "rollup":
+            # Ends *today* rather than yesterday so that --include-today has a day to
+            # include; closed_days_only clips it back to yesterday otherwise.
+            return BillingPeriod(start=today - timedelta(days=ROLLUP_LOOKBACK_DAYS), end=today)
         return BillingPeriod.of_month(today.year, today.month)
     if args.since is None or args.until is None:
         raise ValueError("--from and --to go together; pass both or pass --month")
@@ -447,6 +517,20 @@ def _period(args: argparse.Namespace, *, today: date) -> BillingPeriod:
     if end < start:
         raise ValueError(f"--from {start} is after --to {end}")
     return BillingPeriod(start=start, end=end)
+
+
+def _decimal_argument(text: str) -> Decimal:
+    """Parse a ``Decimal`` command-line argument.
+
+    ``type=Decimal`` looks like it works and does not: a bad value raises
+    ``decimal.InvalidOperation``, which is an ``ArithmeticError`` and **not** a
+    ``ValueError``, so argparse does not catch it and the command dies with a traceback
+    instead of a usage message.
+    """
+    try:
+        return Decimal(text)
+    except ArithmeticError:
+        raise argparse.ArgumentTypeError(f"'{text}' is not a number") from None
 
 
 def _day(text: str) -> date:
@@ -517,6 +601,21 @@ def _print_quota(status: QuotaStatus, out: TextIO) -> None:
     print(f"used:     {_percent(status.fraction)} of plan", file=out)
     print(f"left:     {status.remaining}", file=out)
     print(f"status:   {status.level.value}", file=out)
+
+
+def _print_quota_sweep(statuses: Sequence[QuotaStatus], out: TextIO) -> None:
+    """One line per tenant that has a plan, worst first so the top of the list is the work."""
+    if not statuses:
+        print("(no tenant has an allowance configured)", file=out)
+        return
+    order = {QuotaLevel.EXCEEDED: 0, QuotaLevel.WARNING: 1, QuotaLevel.OK: 2}
+    width = max(len(status.tenant_id) for status in statuses)
+    for status in sorted(statuses, key=lambda s: (order[s.level], s.tenant_id)):
+        print(
+            f"{status.tenant_id:<{width}}  {status.level.value:<8}  "
+            f"{status.used}/{status.quota}  ({_percent(status.fraction)})",
+            file=out,
+        )
 
 
 def _print_margin(report: MarginReport, out: TextIO) -> None:

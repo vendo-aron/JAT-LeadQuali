@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import ClauseElement
+from sqlalchemy import ClauseElement, Row
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine.result import IteratorResult, SimpleResultMetaData
 from sqlalchemy.orm import Session, sessionmaker
 
 from leadquali.adapters import metering_postgres
@@ -68,6 +69,42 @@ class CapturingSession:
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+
+class ScriptedSession:
+    """A session that answers with one canned row, labelled as the statement labels it.
+
+    The values are supplied by name, so the row is built from *the statement's own*
+    labels — which is what makes a mapper reading the wrong name, or the right name in the
+    wrong position, fail here instead of passing quietly.
+    """
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self.values = values
+
+    def execute(self, statement: ClauseElement, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        labels = [str(column.key) for column in statement.selected_columns]  # type: ignore[attr-defined]  # a Select, by construction
+        metadata = SimpleResultMetaData(tuple(labels))
+        return IteratorResult(metadata, iter([tuple(self.values[label] for label in labels)]))
+
+    def __enter__(self) -> ScriptedSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class ScriptedSessions(sessionmaker[Session]):
+    """A ``sessionmaker`` whose ``begin()`` yields a :class:`ScriptedSession`."""
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        super().__init__()
+        self.values = values
+
+    def begin(self) -> Any:
+        """Hand out the scripted session instead of a real one."""
+        return ScriptedSession(self.values)
 
 
 class CapturingSessions(sessionmaker[Session]):
@@ -170,7 +207,18 @@ def test_the_billable_filter_is_the_documented_rule(store: PostgresMeteringStore
     :func:`~leadquali.app.metering.is_billable`. If these two ever disagree, a customer is
     charged for something the documentation says is free."""
     sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
-    assert "count(*) filter (where assessments.input_tokens > " in sql
+    assert "filter (where assessments.input_tokens > " in sql
+
+
+def test_billable_leads_are_counted_distinctly(store: PostgresMeteringStore) -> None:
+    """A dispatch failure re-raises, SQS redelivers and a second assessment row is written
+    for the same lead. Counting rows would bill the customer three times for our own SES
+    outage; the token and cost sums deliberately stay over every attempt, because we were
+    charged for every attempt."""
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "count(distinct assessments.lead_id) filter (where assessments.input_tokens > " in sql
+    assert "sum(assessments.input_tokens)" in sql
+    assert "distinct assessments.input_tokens" not in sql
 
 
 def test_a_failed_assessment_is_counted_by_status(store: PostgresMeteringStore) -> None:
@@ -195,6 +243,12 @@ def test_the_day_predicate_is_a_range_and_not_a_function_on_the_column(
     assert "date_trunc" not in sql
     assert "assessments.created_at >=" in sql
     assert "assessments.created_at <" in sql
+    # `<=` contains `<`, so the assertion above passes for both. Spelled out negatively
+    # because the difference is a row stamped exactly midnight being billed in two days,
+    # for ever, with nothing anywhere to notice.
+    assert "assessments.created_at <=" not in sql
+    assert "leads.received_at <=" not in sql
+    assert "leads.received_at <" in sql
 
 
 def test_reading_a_period_never_touches_the_assessments_table(
@@ -260,6 +314,83 @@ def test_the_fleet_spend_groups_by_day(store: PostgresMeteringStore) -> None:
     assert "sum(usage_daily.cost_usd)" in sql
 
 
+# ------------------------------------------------------------------- result mapping
+
+
+#: A row where every number is distinguishable from every other, so a mapper that reads
+#: the wrong column produces a visibly wrong value rather than a plausible one.
+DISTINCT_VALUES: dict[str, Any] = {
+    "usage_date": DAY,
+    "leads_ingested": 11,
+    "leads_assessed": 22,
+    "leads_billable": 33,
+    "assessments_failed": 44,
+    "input_tokens": 55,
+    "output_tokens": 66,
+    "cache_read_tokens": 77,
+    "cache_creation_tokens": 88,
+    "cost_usd": Decimal("99.000001"),
+    "computed_at": dt.datetime(2026, 10, 1, 6, 0, tzinfo=dt.UTC),
+}
+
+
+def row_of(values: dict[str, Any]) -> Row[Any]:
+    """A real SQLAlchemy ``Row`` with these labels, as a query would produce."""
+    metadata = SimpleResultMetaData(tuple(values))
+    return IteratorResult(metadata, iter([tuple(values.values())])).one()
+
+
+def test_a_rollup_row_maps_onto_every_field_by_name() -> None:
+    """The ten-column mapping, asserted field by field.
+
+    Positional mapping is one edit away from reading money out of the ``input_tokens``
+    slot — a $0.05 day rendered as a $4,200 invoice line — and no constraint, type checker
+    or other test in this suite would notice. This is the test that does.
+    """
+    totals = PostgresMeteringStore._totals_from_row(tenant_id=TENANT, row=row_of(DISTINCT_VALUES))
+
+    assert totals.tenant_id == TENANT
+    assert totals.period == BillingPeriod.of_day(DAY)
+    assert totals.leads_ingested == 11
+    assert totals.leads_assessed == 22
+    assert totals.leads_billable == 33
+    assert totals.assessments_failed == 44
+    assert totals.input_tokens == 55
+    assert totals.output_tokens == 66
+    assert totals.cache_read_tokens == 77
+    assert totals.cache_creation_tokens == 88
+    assert totals.cost_usd == Decimal("99.000001")
+    assert totals.computed_at == DISTINCT_VALUES["computed_at"]
+
+
+def test_the_period_read_maps_its_aggregate_by_name_too() -> None:
+    """The acceptance-criterion query, end to end against a canned result.
+
+    The values are keyed by the label the statement itself declares, so this fails if the
+    ``select()`` and the mapper ever disagree about which aggregate is which — including
+    the two that a positional mapping would silently swap.
+    """
+    values = {**DISTINCT_VALUES, "usage_date": SEPTEMBER.start}
+    store = PostgresMeteringStore(ScriptedSessions(values))
+
+    totals = store.usage_for_period(tenant_id=TENANT, period=SEPTEMBER)
+
+    assert totals.period == SEPTEMBER, "the read reports the period asked for, not one day"
+    assert totals.leads_assessed == 22
+    assert totals.leads_billable == 33
+    assert totals.input_tokens == 55
+    assert totals.cost_usd == Decimal("99.000001")
+
+
+def test_the_period_read_labels_every_aggregate_it_selects(
+    store: PostgresMeteringStore,
+) -> None:
+    """The other half of the guarantee: the statement carries the names the mapper reads."""
+    sql = sql_for(lambda: store.usage_for_period(tenant_id=TENANT, period=SEPTEMBER))
+    for name in ("leads_billable", "input_tokens", "cost_usd", "computed_at"):
+        assert f" as {name}" in sql, name
+
+
 # ------------------------------------------------------------------ tenant scoping
 
 
@@ -267,6 +398,7 @@ def test_the_fleet_spend_groups_by_day(store: PostgresMeteringStore) -> None:
     "method",
     [
         "rollup_day",
+        "compute_day",
         "usage_for_period",
         "daily_usage",
         "quota_for",
@@ -282,7 +414,7 @@ def test_every_tenant_scoped_statement_filters_on_the_tenant(
     pass a signature check and hand one customer another customer's usage.
     """
     arguments: dict[str, Any] = {"tenant_id": TENANT}
-    if method == "rollup_day":
+    if method in {"rollup_day", "compute_day"}:
         arguments["day"] = DAY
     elif method in {"usage_for_period", "daily_usage"}:
         arguments["period"] = SEPTEMBER
@@ -302,12 +434,14 @@ def test_no_store_method_is_reachable_without_a_tenant_or_a_fleet_name() -> None
     }
     assert set(methods) == {
         "rollup_day",
+        "compute_day",
         "usage_for_period",
         "daily_usage",
         "quota_for",
         "set_quota",
         "fleet_billable_leads",
         "fleet_daily_spend",
+        "fleet_tenants_with_quota",
     }
     for name, method in methods.items():
         parameters = inspect.signature(method).parameters

@@ -340,6 +340,75 @@ def test_a_row_that_arrives_late_is_picked_up_by_the_next_run(
     assert again.cost_usd == Decimal("0.059000")
 
 
+def test_one_lead_attempted_three_times_is_one_billable_lead(
+    service: MeteringService, connection: Connection
+) -> None:
+    """``count(DISTINCT lead_id)``, against the database that has to do it.
+
+    A dispatch failure re-raises, ``already_routed`` answers ``False`` for a failed send,
+    and ``record_assessment`` is a plain insert with no uniqueness on ``lead_id`` — so an
+    SES outage plus ``maxReceiveCount: 3`` really does write three rows for one lead.
+    Billing that as three leads charges the customer for our outage.
+    """
+    lead = add_lead(
+        connection,
+        tenant=TENANT_A,
+        received_at=datetime(2026, 9, 3, 9, tzinfo=UTC),
+        submission="redelivered",
+    )
+    for hour in (9, 10, 11):
+        add_assessment(
+            connection,
+            tenant=TENANT_A,
+            lead_id=lead,
+            created_at=datetime(2026, 9, 3, hour, tzinfo=UTC),
+            input_tokens=1_000,
+            output_tokens=200,
+            cost_usd=Decimal("0.010000"),
+        )
+
+    totals = service.rollup_day(tenant_id=TENANT_A, day=DAY)
+
+    assert totals.leads_ingested == 1
+    assert totals.leads_assessed == 3
+    assert totals.leads_billable == 1
+    # Our own cost still counts all three, because Anthropic charged us for all three —
+    # and reconciliation against their invoice would fail by exactly this much otherwise.
+    assert totals.input_tokens == 3_000
+    assert totals.cost_usd == Decimal("0.030000")
+
+
+def test_a_live_day_computes_the_same_figures_without_writing_a_row(
+    service: MeteringService, store: PostgresMeteringStore, connection: Connection
+) -> None:
+    """The live quota read: the same arithmetic as the rollup, and no row afterwards."""
+    seed_a_typical_day(connection)
+
+    live = store.compute_day(tenant_id=TENANT_A, day=DAY)
+    stored = connection.execute(
+        select(UsageDaily.tenant_id).where(UsageDaily.usage_date == DAY)
+    ).all()
+
+    assert live.leads_ingested == 6
+    assert live.leads_billable == 4
+    assert live.cost_usd == Decimal("0.054000")
+    assert stored == [], "a read path must not write, and must not take a row lock"
+
+    rolled = service.rollup_day(tenant_id=TENANT_A, day=DAY)
+    for column in IDEMPOTENT_COLUMNS:
+        assert getattr(live, column) == getattr(rolled, column), column
+
+
+def test_the_fleet_sweep_lists_only_tenants_that_have_a_plan(
+    service: MeteringService, store: PostgresMeteringStore
+) -> None:
+    service.set_quota(tenant_id=TENANT_A, monthly_lead_quota=10, alert_fraction=Decimal("0.80"))
+    assert list(store.fleet_tenants_with_quota()) == [TENANT_A]
+
+    statuses = service.quota_statuses(period=SEPTEMBER)
+    assert [status.tenant_id for status in statuses] == [TENANT_A]
+
+
 def test_an_empty_day_rolls_up_to_zeroes(service: MeteringService, connection: Connection) -> None:
     """A row of zeroes, not a missing row: "rolled up, nothing happened" and "never rolled
     up" are different facts, and only the first can be billed from."""

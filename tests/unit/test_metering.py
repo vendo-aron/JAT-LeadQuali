@@ -176,6 +176,57 @@ def test_an_assessment_that_cost_no_tokens_is_counted_but_not_billed() -> None:
     assert totals.cost_usd == Decimal(0)
 
 
+def test_one_lead_attempted_three_times_is_one_billable_lead() -> None:
+    """The bug the per-lead rule exists to stop.
+
+    ``qualify`` re-raises on a failed dispatch so SQS redelivers, ``already_routed``
+    deliberately answers ``False`` for a failed send, and ``record_assessment`` is a plain
+    insert — so an SES outage plus ``maxReceiveCount: 3`` writes three assessment rows for
+    one lead. Counting rows would bill the customer three times for our own outage, and
+    their report would read "1 lead received, 3 billable leads".
+    """
+    service, store = build()
+    store.add_lead(tenant_id=TENANT, received_at=at(DAY))
+    for hour in (1, 2, 3):
+        store.add_assessment(
+            tenant_id=TENANT,
+            created_at=at(DAY, hour),
+            lead_id="lead-redelivered",
+            input_tokens=1_000,
+            output_tokens=200,
+            cost_usd=Decimal("0.010000"),
+        )
+
+    totals = service.rollup_day(tenant_id=TENANT, day=DAY)
+
+    assert totals.leads_ingested == 1
+    assert totals.leads_assessed == 3, "the attempts happened and are worth seeing"
+    assert totals.leads_billable == 1, "the customer has one lead"
+    # ...and we really were charged for all three, so our own cost still shows all three.
+    # That gap is the retry cost we absorb, and it has to stay visible or reconciliation
+    # against the Anthropic invoice would fail by exactly that amount every month.
+    assert totals.input_tokens == 3_000
+    assert totals.cost_usd == Decimal("0.030000")
+    assert totals.leads_filtered == 0
+
+
+def test_a_retried_lead_does_not_eat_three_units_of_a_plan() -> None:
+    """The same fix, seen from the quota: a plan is a monthly *lead* allowance."""
+    store = InMemoryMeteringStore()
+    store.given_quota(TenantQuota(tenant_id=TENANT, monthly_lead_quota=2))
+    for hour in (1, 2, 3):
+        store.add_assessment(
+            tenant_id=TENANT, created_at=at(DAY, hour), lead_id="one-lead", input_tokens=900
+        )
+    service, _ = build(store=store)
+    service.rollup_day(tenant_id=TENANT, day=DAY)
+
+    status = service.quota_status(tenant_id=TENANT, period=SEPTEMBER)
+
+    assert status.used == 1
+    assert status.level is QuotaLevel.OK
+
+
 def test_another_tenants_rows_never_reach_this_tenants_totals() -> None:
     """Invariant 4, at the level a billing number cares about."""
     service, store = build()
@@ -350,6 +401,42 @@ def test_a_period_with_no_closed_day_meters_as_zero() -> None:
     assert totals.period == BillingPeriod.of_month(2026, 9)
 
 
+def test_a_wholly_open_period_reports_its_zero_as_partial() -> None:
+    """A confident zero is the wrong answer for a month nobody has counted any of yet."""
+    service, _ = build(now=datetime(2026, 9, 1, 3, 0, tzinfo=UTC))
+    totals = service.usage_for_period(tenant_id=TENANT, period=BillingPeriod.of_month(2026, 9))
+    assert totals.leads_billable == 0
+    assert totals.partial
+
+
+def test_the_daily_view_drops_the_day_in_progress_by_default() -> None:
+    """F5: ``--include-today`` was accepted and silently ignored on this branch, so a
+    day-by-day view of a billing period quietly included a day that could still grow."""
+    service, store = build(now=datetime(2026, 9, 5, 9, 0, tzinfo=UTC))
+    for day in (date(2026, 9, 4), date(2026, 9, 5)):
+        seed_a_typical_day(store, day=day)
+        service.rollup_day(tenant_id=TENANT, day=day)
+
+    closed = service.daily_usage(tenant_id=TENANT, period=SEPTEMBER)
+    live = service.daily_usage(tenant_id=TENANT, period=SEPTEMBER, closed_days_only=False)
+
+    assert [row.period.start for row in closed] == [date(2026, 9, 4)]
+    assert [row.period.start for row in live] == [date(2026, 9, 4), date(2026, 9, 5)]
+
+
+def test_the_daily_view_marks_the_open_day_partial() -> None:
+    """It used to report ``"partial": false`` for today, contradicting the CLI's own
+    documented promise that a partial day is always labelled."""
+    service, store = build(now=datetime(2026, 9, 5, 9, 0, tzinfo=UTC))
+    for day in (date(2026, 9, 4), date(2026, 9, 5)):
+        seed_a_typical_day(store, day=day)
+        service.rollup_day(tenant_id=TENANT, day=day)
+
+    rows = service.daily_usage(tenant_id=TENANT, period=SEPTEMBER, closed_days_only=False)
+
+    assert [row.partial for row in rows] == [False, True]
+
+
 def test_daily_usage_lists_only_the_days_that_were_rolled_up() -> None:
     """A missing day is absent rather than zero: "never rolled up" and "nothing happened"
     are different facts and only the caller knows which one matters."""
@@ -365,13 +452,31 @@ def test_daily_usage_lists_only_the_days_that_were_rolled_up() -> None:
 # ---------------------------------------------------------------------------- totals
 
 
+def test_leads_filtered_counts_leads_against_leads() -> None:
+    """Ingested minus *billable*, not minus attempts.
+
+    Both sides of the subtraction have to be a count of leads. Subtracting attempts would
+    report a lead that was retried after a dispatch failure as negative spam — the same
+    confusion that made ``leads_billable`` overcharge before it was made per-lead.
+    """
+    retried = replace(
+        UsageTotals.zero(tenant_id=TENANT, period=SEPTEMBER),
+        leads_ingested=5,
+        leads_assessed=7,
+        leads_billable=3,
+    )
+    assert retried.leads_filtered == 2
+
+
 def test_leads_filtered_is_never_negative() -> None:
-    """A lead received at 23:59 and assessed at 00:01 lands in two different days, so the
-    difference can invert. A negative "spam caught" figure would be unexplainable."""
+    """One cause survives the fix: a lead received at 23:59 and assessed at 00:01 belongs
+    to two different days, so a day can hold a billable lead whose submission is in
+    yesterday's count. A negative "spam caught" figure would be unexplainable, and nothing
+    that could reach an invoice is hidden — ``leads_billable`` is computed directly."""
     inverted = replace(
         UsageTotals.zero(tenant_id=TENANT, period=SEPTEMBER),
         leads_ingested=1,
-        leads_assessed=4,
+        leads_billable=4,
     )
     assert inverted.leads_filtered == 0
 
@@ -497,6 +602,105 @@ def test_a_live_quota_check_includes_today() -> None:
 
     assert status.level is QuotaLevel.EXCEEDED
     assert status.partial
+
+
+def test_a_live_quota_check_reads_today_from_the_source_tables() -> None:
+    """F7: the rollup is written after midnight, so today has no row in it.
+
+    A quota check that read only the rollup would report zero for today however its
+    arguments were set, and a tenant who blew through their plan this morning would look
+    fine until tomorrow — which is the entire failure the alert exists to prevent. The
+    earlier test passed only because it rolled today up first, a step the runbook never
+    prescribes.
+    """
+    store = InMemoryMeteringStore()
+    store.given_quota(TenantQuota(tenant_id=TENANT, monthly_lead_quota=3))
+    today = date(2026, 9, 5)
+    for index in range(9):
+        store.add_assessment(
+            tenant_id=TENANT, created_at=at(today), lead_id=f"live-{index}", input_tokens=100
+        )
+    service, _ = build(store=store, now=datetime(2026, 9, 5, 10, 0, tzinfo=UTC))
+    # Deliberately no rollup of today: this is the state the prescribed cron leaves.
+
+    status = service.quota_status(tenant_id=TENANT, period=BillingPeriod.of_month(2026, 9))
+
+    assert status.used == 9
+    assert status.level is QuotaLevel.EXCEEDED
+    assert status.partial
+    assert store.computed == [(TENANT, today)], "today, once, for this tenant only"
+
+
+def test_a_live_quota_check_reads_but_never_writes() -> None:
+    """A write inside a read path is how a reporting command takes a row lock on a table
+    a billing job is updating."""
+    store = InMemoryMeteringStore()
+    store.given_quota(TenantQuota(tenant_id=TENANT, monthly_lead_quota=3))
+    store.add_assessment(tenant_id=TENANT, created_at=at(date(2026, 9, 5)), input_tokens=100)
+    service, _ = build(store=store, now=datetime(2026, 9, 5, 10, 0, tzinfo=UTC))
+
+    service.quota_status(tenant_id=TENANT, period=BillingPeriod.of_month(2026, 9))
+
+    assert store.rollups == []
+    assert store.rows == {}
+
+
+def test_a_live_quota_check_adds_today_to_the_closed_days() -> None:
+    """Closed days come from the rollup and today from source; neither is double counted."""
+    store = InMemoryMeteringStore()
+    store.given_quota(TenantQuota(tenant_id=TENANT, monthly_lead_quota=100))
+    for index in range(4):
+        store.add_assessment(
+            tenant_id=TENANT,
+            created_at=at(date(2026, 9, 4)),
+            lead_id=f"closed-{index}",
+            input_tokens=100,
+        )
+    for index in range(3):
+        store.add_assessment(
+            tenant_id=TENANT,
+            created_at=at(date(2026, 9, 5)),
+            lead_id=f"open-{index}",
+            input_tokens=100,
+        )
+    service, _ = build(store=store, now=datetime(2026, 9, 5, 10, 0, tzinfo=UTC))
+    service.rollup_day(tenant_id=TENANT, day=date(2026, 9, 4))
+
+    period = BillingPeriod.of_month(2026, 9)
+    assert service.quota_status(tenant_id=TENANT, period=period).used == 7
+    billed = service.quota_status(tenant_id=TENANT, period=period, closed_days_only=True)
+    assert billed.used == 4, "the figure a billing job would use excludes today"
+
+
+def test_a_quota_check_outside_the_current_month_does_not_read_source_tables() -> None:
+    """September, checked in October: every day of it is closed and in the rollup."""
+    service, store = quota_service(used=10, quota=100)
+    store.computed.clear()
+    service.quota_status(tenant_id=TENANT, period=SEPTEMBER)
+    assert store.computed == []
+
+
+def test_the_fleet_sweep_checks_every_tenant_that_has_a_plan() -> None:
+    """The thing to schedule. ``quota <slug>`` reports one customer, which is no use as a
+    standing alert across a growing customer list."""
+    store = InMemoryMeteringStore()
+    store.given_quota(TenantQuota(tenant_id=TENANT, monthly_lead_quota=10))
+    store.given_quota(TenantQuota(tenant_id=OTHER, monthly_lead_quota=10))
+    store.given_quota(TenantQuota(tenant_id="unlimited-co", monthly_lead_quota=None))
+    for index in range(20):
+        store.add_assessment(
+            tenant_id=OTHER, created_at=at(DAY), lead_id=f"o-{index}", input_tokens=100
+        )
+    service, _ = build(store=store)
+    service.rollup_day(tenant_id=OTHER, day=DAY)
+
+    statuses = service.quota_statuses(period=SEPTEMBER)
+
+    assert [status.tenant_id for status in statuses] == [TENANT, OTHER]
+    assert {status.tenant_id: status.level for status in statuses} == {
+        TENANT: QuotaLevel.OK,
+        OTHER: QuotaLevel.EXCEEDED,
+    }
 
 
 def test_crossing_a_quota_emits_an_event_and_a_metric() -> None:
@@ -646,6 +850,25 @@ def test_margin_is_revenue_minus_every_cost_once_revenue_is_known() -> None:
     assert report.revenue_usd == Decimal("500.00")
     assert report.margin_usd == Decimal("500.00") - report.cost_usd
     assert report.margin_fraction == report.margin_usd / Decimal("500.00")
+
+
+def test_margin_excludes_the_day_in_progress_by_default() -> None:
+    """F6: flipping this default to ``False`` used to pass the whole suite. A margin
+    report is a billing artefact and must not be computed from a day that can still grow."""
+    service, store = build(now=datetime(2026, 9, 5, 9, 0, tzinfo=UTC))
+    for day in (date(2026, 9, 4), date(2026, 9, 5)):
+        seed_a_typical_day(store, day=day)
+        service.rollup_day(tenant_id=TENANT, day=day)
+    period = BillingPeriod.of_month(2026, 9)
+
+    closed = service.margin(tenant_id=TENANT, period=period)
+    live = service.margin(tenant_id=TENANT, period=period, closed_days_only=False)
+
+    assert closed.usage.period.end == date(2026, 9, 4)
+    assert closed.inference_usd == Decimal("0.054000")
+    assert not closed.usage.partial
+    assert live.inference_usd == Decimal("0.108000")
+    assert live.usage.partial
 
 
 def test_infrastructure_is_allocated_pro_rata_by_billable_leads() -> None:

@@ -16,7 +16,7 @@ Three numbers are recorded for every tenant, every day. They are different on pu
 |---|---|---|
 | **Leads received** | Every submission your form sent us, spam included | No |
 | **Leads assessed** | Every submission we ran through the qualification model | — |
-| **Billable leads** | Every assessment that actually reached the model | **Yes** |
+| **Billable leads** | Every *lead* that actually reached the model at least once | **Yes** |
 
 **You are charged for billable leads.** That is the third number, and it is the only one on
 an invoice.
@@ -34,6 +34,14 @@ Three reasons, and the third is the one that matters most:
 2. Charging for it would mean charging you for our filter doing its job.
 3. It would give *us* a reason not to improve the filter. A pricing rule that rewards us
    for being worse at something is a bad rule however small the amounts are.
+
+### One lead is one charge, however many times we tried
+
+If something goes wrong on our side after the model has answered — our email provider is
+down, say — the work is retried, and the lead is assessed again. **You are charged once.**
+Billable leads are counted as distinct leads, not as attempts, because a retry is our
+problem and not yours. Your usage report shows both numbers, so the gap between "leads
+assessed" and "billable leads" is visible: that gap is cost we absorb.
 
 ### A failed assessment is charged
 
@@ -71,6 +79,22 @@ skipped, nothing is silently downgraded. Crossing the threshold produces:
 
 - a `warning` or `exceeded` status in `usagectl quota`,
 - a log event (`tenant.quota_crossed`) and a CloudWatch metric.
+
+Those are emitted **when the check is run**, and the check to run is the fleet sweep:
+
+```bash
+python -m leadquali.usagectl quota --all
+```
+
+Nothing schedules that today — `infra/template.yaml` has no timer for `usagectl`, and
+wiring one is the obvious follow-up. Until it exists, the quota is a report somebody runs,
+not an alert that arrives.
+
+A quota check reads today's usage from the source tables rather than from the rollup,
+because the rollup is written after midnight and would otherwise report zero for today —
+a tenant who blew through their plan this morning would look fine until tomorrow. It is
+the one read in the system that touches `assessments`, it is bounded to one day for one
+tenant, and it writes nothing.
 
 That is the whole mechanism. Going over your plan is a conversation and an invoice line; it
 is not a technical event, and a system that turned it into one would be choosing to throw
@@ -116,6 +140,12 @@ there is one tenant or fifty. So:
 
 Every report that prints the number prints that caveat with it. Keep it that way.
 
+**`margin` output is operator-only — do not show it to a customer.** Both the human report
+and `--json` carry `fleet_billable_leads`, the total across every tenant, because it is the
+denominator of the allocation and a number nobody can check an allocation without. It is
+also, straightforwardly, everyone else's volume. `usage` and `quota` carry only the
+tenant's own figures and are the reports to share.
+
 ---
 
 ## Operator runbook
@@ -129,8 +159,17 @@ All commands are `python -m leadquali.usagectl`. They need `DATABASE_URL` set (s
 python -m leadquali.usagectl rollup acme-demo
 ```
 
-Recomputes every **closed** day of the current month for that tenant and replaces the rows
+Recomputes every **closed** day of the last 35 days for that tenant and replaces the rows
 in `usage_daily`. Run it once a day, after midnight UTC.
+
+The default is a **trailing window**, not the current month, and that is load-bearing. With
+a current-month default, the run on the 1st finds no closed day in the new month and does
+nothing, and every later run reaches back only to its own 1st — so the last day of every
+month would never be rolled up by any run, and every monthly invoice would silently
+undercharge by a day (~3.3%), with exit code 0 and no error anywhere. A trailing window
+rolls 30 September up on 1 October. Thirty-five days rather than two because the rollup is
+idempotent, so redoing a day is free, and a window longer than a month means a week-long
+outage of the job repairs itself on the next run.
 
 It is **idempotent**: a day is recomputed from `leads` and `assessments` and written as a
 whole row, never incremented. Consequences worth knowing:
@@ -155,7 +194,10 @@ python -m leadquali.usagectl margin acme-demo --month 2026-09
 
 Reads come from `usage_daily` and never scan `assessments`, so a billing read costs the
 same in month one and in year three. Add `--include-today` to see the day in progress; it
-is marked `(partial)`, and an invoice must not come from it.
+is marked `(partial)`, and an invoice must not come from it. Note the consequence of
+reading the rollup: today shows up only once it has been rolled up, so
+`usagectl rollup <tenant> --include-today` first if you want live figures. (`quota` is the
+exception — see above — because an alert that was a day behind would be useless.)
 
 In `--json`, **every money figure is a string** (`"0.054000"`, not `0.054`). A JSON number
 is a double by the time anything has parsed it, and a billing figure that has been through
@@ -196,8 +238,18 @@ reach the Anthropic console.
    the customer — and prints a per-day and total variance in dollars and percent.
 
 4. **Exit 0** means the totals agree within 2% (`RECONCILIATION_TOLERANCE`). **Exit 1**
-   means they do not, and no customer should be invoiced from our figures until the
-   difference is explained. Run it from a cron so a silent drift cannot accumulate.
+   means the reconciliation did not come out clean — either the variance is outside
+   tolerance, or it could not be done at all (columns this tool does not recognise, an
+   empty file, a tenant that does not exist). Both mean a person has to look before
+   anybody bills from our figures; the message on stderr says which it was. An unreadable
+   or missing file is exit 2, like any other bad argument. Run it from a cron so a silent
+   drift cannot accumulate.
+5. Watch for the per-day notes on stderr. The tolerance is measured on the **month's
+   total**, so a systematic day-shift — every day wrong by a day's spend, the errors
+   cancelling out across the month — reconciles perfectly. Any single day more than five
+   times the tolerance out is printed as a note even when the total is fine. It does not
+   change the exit code (a quiet Sunday next to a busy Monday can produce one), but it is
+   the only thing that would surface that class of bug.
 
 #### What legitimately causes drift
 

@@ -54,11 +54,13 @@ no tenant attached to it cannot be produced by accident at a call site.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Date, Row, cast, func, literal, select, update
+from sqlalchemy import Date, Row, Select, cast, distinct, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -94,6 +96,21 @@ _ROLLUP_COLUMNS: tuple[str, ...] = (
     "cache_creation_tokens",
     "cost_usd",
     "computed_at",
+)
+
+#: The counters ``usage_for_period`` sums. The names are the ``usage_daily`` columns and
+#: the ``UsageTotals`` fields alike, which is what lets one mapper read a single rollup row
+#: and an aggregate over a month without knowing which it was given.
+_SUMMED_COLUMNS: tuple[str, ...] = (
+    "leads_ingested",
+    "leads_assessed",
+    "leads_billable",
+    "assessments_failed",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "cost_usd",
 )
 
 #: Everything a full recomputation replaces. ``tenant_id`` and ``usage_date`` are the
@@ -154,17 +171,51 @@ class PostgresMeteringStore:
         """Recompute one tenant-day from source and replace its ``usage_daily`` row.
 
         One statement, and it is a whole-row replacement rather than an increment — see
-        the module docstring. The counting rule is
-        :func:`leadquali.app.metering.is_billable`, restated here as
-        ``input_tokens > 0`` because a ``FILTER`` clause has to be SQL; the unit tests pin
-        the two together.
+        the module docstring. The arithmetic is :meth:`_day_source`, shared with
+        :meth:`compute_day` so that the written figure and the live one cannot drift.
 
         Returns:
             The row as it now stands, read back from ``RETURNING`` rather than from the
             values sent, so a CHECK constraint or a type coercion cannot make the returned
             totals disagree with what is stored.
         """
-        tenant = tenant_uuid(tenant_id)
+        source = self._day_source(tenant=tenant_uuid(tenant_id), day=day, for_insert=True)
+        insertion = insert(UsageDaily).from_select(list(_ROLLUP_COLUMNS), source)
+        statement = insertion.on_conflict_do_update(
+            index_elements=[UsageDaily.tenant_id, UsageDaily.usage_date],
+            set_={name: getattr(insertion.excluded, name) for name in _REPLACED_COLUMNS},
+        ).returning(*(getattr(UsageDaily, name) for name in _ROLLUP_COLUMNS))
+
+        with self._sessions.begin() as session:
+            row = session.execute(statement).one()
+        return self._totals_from_row(tenant_id=tenant_id, row=row)
+
+    def compute_day(self, *, tenant_id: str, day: dt.date) -> UsageTotals:
+        """The same arithmetic as :meth:`rollup_day`, as a read that stores nothing.
+
+        The one query in the system that reaches into ``assessments`` on a reporting path,
+        and it exists for exactly one caller: the live quota check, which needs a figure
+        for today, a day the nightly rollup has not covered and cannot have. It is bounded
+        to one day for one tenant and served by ``ix_assessments_tenant_id_created_at``.
+
+        It does not write. Rolling today up as a side effect of reading it would put a row
+        lock on a table a billing job may be updating, from a command an operator runs
+        whenever they like.
+        """
+        statement = self._day_source(tenant=tenant_uuid(tenant_id), day=day, for_insert=False)
+        with self._sessions.begin() as session:
+            row = session.execute(statement).one()
+        return self._totals_from_row(tenant_id=tenant_id, row=row)
+
+    def _day_source(self, *, tenant: uuid.UUID, day: dt.date, for_insert: bool) -> Select[Any]:
+        """One tenant-day, computed from ``leads`` and ``assessments``.
+
+        The single definition of what a usage day *is*, used both as the ``SELECT`` half of
+        the rollup's upsert and as a standalone read. ``for_insert`` only decides whether
+        the tenant and the date ride along as columns (the upsert needs them; a read
+        already knows them) — the counting is identical either way, which is the point of
+        having one method.
+        """
         start, end = _day_bounds(day)
 
         # Submissions stored for this tenant on this day, counted by when they arrived.
@@ -182,19 +233,33 @@ class PostgresMeteringStore:
             .scalar_subquery()
         )
 
-        source = (
-            select(
+        identity: tuple[Any, ...] = (
+            (
                 literal(tenant).label("tenant_id"),
                 # Cast explicitly rather than relying on Postgres to resolve an
                 # unknown-typed parameter from the target column of the INSERT: the
                 # inference does hold, and a billing statement is the wrong place to
                 # depend on it.
                 cast(literal(day), Date).label("usage_date"),
+            )
+            if for_insert
+            else (cast(literal(day), Date).label("usage_date"),)
+        )
+
+        return (
+            select(
+                *identity,
                 leads_ingested.label("leads_ingested"),
                 func.count().label("leads_assessed"),
-                # The billing rule, in SQL. An attempt that burned input tokens reached
-                # Anthropic and is on our invoice, so it is on the customer's.
-                func.count().filter(Assessment.input_tokens > 0).label("leads_billable"),
+                # The billing rule, in SQL: distinct *leads* with at least one attempt
+                # that cost input tokens. DISTINCT, not a row count, because a dispatch
+                # failure re-raises and SQS redelivers, so one lead can carry three
+                # attempts — and billing a customer three times for our own SES outage is
+                # indefensible. The token and cost sums below deliberately stay over every
+                # attempt: we really were charged for all three, and that gap is ours.
+                func.count(distinct(Assessment.lead_id))
+                .filter(Assessment.input_tokens > 0)
+                .label("leads_billable"),
                 func.count()
                 .filter(Assessment.status == ASSESSMENT_STATUS_FAILED)
                 .label("assessments_failed"),
@@ -215,16 +280,6 @@ class PostgresMeteringStore:
             )
         )
 
-        insertion = insert(UsageDaily).from_select(list(_ROLLUP_COLUMNS), source)
-        statement = insertion.on_conflict_do_update(
-            index_elements=[UsageDaily.tenant_id, UsageDaily.usage_date],
-            set_={name: getattr(insertion.excluded, name) for name in _REPLACED_COLUMNS},
-        ).returning(*(getattr(UsageDaily, name) for name in _ROLLUP_COLUMNS))
-
-        with self._sessions.begin() as session:
-            row = session.execute(statement).one()
-        return self._totals_from_row(tenant_id=tenant_id, row=row)
-
     # --------------------------------------------------------------------------- reads
 
     def usage_for_period(self, *, tenant_id: str, period: BillingPeriod) -> UsageTotals:
@@ -234,19 +289,21 @@ class PostgresMeteringStore:
         period", and it is a range scan over the primary key: ``assessments`` is not named
         in this statement at all, so the cost of a month's billing read does not grow with
         the history behind it.
+
+        Every aggregate is **labelled with the column it sums**, and the result is read
+        back by name through the same :meth:`_totals_from_row` a single rollup row goes
+        through. Reading a ten-column aggregate positionally is one edit away from putting
+        ``input_tokens`` in ``cost_usd`` — a $0.05 day rendered as a $4,200 invoice line —
+        and no type checker or constraint would notice.
         """
         tenant = tenant_uuid(tenant_id)
         statement = select(
-            func.coalesce(func.sum(UsageDaily.leads_ingested), 0),
-            func.coalesce(func.sum(UsageDaily.leads_assessed), 0),
-            func.coalesce(func.sum(UsageDaily.leads_billable), 0),
-            func.coalesce(func.sum(UsageDaily.assessments_failed), 0),
-            func.coalesce(func.sum(UsageDaily.input_tokens), 0),
-            func.coalesce(func.sum(UsageDaily.output_tokens), 0),
-            func.coalesce(func.sum(UsageDaily.cache_read_tokens), 0),
-            func.coalesce(func.sum(UsageDaily.cache_creation_tokens), 0),
-            func.coalesce(func.sum(UsageDaily.cost_usd), 0),
-            func.max(UsageDaily.computed_at),
+            cast(literal(period.start), Date).label("usage_date"),
+            *(
+                func.coalesce(func.sum(getattr(UsageDaily, name)), 0).label(name)
+                for name in _SUMMED_COLUMNS
+            ),
+            func.max(UsageDaily.computed_at).label("computed_at"),
         ).where(
             UsageDaily.tenant_id == tenant,
             UsageDaily.usage_date >= period.start,
@@ -254,20 +311,7 @@ class PostgresMeteringStore:
         )
         with self._sessions.begin() as session:
             row = session.execute(statement).one()
-        return UsageTotals(
-            tenant_id=tenant_id,
-            period=period,
-            leads_ingested=_as_int(row[0]),
-            leads_assessed=_as_int(row[1]),
-            leads_billable=_as_int(row[2]),
-            assessments_failed=_as_int(row[3]),
-            input_tokens=_as_int(row[4]),
-            output_tokens=_as_int(row[5]),
-            cache_read_tokens=_as_int(row[6]),
-            cache_creation_tokens=_as_int(row[7]),
-            cost_usd=_as_decimal(row[8]),
-            computed_at=row[9],
-        )
+        return replace(self._totals_from_row(tenant_id=tenant_id, row=row), period=period)
 
     def daily_usage(self, *, tenant_id: str, period: BillingPeriod) -> Sequence[UsageTotals]:
         """The stored rollup rows for a period, oldest first.
@@ -369,6 +413,22 @@ class PostgresMeteringStore:
             rows = session.execute(statement).all()
         return {row[0]: _as_int(row[1]) for row in rows}
 
+    def fleet_tenants_with_quota(self) -> Sequence[str]:
+        """Every tenant that has a plan allowance, oldest first.
+
+        The fleet sweep's worklist. Filtered on the column rather than listing every
+        customer, because a tenant with no quota has nothing to report and the sweep
+        should not grow with the business for no signal.
+        """
+        statement = (
+            select(Tenant.slug)
+            .where(Tenant.monthly_lead_quota.is_not(None))
+            .order_by(Tenant.created_at, Tenant.slug)
+        )
+        with self._sessions.begin() as session:
+            rows = session.execute(statement).all()
+        return [row[0] for row in rows]
+
     def fleet_daily_spend(self, *, period: BillingPeriod) -> Sequence[DailySpend]:
         """Token spend per day across every tenant, for invoice reconciliation.
 
@@ -410,7 +470,13 @@ class PostgresMeteringStore:
 
     @staticmethod
     def _totals_from_row(*, tenant_id: str, row: Row[Any]) -> UsageTotals:
-        """Map one ``usage_daily`` row onto the type the application layer speaks in."""
+        """Map a result row onto the type the application layer speaks in.
+
+        One mapper for a single ``usage_daily`` row *and* for an aggregate over a period,
+        because both are labelled with the same column names. Everything is read by name:
+        a ten-column positional mapping is one edit away from reading money out of the
+        token slot, and nothing else in the system would notice.
+        """
         return UsageTotals(
             tenant_id=tenant_id,
             period=BillingPeriod.of_day(row.usage_date),

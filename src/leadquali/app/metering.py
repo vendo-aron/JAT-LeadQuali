@@ -18,9 +18,13 @@ Three counts, and they are deliberately three different numbers
     reached a human.
 
 ``leads_billable``
-    Rows in ``assessments`` with ``input_tokens > 0`` — the calls we actually paid
-    Anthropic for. This is the number a customer is charged on, and the number a plan's
-    quota is measured against.
+    **Distinct leads** with at least one assessment attempt that cost input tokens. This
+    is the number a customer is charged on, and the number a plan's quota is measured
+    against. Distinct, not a row count: a dispatch failure re-raises so SQS redelivers,
+    and ``record_assessment`` writes a second attempt for the same lead, so counting rows
+    would bill a customer three times for one lead because *our* SES had an outage. The
+    token and cost sums stay over **every** attempt, because we really were charged for
+    all three — that gap is our loss to see, not the customer's to pay.
 
 The gap between the first and the third is the deterministic spam pre-filter, and it is
 not billable. The reasoning is written down here because it is a commercial decision, not
@@ -70,6 +74,7 @@ from leadquali.app.ports import ClockPort
 from leadquali.observability.events import log_quota_crossed
 
 __all__ = [
+    "DAY_VARIANCE_MULTIPLE",
     "DEFAULT_QUOTA_ALERT_FRACTION",
     "MONTHLY_INFRASTRUCTURE_USD",
     "RECONCILIATION_TOLERANCE",
@@ -120,6 +125,19 @@ strategy shows up here before it shows up anywhere else. Anything past two perce
 number nobody should bill a customer from until it is explained."""
 
 
+DAY_VARIANCE_MULTIPLE: Final[int] = 5
+"""How far a *single day* may drift before it is called out, as a multiple of
+:data:`RECONCILIATION_TOLERANCE`.
+
+The tolerance proper is measured on the month's total, and deliberately so: one expensive
+call landing either side of midnight moves a day by a lot and the month by nothing. But
+that is exactly what hides a systematic day-shift — every day wrong by a day's spend, the
+errors cancelling to zero across the month — so a day past five times the tolerance is
+reported even when the total reconciles. It is a note, not a verdict: it does not change
+the exit code, because a genuinely quiet Sunday next to a busy Monday can produce one.
+"""
+
+
 class MeteringError(Exception):
     """A metering operation cannot be carried out, with a reason an operator can act on."""
 
@@ -132,17 +150,22 @@ class InvoiceFormatError(MeteringError):
 
 
 def is_billable(*, input_tokens: int) -> bool:
-    """Whether one assessment attempt is charged to the customer.
+    """Whether one assessment attempt makes its lead chargeable.
 
     The rule in one place, so the SQL in
     :mod:`leadquali.adapters.metering_postgres` and the documentation cannot drift apart:
     an attempt that consumed input tokens reached Anthropic and appeared on our invoice,
-    so it appears on the customer's. An attempt that consumed none never reached the
+    so its lead appears on the customer's. An attempt that consumed none never reached the
     model — the deterministic pre-filter stopped it — and is not billable.
 
     Note that this is a question about *tokens*, not about success. A refusal, a timeout
     after the request was accepted and a ``max_tokens`` truncation all burned input tokens
-    and are all billable.
+    and all make their lead billable.
+
+    Note also that it is a question about one *attempt*, and that the customer is charged
+    per **lead**. Several attempts on one lead — an SES outage makes the worker re-raise
+    and SQS redeliver — are one billable lead, however many of them cost us tokens. See
+    :attr:`UsageTotals.leads_billable`.
     """
     return input_tokens > 0
 
@@ -252,11 +275,20 @@ class UsageTotals:
     """Assessment attempts, successful or not."""
 
     leads_billable: int
-    """Attempts that cost us tokens. **This is the number a customer is charged on.**"""
+    """**Distinct leads** with at least one attempt that cost us tokens, and the number a
+    customer is charged on.
+
+    Distinct rather than a count of attempts, because a lead can be attempted more than
+    once through no fault of the customer's: a dispatch failure re-raises, SQS redelivers,
+    and a second assessment row is written for the same lead. Billing that as two leads
+    would charge a customer for our own outage. The token and cost figures below still
+    count every attempt — we paid for all of them — so the gap between ``leads_billable``
+    and ``leads_assessed`` is exactly the retry cost we are absorbing.
+    """
 
     assessments_failed: int
     """Attempts that produced no usable judgement. A subset of ``leads_assessed``, and
-    mostly a subset of ``leads_billable`` too: a refusal is an HTTP 200 we paid for."""
+    mostly on leads that are billable too: a refusal is an HTTP 200 we paid for."""
 
     input_tokens: int
     output_tokens: int
@@ -292,6 +324,38 @@ class UsageTotals:
             cost_usd=Decimal(0),
         )
 
+    @classmethod
+    def combined(
+        cls, *, tenant_id: str, period: BillingPeriod, parts: Sequence[UsageTotals]
+    ) -> UsageTotals:
+        """Add several totals together over one period.
+
+        Used where a period is assembled from more than one source — closed days from the
+        rollup and today from the source tables (:meth:`MeteringService.quota_status`).
+        ``leads_billable`` is summed rather than de-duplicated across the parts, which is
+        the same arithmetic a multi-day period already does: a lead that spans midnight is
+        counted in each day it was attempted in. Within a day, which is where a retry
+        storm happens, the count is distinct.
+        """
+        return cls(
+            tenant_id=tenant_id,
+            period=period,
+            leads_ingested=sum(part.leads_ingested for part in parts),
+            leads_assessed=sum(part.leads_assessed for part in parts),
+            leads_billable=sum(part.leads_billable for part in parts),
+            assessments_failed=sum(part.assessments_failed for part in parts),
+            input_tokens=sum(part.input_tokens for part in parts),
+            output_tokens=sum(part.output_tokens for part in parts),
+            cache_read_tokens=sum(part.cache_read_tokens for part in parts),
+            cache_creation_tokens=sum(part.cache_creation_tokens for part in parts),
+            cost_usd=sum((part.cost_usd for part in parts), Decimal(0)),
+            computed_at=max(
+                (part.computed_at for part in parts if part.computed_at is not None),
+                default=None,
+            ),
+            partial=any(part.partial for part in parts),
+        )
+
     @property
     def total_tokens(self) -> int:
         """Every token, however it was billed. The four counters are disjoint."""
@@ -304,14 +368,22 @@ class UsageTotals:
 
     @property
     def leads_filtered(self) -> int:
-        """Submissions that never reached the model: ingested minus assessed.
+        """Submissions that never reached the model: ingested minus billable leads.
 
-        Deterministic spam, mostly. Negative is impossible in a consistent rollup but is
-        representable across a midnight boundary — a lead received at 23:59:59 and
-        assessed at 00:00:01 lands in two different days — so it is clamped rather than
-        rendered as a negative count nobody can explain.
+        Deterministic spam, mostly. Measured against ``leads_billable`` rather than
+        ``leads_assessed`` because both sides of the subtraction are then a count of
+        *leads*: subtracting attempts from submissions would report a retried lead as
+        negative spam, which is how the count read "1 received, 3 assessed" before the
+        billable rule was made per-lead.
+
+        It is still clamped at zero, for one remaining and legitimate reason: a lead
+        received at 23:59:59 and assessed at 00:00:01 belongs to two different days, so a
+        single day can hold an assessment whose submission is in yesterday's count. The
+        clamp hides nothing that could reach an invoice — ``leads_billable`` is the billed
+        number and is computed directly — and over any period longer than a day the
+        boundary effect cancels.
         """
-        return max(self.leads_ingested - self.leads_assessed, 0)
+        return max(self.leads_ingested - self.leads_billable, 0)
 
     @property
     def cost_per_billable_lead_usd(self) -> Decimal | None:
@@ -713,6 +785,25 @@ class ReconciliationReport:
         return self.variance_usd / self.invoice_usd
 
     @property
+    def outlying_days(self) -> Sequence[DayVariance]:
+        """Days that drift far more than the month does — see :data:`DAY_VARIANCE_MULTIPLE`.
+
+        A day the export covers and we do not (or the reverse) is always an outlier: there
+        is no percentage to take, and "one side thinks this day cost money and the other
+        does not" is the most interesting thing a reconciliation can find.
+        """
+        limit = self.tolerance * DAY_VARIANCE_MULTIPLE
+        found: list[DayVariance] = []
+        for day in self.days:
+            fraction = day.variance_fraction
+            if fraction is None:
+                if day.ours_usd != 0:
+                    found.append(day)
+            elif abs(fraction) > limit:
+                found.append(day)
+        return found
+
+    @property
     def within_tolerance(self) -> bool:
         """Whether the totals agree closely enough to bill from.
 
@@ -751,6 +842,16 @@ class MeteringStorePort(Protocol):
         """
         ...
 
+    def compute_day(self, *, tenant_id: str, day: date) -> UsageTotals:
+        """Compute one tenant-day from ``leads`` and ``assessments`` **without storing it**.
+
+        The same arithmetic :meth:`rollup_day` writes, as a pure read. It exists for the
+        one caller that needs a figure for a day the rollup has not covered yet — the live
+        quota check — and it must not write, because a write on a read path is how a
+        reporting command takes a lock on a row a billing job is updating.
+        """
+        ...
+
     def usage_for_period(self, *, tenant_id: str, period: BillingPeriod) -> UsageTotals:
         """Read the stored rollup for a period. Must not scan ``assessments``."""
         ...
@@ -779,6 +880,15 @@ class MeteringStorePort(Protocol):
 
     def fleet_billable_leads(self, *, period: BillingPeriod) -> Mapping[str, int]:
         """Billable leads per tenant across every tenant, for cost allocation."""
+        ...
+
+    def fleet_tenants_with_quota(self) -> Sequence[str]:
+        """Every tenant that has a plan allowance, oldest first.
+
+        Only those: a tenant with no quota has nothing a sweep could report, and putting
+        the whole customer list through a per-tenant check to say "unlimited" about most
+        of them would make the sweep cost grow with the business for no signal.
+        """
         ...
 
     def fleet_daily_spend(self, *, period: BillingPeriod) -> Sequence[DailySpend]:
@@ -890,14 +1000,36 @@ class MeteringService:
         if closed_days_only:
             closed = period.closed_as_of(today=today)
             if closed is None:
-                return UsageTotals.zero(tenant_id=tenant_id, period=period)
+                # Nothing in the period is over yet, so there is nothing to read — but the
+                # zero is marked partial, because "we have not counted any of this period"
+                # must not render as a confident zero on a page somebody bills from.
+                return replace(UsageTotals.zero(tenant_id=tenant_id, period=period), partial=True)
             effective = closed
         totals = self._store.usage_for_period(tenant_id=tenant_id, period=effective)
         return replace(totals, partial=effective.includes_open_day(today=today))
 
-    def daily_usage(self, *, tenant_id: str, period: BillingPeriod) -> Sequence[UsageTotals]:
-        """The stored rollup rows for a period, for a day-by-day view. Never recomputes."""
-        return self._store.daily_usage(tenant_id=tenant_id, period=period)
+    def daily_usage(
+        self, *, tenant_id: str, period: BillingPeriod, closed_days_only: bool = True
+    ) -> Sequence[UsageTotals]:
+        """The stored rollup rows for a period, day by day. Never recomputes.
+
+        Args:
+            closed_days_only: drop the day in progress. Defaults to ``True`` for the same
+                reason every other read does — the caller that forgets is a billing job.
+                Passing ``False`` includes today's row if one has been rolled up, and that
+                row comes back marked :attr:`UsageTotals.partial`.
+        """
+        today = self.today()
+        effective = period
+        if closed_days_only:
+            closed = period.closed_as_of(today=today)
+            if closed is None:
+                return []
+            effective = closed
+        return [
+            replace(row, partial=row.period.start >= today)
+            for row in self._store.daily_usage(tenant_id=tenant_id, period=effective)
+        ]
 
     def quota_status(
         self, *, tenant_id: str, period: BillingPeriod, closed_days_only: bool = False
@@ -909,12 +1041,23 @@ class MeteringService:
         ingest, skip an assessment or downgrade a lead. Invariant 3 says a lead is never
         silently dropped, and "the customer was over their plan" is not an exception to it.
 
+        **Today is read from the source tables, not from the rollup.** This is the one
+        read in the system that touches ``assessments``, and it is deliberate: the rollup
+        is written by a job that runs after midnight, so today has no row in it, and a
+        quota check that read only the rollup would report zero for today however its
+        arguments were set — a tenant who blew through their plan this morning would look
+        fine until tomorrow, which is the entire failure the alert exists to prevent.
+        The extra read is one day for one tenant against
+        ``ix_assessments_tenant_id_created_at``, and it is a read: rolling today up as a
+        side effect of a status check would put a write, and a row lock, on a reporting
+        path that an operator runs whenever they feel like it.
+
         Args:
             closed_days_only: defaults to ``False`` here, unlike the billing reads — an
-                alert is about what is happening now, and excluding today would make a
-                tenant that blew through its plan this morning look fine until midnight.
+                alert is about what is happening now. Passing ``True`` gives the figure a
+                billing job would use, which is the same number minus today.
         """
-        usage = self.usage_for_period(
+        usage = self._usage_including_today(
             tenant_id=tenant_id, period=period, closed_days_only=closed_days_only
         )
         quota = self._store.quota_for(tenant_id=tenant_id)
@@ -971,6 +1114,41 @@ class MeteringService:
             tenant_id=tenant_id,
             monthly_lead_quota=monthly_lead_quota,
             alert_fraction=alert_fraction,
+        )
+
+    def quota_statuses(
+        self, *, period: BillingPeriod, closed_days_only: bool = False
+    ) -> Sequence[QuotaStatus]:
+        """Check every tenant that has a plan, oldest first.
+
+        The fleet sweep a scheduled job runs. Tenants with no allowance are not included:
+        there is nothing to report about them, and putting the whole customer list through
+        a per-tenant check to say "unlimited" would make the sweep cost grow with the
+        business for no signal.
+        """
+        return [
+            self.quota_status(tenant_id=tenant_id, period=period, closed_days_only=closed_days_only)
+            for tenant_id in self._store.fleet_tenants_with_quota()
+        ]
+
+    def _usage_including_today(
+        self, *, tenant_id: str, period: BillingPeriod, closed_days_only: bool
+    ) -> UsageTotals:
+        """Closed days from the rollup, plus today computed live when it is in scope.
+
+        Split out because it is the only place two sources are stitched together, and the
+        stitching has one rule worth stating: the rollup is authoritative for every day it
+        covers, and the live read is used **only** for today, which it cannot cover.
+        """
+        closed = self.usage_for_period(tenant_id=tenant_id, period=period, closed_days_only=True)
+        today = self.today()
+        if closed_days_only or not period.contains(today):
+            return closed
+        live = self._store.compute_day(tenant_id=tenant_id, day=today)
+        return UsageTotals.combined(
+            tenant_id=tenant_id,
+            period=period,
+            parts=(closed, replace(live, partial=True)),
         )
 
     # -------------------------------------------------------------------------- margin
