@@ -73,7 +73,6 @@ from leadquali.adapters.db_schema import (
     GoldenPromotion as GoldenPromotionRow,
 )
 from leadquali.adapters.unit_of_work import session_scope
-from leadquali.api.schemas import LeadForm
 from leadquali.app.admin_views import (
     AgreementPoint,
     FeedbackNote,
@@ -91,6 +90,7 @@ from leadquali.app.admin_views import (
 from leadquali.app.config_versions import ConfigVersion, UnknownConfigVersionError
 from leadquali.app.feedback import Verdict
 from leadquali.app.golden_promotion import GoldenPromotion
+from leadquali.app.lead_payload import LeadForm
 from leadquali.app.tenant_ids import tenant_id_for
 from leadquali.app.tenants import UnknownTenantError
 from leadquali.config import Settings
@@ -644,8 +644,11 @@ class PostgresAdminQueryStore:
                 RerunCandidate(
                     lead_id=str(row.lead_id),
                     submission_id=row.submission_id,
-                    # Through #17's own form schema, so a lead stored before a field was
-                    # renamed goes through exactly the normalisation ingest applies.
+                    # Through the same schema ingest validated the row with, so a lead
+                    # stored before a field was renamed goes through exactly the
+                    # normalisation the door applies. It lives in `app` rather than in
+                    # `api/schemas` precisely so an adapter can reach it without
+                    # importing the layer above (tests/unit/test_layering.py).
                     submission=LeadForm.model_validate(dict(row.raw_payload)).to_submission(),
                     assessed_at=row.created_at,
                     previous_tier=_as_tier(row.tier),
