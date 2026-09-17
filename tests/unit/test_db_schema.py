@@ -35,9 +35,11 @@ from leadquali.adapters.db_schema import (
     Feedback,
     Lead,
     RoutingEvent,
+    StripeEventRow,
     Tenant,
     TenantApiKey,
     UsageDaily,
+    UsageReportRecord,
 )
 from leadquali.app.metering import (
     DEFAULT_QUOTA_ALERT_FRACTION as METERING_DEFAULT_ALERT_FRACTION,
@@ -51,6 +53,8 @@ EXPECTED_TABLES = {
     "routing_events",
     "feedback",
     "usage_daily",
+    "stripe_events",
+    "usage_reports",
 }
 
 CHILD_TABLES = ("assessments", "routing_events", "feedback")
@@ -67,7 +71,7 @@ CHILD_TABLES = ("assessments", "routing_events", "feedback")
 # check for "email" only catches a column whose author named it honestly; it would pass
 # `rater`, `contact_details` or `notes_from_crm` without a murmur. Pinning the inventory
 # means adding any column at all fails this test until someone has classified it, and the
-# `raw` bucket having exactly one member is the property #37's retention job depends on.
+# membership of the `raw` bucket is the property #37's retention job depends on.
 COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("tenants", "id"): "none",
     ("tenants", "slug"): "none",
@@ -81,6 +85,11 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     # customer's *account*, with nothing of any lead in it.
     ("tenants", "monthly_lead_quota"): "none",
     ("tenants", "quota_alert_fraction"): "none",
+    # The Stripe link (#35). Opaque processor identifiers and a grace-period deadline:
+    # facts about the *account*, with nothing of any lead or any person in them.
+    ("tenants", "stripe_customer_id"): "none",
+    ("tenants", "stripe_subscription_id"): "none",
+    ("tenants", "dunning_until"): "none",
     ("tenants", "created_at"): "none",
     ("tenants", "updated_at"): "none",
     ("tenant_api_keys", "id"): "none",
@@ -168,6 +177,30 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("usage_daily", "cache_creation_tokens"): "none",
     ("usage_daily", "cost_usd"): "none",
     ("usage_daily", "computed_at"): "none",
+    ("stripe_events", "event_id"): "none",
+    ("stripe_events", "event_type"): "none",
+    # The second column in the schema that may hold personal data, and the only one
+    # added since #16. A Stripe event body is stored verbatim because it is the
+    # evidence of what Stripe actually said, and an invoice object carries the
+    # *billing contact's* name, email and address — a customer's accounts-payable
+    # person, not a lead, but personal data all the same. Classified honestly rather
+    # than pruned, because a payload filtered down to the fields this build models is
+    # missing exactly the fields an incident will want. #37's retention job must cover
+    # this column as it covers leads.raw_payload; docs/billing-integration.md says so.
+    ("stripe_events", "payload"): "raw",
+    ("stripe_events", "received_at"): "none",
+    ("stripe_events", "processed_at"): "none",
+    ("stripe_events", "status"): "none",
+    ("stripe_events", "attempts"): "none",
+    # An exception class and one short line, never a payload dump — enforced by
+    # MAX_ERROR_CHARS and by the service that writes it.
+    ("stripe_events", "last_error"): "none",
+    ("stripe_events", "tenant_id"): "none",
+    ("usage_reports", "tenant_id"): "none",
+    ("usage_reports", "usage_date"): "none",
+    ("usage_reports", "reported_at"): "none",
+    ("usage_reports", "external_id"): "none",
+    ("usage_reports", "quantity"): "none",
 }
 
 
@@ -215,11 +248,25 @@ def test_model_classes_map_to_the_expected_table_names() -> None:
         (Feedback, "feedback"),
         (TenantApiKey, "tenant_api_keys"),
         (UsageDaily, "usage_daily"),
+        (StripeEventRow, "stripe_events"),
+        (UsageReportRecord, "usage_reports"),
     ):
         assert model.__tablename__ == table_name
         # The class and the metadata entry are one object, so a repository written against
         # either sees the same columns.
         assert model.__table__ is _table(table_name)
+
+
+#: The one table whose ``tenant_id`` is nullable, and the only exception to invariant 4.
+#:
+#: A Stripe webhook arrives before we know who it is about: the event names a Stripe
+#: *customer*, and resolving that to one of our tenants is a database read the verifying
+#: route deliberately does not do (it verifies, inserts and returns 200). Refusing to store
+#: an event we cannot attribute would mean discarding the only record that it arrived. So
+#: the column is filled in by the handler once the customer resolves, and every *read* that
+#: is about a tenant filters on it. Named here, in one constant, so that a second table
+#: quietly joining it is a diff somebody has to justify.
+TENANT_ID_NULLABLE_TABLES = {"stripe_events"}
 
 
 @pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES))
@@ -231,7 +278,23 @@ def test_every_table_carries_a_tenant_id(table_name: str) -> None:
         assert "id" in table.c
         return
     column = table.c["tenant_id"]
+    if table_name in TENANT_ID_NULLABLE_TABLES:
+        assert column.nullable, f"{table_name} is listed as the invariant-4 exception"
+        return
     assert not column.nullable, f"{table_name}.tenant_id must be NOT NULL"
+
+
+def test_the_invariant_four_exception_is_exactly_one_table() -> None:
+    """Stated on its own so that widening it is a deliberate, reviewable act.
+
+    An unexplained exception to an invariant is how the invariant dies. This one is
+    explained in three places — here, in ``StripeEventRow``'s docstring and in the
+    migration — and it costs nothing to keep true.
+    """
+    nullable = {
+        name for name in EXPECTED_TABLES - {"tenants"} if _table(name).c["tenant_id"].nullable
+    }
+    assert nullable == TENANT_ID_NULLABLE_TABLES
 
 
 def test_leads_is_the_only_direct_reference_to_tenants() -> None:
@@ -321,11 +384,18 @@ def test_every_column_is_classified_against_the_pii_policy() -> None:
     )
 
 
-def test_raw_payload_is_the_only_column_that_may_hold_personal_data() -> None:
-    """What ``contact_email_hash`` is *for*, and what #37's retention job relies on:
-    purging one column removes the personal data while the assessments survive."""
+def test_the_columns_that_may_hold_personal_data_are_exactly_these_two() -> None:
+    """The inventory #37's retention job has to purge, stated as a closed set.
+
+    ``leads.raw_payload`` is the lead's own data and is what ``contact_email_hash`` exists
+    to replace everywhere else. ``stripe_events.payload`` joined it with #35: a Stripe
+    invoice object carries the billing contact's name, email and address, and the event is
+    stored verbatim on purpose — a payload pruned to the fields this build models is
+    missing the ones an incident will need. Two members, both deliberate, and a third
+    cannot appear without failing this test.
+    """
     raw = {key for key, policy in COLUMN_PII_POLICY.items() if policy == "raw"}
-    assert raw == {("leads", "raw_payload")}
+    assert raw == {("leads", "raw_payload"), ("stripe_events", "payload")}
     assert set(COLUMN_PII_POLICY.values()) <= {"none", "hashed", "raw"}
 
 
@@ -489,7 +559,7 @@ def test_timestamps_are_timezone_aware_with_a_server_default(
 #: second row for one tenant-day is a bug rather than a new fact, and the composite key is
 #: also the conflict target the idempotent upsert needs. A surrogate ``id`` would let two
 #: rows for one day coexist while every billing read summed both.
-NATURAL_KEY_TABLES = {"usage_daily"}
+NATURAL_KEY_TABLES = {"usage_daily", "usage_reports", "stripe_events"}
 
 
 @pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES - NATURAL_KEY_TABLES))
@@ -503,6 +573,24 @@ def test_the_usage_rollup_is_keyed_by_the_tenant_and_the_day() -> None:
     """The exception to the rule above, and the reason a re-run cannot double count."""
     primary_key = [column.name for column in _table("usage_daily").primary_key.columns]
     assert primary_key == ["tenant_id", "usage_date"]
+
+
+def test_a_usage_report_is_keyed_by_the_tenant_and_the_day_too() -> None:
+    """The same natural key doing a different job (#35). Here it is not a cache of a SUM,
+    it is the thing that makes reporting a day twice impossible — and double-reporting
+    overbills a customer, which the issue says is worse than under-reporting."""
+    primary_key = [column.name for column in _table("usage_reports").primary_key.columns]
+    assert primary_key == ["tenant_id", "usage_date"]
+
+
+def test_a_stripe_event_is_keyed_by_stripes_own_event_id() -> None:
+    """Webhook idempotency, in the schema rather than in a handler. Stripe retries a
+    delivery it did not see a 200 for, and the retry carries the same ``evt_...``; with
+    this as the primary key the route's insert can be ``ON CONFLICT DO NOTHING`` and a
+    retry is a no-op whatever state the first copy is in."""
+    primary_key = [column.name for column in _table("stripe_events").primary_key.columns]
+    assert primary_key == ["event_id"]
+    assert _table("stripe_events").c["event_id"].server_default is None
 
 
 def test_the_usage_rollup_counts_tokens_in_bigints() -> None:

@@ -25,6 +25,16 @@ from leadquali.app.assessment_result import (
     AssessmentOutcome,
     AssessmentSucceeded,
 )
+from leadquali.app.billing import (
+    BillingCustomer,
+    BillingSubscription,
+    BillingTenant,
+    EventStatus,
+    ReportedUsage,
+    StripeEvent,
+    SubscriptionState,
+    UsageReport,
+)
 from leadquali.app.enrichment import Enrichment
 from leadquali.app.feedback import UnknownLeadError, Verdict
 from leadquali.app.metering import (
@@ -401,6 +411,15 @@ class FakeClock:
         value = self.step_ms * self.ticks
         self.ticks += 1
         return value
+
+    def advance(self, delta: timedelta) -> None:
+        """Move the clock forward by ``delta``.
+
+        Needed by anything whose behaviour is measured in days — a seven-day dunning grace
+        period is not something a test can wait for, and ``step_ms`` moves the clock by
+        milliseconds per read, which is the wrong granularity to express "a week later".
+        """
+        self.start += delta
 
 
 class InMemoryTenantAdminStore:
@@ -801,3 +820,284 @@ class StaticRevenue:
     def revenue_usd(self, *, tenant_id: str, period: BillingPeriod) -> Decimal | None:
         del period
         return self.amounts.get(tenant_id)
+
+
+# ------------------------------------------------------------------------------- billing
+
+
+def stripe_event(
+    event_id: str,
+    event_type: str,
+    *,
+    customer: str | None = None,
+    subscription: str | None = None,
+    status: str | None = None,
+    created: int = 1_788_000_000,
+) -> dict[str, Any]:
+    """A Stripe webhook event body, hand-built from the SDK's own type definitions.
+
+    Hand-built, not captured: there is no Stripe key in this environment, and a captured
+    body would have to be stored byte-exactly for ever with somebody's real customer id in
+    it. Only the fields this system reads are populated — ``id``, ``type`` and
+    ``data.object`` with a customer, an id and a status — because populating the rest would
+    be inventing values and inviting a test to assert on one.
+
+    ``tests/fixtures/stripe/README.md`` says the same thing about the JSON fixtures, which
+    are the fuller version of this used by the webhook route tests.
+    """
+    obj: dict[str, Any] = {"object": "subscription" if subscription else "invoice"}
+    if customer is not None:
+        obj["customer"] = customer
+    if subscription is not None:
+        obj["id"] = subscription
+    if status is not None:
+        obj["status"] = status
+    return {
+        "id": event_id,
+        "object": "event",
+        "type": event_type,
+        "created": created,
+        "livemode": False,
+        "api_version": "2025-08-27.basil",
+        "data": {"object": obj},
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedUsageCall:
+    """One call to :meth:`RecordingBilling.report_usage`."""
+
+    tenant_id: str
+    customer_id: str
+    report: UsageReport
+
+
+class RecordingBilling:
+    """A :class:`~leadquali.app.billing.BillingPort` that records instead of calling Stripe.
+
+    It is the *port's* double, not the SDK's: it answers with our own dataclasses, exactly
+    as the real adapter does, so a test written against it exercises the service's real
+    call sequence. ``tests/unit/test_billing_stripe.py`` is the other half — it drives the
+    real adapter against a fake *client* and asserts the parameters that go on the wire.
+
+    ``fail_times`` makes the processor break, because "what happens when Stripe is down
+    half way through a billing run" is the question that decides whether a customer is
+    double-billed.
+    """
+
+    def __init__(
+        self, *, fail_times: int = 0, portal_url: str = "https://billing.example/s/1"
+    ) -> None:
+        self.fail_times = fail_times
+        self.portal_url = portal_url
+        self.customers: list[tuple[str, str, str | None]] = []
+        self.subscriptions: list[tuple[str, str, str]] = []
+        self.cancellations: list[tuple[str, str, bool]] = []
+        self.reports: list[RecordedUsageCall] = []
+        self.portal_calls: list[tuple[str, str, str]] = []
+        self._created = 0
+
+    def _maybe_fail(self) -> None:
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("stripe is unavailable")
+
+    def create_customer(
+        self, *, tenant_id: str, name: str, email: str | None = None
+    ) -> BillingCustomer:
+        self._maybe_fail()
+        self._created += 1
+        customer_id = f"cus_fake{self._created}"
+        self.customers.append((tenant_id, name, email))
+        return BillingCustomer(tenant_id=tenant_id, customer_id=customer_id)
+
+    def create_subscription(
+        self, *, tenant_id: str, customer_id: str, price_id: str
+    ) -> BillingSubscription:
+        self._maybe_fail()
+        self.subscriptions.append((tenant_id, customer_id, price_id))
+        return BillingSubscription(
+            tenant_id=tenant_id,
+            subscription_id=f"sub_fake{len(self.subscriptions)}",
+            customer_id=customer_id,
+            state=SubscriptionState.ACTIVE,
+        )
+
+    def cancel_subscription(
+        self, *, tenant_id: str, subscription_id: str, at_period_end: bool = False
+    ) -> BillingSubscription:
+        self._maybe_fail()
+        self.cancellations.append((tenant_id, subscription_id, at_period_end))
+        return BillingSubscription(
+            tenant_id=tenant_id,
+            subscription_id=subscription_id,
+            customer_id="cus_fake",
+            state=SubscriptionState.ACTIVE if at_period_end else SubscriptionState.CANCELED,
+            cancel_at_period_end=at_period_end,
+        )
+
+    def report_usage(
+        self, *, tenant_id: str, customer_id: str, report: UsageReport
+    ) -> ReportedUsage:
+        self._maybe_fail()
+        self.reports.append(
+            RecordedUsageCall(tenant_id=tenant_id, customer_id=customer_id, report=report)
+        )
+        return ReportedUsage(
+            tenant_id=tenant_id,
+            usage_date=report.usage_date,
+            external_id=report.external_id,
+            quantity=report.quantity,
+        )
+
+    def portal_session_url(self, *, tenant_id: str, customer_id: str, return_url: str) -> str:
+        self._maybe_fail()
+        self.portal_calls.append((tenant_id, customer_id, return_url))
+        return self.portal_url
+
+
+class InMemoryBillingStore:
+    """A :class:`~leadquali.app.billing.BillingStorePort` over two dicts.
+
+    It behaves like the Postgres one in the ways the service's correctness depends on, and
+    those are the ways that cost money:
+
+    * :meth:`insert_event` is an ``ON CONFLICT DO NOTHING``: a second copy of an event id
+      is refused **whatever state the first copy is in**, including ``pending``.
+    * :meth:`record_usage_report` is unique on ``(tenant_id, usage_date)``.
+    * :meth:`mark_event_attempt_failed` makes the pending/failed decision itself, in one
+      step, as the real ``UPDATE`` does.
+
+    ``fail_on_status_write`` breaks the next *n* status writes, which is how a test gets a
+    handler to raise without reaching into the service.
+    """
+
+    def __init__(self) -> None:
+        self.events: dict[str, StripeEvent] = {}
+        self.tenants: dict[str, BillingTenant] = {}
+        self.usage_reports: dict[tuple[str, date], tuple[UsageReport, datetime]] = {}
+        #: Every attempted insert, so a test can tell "the caller stopped" from "the store
+        #: deduplicated" — they look identical from the outside and are not the same bug.
+        self.inserts = 0
+        self.status_writes: list[tuple[str, TenantStatus]] = []
+        self.fail_on_status_write = 0
+        self._order: list[str] = []
+
+    # ------------------------------------------------------------------------ seeding
+
+    def given_tenant(
+        self,
+        tenant_id: str,
+        *,
+        status: TenantStatus = TenantStatus.ACTIVE,
+        stripe_customer_id: str | None = None,
+        stripe_subscription_id: str | None = None,
+        dunning_until: datetime | None = None,
+    ) -> BillingTenant:
+        """Seed a tenant row, replacing any earlier one."""
+        tenant = BillingTenant(
+            tenant_id=tenant_id,
+            status=status,
+            stripe_customer_id=stripe_customer_id,
+            stripe_subscription_id=stripe_subscription_id,
+            dunning_until=dunning_until,
+        )
+        self.tenants[tenant_id] = tenant
+        return tenant
+
+    def ordered_events(self) -> list[StripeEvent]:
+        """Every stored event, in the order it was received."""
+        return [self.events[event_id] for event_id in self._order]
+
+    # --------------------------------------------------------------------------- port
+
+    def insert_event(self, *, event: StripeEvent) -> bool:
+        self.inserts += 1
+        if event.event_id in self.events:
+            return False
+        self.events[event.event_id] = event
+        self._order.append(event.event_id)
+        return True
+
+    def pending_events(self, *, limit: int) -> Sequence[StripeEvent]:
+        pending = [
+            self.events[event_id]
+            for event_id in self._order
+            if self.events[event_id].status is EventStatus.PENDING
+        ]
+        return pending[:limit]
+
+    def mark_event_processed(
+        self, *, event_id: str, processed_at: datetime, tenant_id: str | None
+    ) -> None:
+        self.events[event_id] = replace(
+            self.events[event_id],
+            status=EventStatus.PROCESSED,
+            processed_at=processed_at,
+            tenant_id=tenant_id,
+            last_error=None,
+        )
+
+    def mark_event_attempt_failed(
+        self, *, event_id: str, error: str, attempted_at: datetime, max_attempts: int
+    ) -> EventStatus:
+        current = self.events[event_id]
+        attempts = current.attempts + 1
+        status = EventStatus.FAILED if attempts >= max_attempts else EventStatus.PENDING
+        self.events[event_id] = replace(current, attempts=attempts, status=status, last_error=error)
+        return status
+
+    def tenant_for_customer(self, *, stripe_customer_id: str) -> str | None:
+        for tenant in self.tenants.values():
+            if tenant.stripe_customer_id == stripe_customer_id:
+                return tenant.tenant_id
+        return None
+
+    def billing_tenant(self, *, tenant_id: str) -> BillingTenant | None:
+        return self.tenants.get(tenant_id)
+
+    def billable_tenants(self) -> Sequence[BillingTenant]:
+        return [tenant for tenant in self.tenants.values() if tenant.stripe_customer_id]
+
+    def link_customer(self, *, tenant_id: str, stripe_customer_id: str) -> None:
+        self.tenants[tenant_id] = replace(
+            self._row(tenant_id), stripe_customer_id=stripe_customer_id
+        )
+
+    def set_subscription(self, *, tenant_id: str, stripe_subscription_id: str | None) -> None:
+        self.tenants[tenant_id] = replace(
+            self._row(tenant_id), stripe_subscription_id=stripe_subscription_id
+        )
+
+    def set_status(self, *, tenant_id: str, status: TenantStatus) -> None:
+        if self.fail_on_status_write > 0:
+            self.fail_on_status_write -= 1
+            raise FakeStoreError("set_status is unavailable")
+        self.status_writes.append((tenant_id, status))
+        self.tenants[tenant_id] = replace(self._row(tenant_id), status=status)
+
+    def set_dunning_until(self, *, tenant_id: str, until: datetime | None) -> None:
+        self.tenants[tenant_id] = replace(self._row(tenant_id), dunning_until=until)
+
+    def tenants_in_expired_dunning(self, *, now: datetime) -> Sequence[BillingTenant]:
+        return [
+            tenant
+            for tenant in self.tenants.values()
+            if tenant.status is TenantStatus.ACTIVE and tenant.dunning(now=now).expired
+        ]
+
+    def record_usage_report(self, *, report: UsageReport, reported_at: datetime) -> bool:
+        key = (report.tenant_id, report.usage_date)
+        if key in self.usage_reports:
+            return False
+        self.usage_reports[key] = (report, reported_at)
+        return True
+
+    def usage_reported(self, *, tenant_id: str, usage_date: date) -> bool:
+        return (tenant_id, usage_date) in self.usage_reports
+
+    def _row(self, tenant_id: str) -> BillingTenant:
+        tenant = self.tenants.get(tenant_id)
+        if tenant is None:
+            raise FakeStoreError(f"no tenant '{tenant_id}'")
+        return tenant

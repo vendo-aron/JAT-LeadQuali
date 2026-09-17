@@ -33,7 +33,14 @@ lost every time the model is slow. The app is constructed without a
 :class:`~leadquali.app.ports.LeadAssessorPort` at all, so the fast path cannot regress into
 a slow one by accident; ``tests/unit/test_api_ingest.py`` asserts that structurally.
 
-The other public surface, ``/feedback/{token}``, is registered here by
+Two more surfaces are registered here and share nothing else with ingest.
+``/feedback/{token}`` is #19's one-click verdict page; ``/webhooks/stripe`` and
+``/billing/portal`` are #35's, added by
+:func:`~leadquali.api.webhooks.register_billing_routes`. Each has its own dependency object,
+so the ingest handler cannot reach a feedback writer or a Stripe client, and neither of them
+holds ingest's credentials or the lead queue.
+
+The first of those surfaces, ``/feedback/{token}``, is registered here by
 :func:`~leadquali.api.feedback.register_feedback_routes` and implemented in
 :mod:`leadquali.api.feedback`. It shares this app because it is one deployment, and it
 shares nothing else: its dependencies are a separate object, so the ingest handler cannot
@@ -74,6 +81,7 @@ from leadquali.api.signing import (
     ReplayGuard,
     verify,
 )
+from leadquali.api.webhooks import BillingDeps, register_billing_routes
 from leadquali.app.ingest import IngestRequest, IngestService
 from leadquali.app.ports import ClockPort
 from leadquali.config import Settings, get_settings
@@ -192,7 +200,9 @@ def _default_deps() -> IngestDeps:
 
 
 def create_app(
-    deps: IngestDeps | None = None, feedback_deps: FeedbackDeps | None = None
+    deps: IngestDeps | None = None,
+    feedback_deps: FeedbackDeps | None = None,
+    billing_deps: BillingDeps | None = None,
 ) -> FastAPI:
     """Build the ASGI application.
 
@@ -209,6 +219,10 @@ def create_app(
         deps: the ingest wiring. ``None`` — the default, and what uvicorn and Mangum get —
             resolves the production dependencies lazily on the first request.
         feedback_deps: the feedback wiring, resolved the same way.
+        billing_deps: the billing wiring (#35) — Stripe's webhook and the tenant billing
+            portal — resolved the same way. A third separate deps object for a third
+            separate surface: the webhook handler holds no lead store and no queue, and
+            ingest holds no Stripe secret.
 
     Returns:
         A deployment-agnostic ASGI app. It is served by uvicorn locally (``run_local.py``)
@@ -227,6 +241,7 @@ def create_app(
         redoc_url=None,
     )
     register_feedback_routes(app, feedback_deps)
+    register_billing_routes(app, billing_deps)
 
     @app.get(
         HEALTH_PATH,
