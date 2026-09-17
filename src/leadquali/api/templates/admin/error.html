@@ -1,0 +1,13 @@
+{#
+  The generic failure page. It carries one of the application's own sentences and nothing
+  else — never the request, never the row, never the exception. The admin renders lead
+  payloads, so an error page that echoed what it was working on would put a submitter's
+  contact details on a screen and into whatever collects unhandled errors (invariant 5).
+#}
+{% extends "admin/base.html" %}
+{% block title %}Something went wrong — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Something went wrong</h1>
+<p class="errors">{{ message }}</p>
+<p><a href="{{ admin_prefix }}/">Back to the tenant list</a></p>
+{% endblock %}

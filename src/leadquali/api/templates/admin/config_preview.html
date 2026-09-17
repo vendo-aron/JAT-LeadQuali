@@ -1,0 +1,46 @@
+{#
+  Step two. A field-by-field diff, not a text diff: what an operator needs to see is
+  "thresholds.hot 80 → 85", not three lines of JSON that happen to have moved.
+
+  The candidate document travels through this page in a hidden field and is re-validated
+  by the confirm handler — the confirm is a separate request and the document has been in
+  the browser in between.
+#}
+{% extends "admin/base.html" %}
+{% block title %}Confirm {{ slug }}'s rubric — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Confirm changes to {{ slug }}</h1>
+{% if preview.changed %}
+<table>
+  <tr><th>Field</th><th>Now</th><th>After</th></tr>
+  {% for change in preview.changes %}
+  <tr class="changed">
+    <td><code>{{ change.path }}</code></td>
+    <td>{% if change.kind.value == 'added' %}<span class="muted">not set</span>
+        {% else %}{{ change.before }}{% endif %}</td>
+    <td>{% if change.kind.value == 'removed' %}<span class="muted">removed</span>
+        {% else %}{{ change.after }}{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="notice">
+  This rubric is valid. Saving it writes a new version to the edit history, attributed to
+  you, and it can be reverted from there at any time.
+</p>
+<p>
+  Before you save, you can
+  <a href="{{ admin_prefix }}/tenants/{{ slug }}/rerun">run it against up to
+  {{ rerun_cap }} historical leads</a> and see which ones change tier. That costs money
+  and asks you to confirm first.
+</p>
+<form method="post" action="{{ admin_prefix }}/tenants/{{ slug }}/config/apply">
+  <input type="hidden" name="{{ csrf_field }}" value="{{ csrf }}">
+  <input type="hidden" name="config" value="{{ document }}">
+  <input type="hidden" name="note" value="{{ note }}">
+  <button type="submit">Save this rubric</button>
+</form>
+{% else %}
+<p class="notice">This document is identical to what is stored. There is nothing to save.</p>
+{% endif %}
+<p><a href="{{ admin_prefix }}/tenants/{{ slug }}/config">Back to the editor</a></p>
+{% endblock %}

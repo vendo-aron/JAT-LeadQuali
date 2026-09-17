@@ -1,0 +1,81 @@
+{#
+  Re-run historical leads against a candidate rubric, without dispatching anything.
+
+  This costs money: every lead in the batch is a model call. So the page shows the
+  estimate first, caps the batch, and requires an explicit confirmation — a request that
+  spends money must not be one a stray click or a prefetcher can make.
+#}
+{% extends "admin/base.html" %}
+{% block title %}Test a rubric for {{ slug }} — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Test a rubric against {{ slug }}'s history</h1>
+<p class="muted">
+  Runs the real pipeline with the rubric below, against leads that already arrived.
+  <strong>Nothing is written and no email is sent.</strong>
+  <a href="{{ admin_prefix }}/tenants/{{ slug }}/config">Back to the editor</a>
+</p>
+{% if message is defined and message %}<p class="errors">{{ message }}</p>{% endif %}
+{% if plan.empty %}
+<p class="notice">
+  This tenant has no assessed leads yet, so there is nothing to test a rubric against.
+  Once leads start arriving, this page will compare them.
+</p>
+{% else %}
+<p class="notice">
+  This will assess <strong>{{ plan.size }}</strong> lead{{ '' if plan.size == 1 else 's' }}
+  {% if plan.capped %}(the most recent {{ plan.size }} of {{ plan.available }}){% endif %}
+  at an estimated cost of <strong>{{ plan.estimated_cost_usd | money }}</strong>
+  {% if plan.cost_per_lead_usd is none %}
+  — we have no billing history for this tenant, so there is no basis for an estimate
+  {% else %}
+  (based on {{ plan.cost_per_lead_usd | money }} per billable lead over the last 30 days)
+  {% endif %}.
+  This is our cost, not the customer's: it is not billable and never reaches an invoice.
+</p>
+<form method="post" action="{{ admin_prefix }}/tenants/{{ slug }}/rerun">
+  <input type="hidden" name="{{ csrf_field }}" value="{{ csrf }}">
+  <p><textarea name="config" rows="20" spellcheck="false">{{ document }}</textarea></p>
+  <p><label><input type="checkbox" name="confirm" value="yes">
+    Yes, spend about {{ plan.estimated_cost_usd | money }} to run this</label></p>
+  <p><button type="submit">Run against {{ plan.size }} leads</button></p>
+</form>
+{% endif %}
+
+{% if report %}
+<h2>Result</h2>
+<p class="notice">
+  {{ report.comparisons | length }} leads assessed ·
+  {{ report.changed | length }} would change tier
+  ({{ report.moved_up }} up, {{ report.moved_down }} down) ·
+  actual cost {{ report.actual_cost_usd | money }}.
+  Nothing was written and nothing was sent.
+</p>
+<table>
+  <tr><th>Lead</th><th>Was</th><th>Would be</th><th>Old score</th><th>New score</th>
+      <th>Action</th><th>Cost</th></tr>
+  {% for row in report.comparisons %}
+  <tr{% if row.changed %} class="changed"{% endif %}>
+    <td><a href="{{ admin_prefix }}/leads/{{ row.lead_id }}?tenant={{ slug }}"
+        ><code>{{ row.lead_id[:8] }}</code></a></td>
+    <td>{% if row.previous_tier %}<span class="tier-{{ row.previous_tier.value }}"
+        >{{ row.previous_tier.value }}</span>{% else %}—{% endif %}</td>
+    <td>
+      {% if not row.assessed %}
+      <span class="muted">could not assess</span>
+      {% elif row.new_tier %}
+      <span class="tier-{{ row.new_tier.value }}">{{ row.new_tier.value }}</span>
+      {% else %}—{% endif %}
+    </td>
+    <td class="num">{{ row.previous_score if row.previous_score is not none else '—' }}</td>
+    <td class="num">{{ row.new_score if row.new_score is not none else '—' }}</td>
+    <td>{{ row.new_action.value }}</td>
+    <td class="num">{{ row.cost_usd | money }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">
+  A lead marked "could not assess" is one the model refused or failed on under this
+  rubric. That is a finding about the rubric, not a downgrade — it is counted as one.
+</p>
+{% endif %}
+{% endblock %}
