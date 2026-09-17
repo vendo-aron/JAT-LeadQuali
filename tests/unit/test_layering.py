@@ -65,6 +65,45 @@ def test_domain_and_app_import_no_third_party_sdk() -> None:
         assert not leaked, f"{relative} imports {sorted(leaked)}"
 
 
+def test_observability_imports_no_layer_above_it() -> None:
+    """``leadquali.observability`` sits beside the layers, not on top of them.
+
+    It is imported by ``domain``-adjacent value types, by ``app``, by ``adapters`` and by
+    ``api`` alike, which is only safe while it depends on none of them: an
+    ``observability`` that reached into ``adapters`` would put SQLAlchemy in the import
+    graph of every module that wants to write a log line, and would make the import cycle
+    ``app`` → ``observability`` → ``adapters`` → ``app`` a matter of luck about which file
+    was imported first.
+
+    Reading value types (``RoutingDecision``, ``CallMetering``) is allowed and is the point
+    — a metric about a decision has to be able to see one.
+    """
+    permitted = {"leadquali"}
+    for path in python_sources():
+        relative = path.relative_to(SRC).as_posix()
+        if not relative.startswith("observability/"):
+            continue
+        imported = {
+            name
+            for name in _imported_paths(path)
+            if name.startswith("leadquali.") and name.split(".")[1] in {"adapters", "api"}
+        }
+        assert not imported, f"{relative} imports {sorted(imported)}"
+        assert imported_modules(path) & {"anthropic", "boto3", "sqlalchemy", "fastapi"} == set()
+        assert permitted  # the loop ran with a real package root
+
+
+def _imported_paths(path: Path) -> set[str]:
+    """Every dotted module path imported by ``path``, in full."""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+    return names
+
+
 def test_only_the_ses_adapter_imports_boto3() -> None:
     """``CLAUDE.md``: one file per external system, and ``boto3`` belongs to that one.
 

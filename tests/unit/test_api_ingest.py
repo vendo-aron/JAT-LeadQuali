@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import ast
 import json
-import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -58,6 +57,7 @@ from leadquali.config import Settings
 from leadquali.domain.models import Action, EscalationReason
 from leadquali.domain.tenant_config import TenantConfig
 from tests.fakes import FakeClock, InMemoryLeadStore
+from tests.logcapture import capture_json_logs
 
 TENANT = "default"
 API_KEY = "lq_live_5b1f0a7c2e9d4368"
@@ -543,30 +543,35 @@ def test_a_rate_limited_response_says_when_to_come_back() -> None:
     assert int(refused.headers["retry-after"]) >= 1
 
 
-def test_no_contact_address_ever_reaches_the_logs(
-    harness: Harness, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Invariant 5: the hash correlates a person's leads; the address is never written."""
-    with caplog.at_level(logging.DEBUG):
+def test_no_contact_address_ever_reaches_the_logs(harness: Harness) -> None:
+    """Invariant 5: the hash correlates a person's leads; the address is never written.
+
+    Asserted against the emitted JSON rather than ``caplog.text``, because what a log
+    aggregator receives is the formatter's output and that is the only thing invariant 5 is
+    a statement about. #21's ``tests/unit/test_observability_pipeline.py`` makes the same
+    assertion over the worker half of the journey.
+    """
+    with capture_json_logs() as logs:
         harness.post()
 
-    assert "ada@analytical-engines.co.uk" not in caplog.text
-    assert "Ada Lovelace" not in caplog.text
-    assert VALID_FORM["message"] not in caplog.text
+    assert "ada@analytical-engines.co.uk" not in logs.text
+    assert "Ada Lovelace" not in logs.text
+    assert str(VALID_FORM["message"]) not in logs.text
     # 64 hex characters: the contact hash, which is what correlation is done on.
-    assert "contact=" in caplog.text
-    hashed = caplog.text.split("contact=")[1].split()[0]
-    assert len(hashed) == 64
+    accepted = logs.one("lead.accepted")
+    assert len(accepted["contact_email_hash"]) == 64
+    assert accepted["trace_id"] == logs.one("http.ingest")["trace_id"]
 
 
-def test_a_rejected_request_logs_the_reason_but_answers_with_nothing(
-    harness: Harness, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.WARNING):
+def test_a_rejected_request_logs_the_reason_but_answers_with_nothing(harness: Harness) -> None:
+    with capture_json_logs() as logs:
         response = harness.post(tenant="does-not-exist")
 
     assert response.json() == {"detail": "authentication failed"}
-    assert "unknown_tenant" in caplog.text
+    rejected = logs.one("ingest.rejected")
+    assert rejected["reason"] == "unknown_tenant"
+    assert rejected["claimed_tenant"] == "does-not-exist"
+    assert rejected["level"] == "WARNING"
 
 
 # ------------------------------------------------------------------------- wiring

@@ -42,6 +42,7 @@ from leadquali.config import get_settings
 from leadquali.domain.models import RoutingDecision
 from leadquali.domain.routing import decide, system_failure
 from leadquali.domain.tenant_config import TenantConfig, TenantConfigError
+from leadquali.observability import configure_logging
 from leadquali.prompts.lead import LeadSubmission, render_lead_detailed
 
 #: Exit code for a usage or input problem. Reserved so a caller can tell "you gave me a
@@ -90,6 +91,11 @@ def main(
     argv: Sequence[str] | None = None, *, assessor_factory: AssessorFactory | None = None
 ) -> int:
     """Run the CLI. Returns the process exit code."""
+    # Logs go to stderr, never stdout. `--json` writes a machine-readable record on stdout
+    # that #23's eval harness pipes into a file, and one interleaved log line would make it
+    # unparseable. Configured at all — rather than left to Python's "no handler" default —
+    # so that an adapter's retry or a slow call is visible while a person waits for it.
+    configure_logging(stream=sys.stderr)
     parser = build_parser()
     raw = list(sys.argv[1:] if argv is None else argv)
     # `score` is the only subcommand, so allow it to be omitted for everyday use.
