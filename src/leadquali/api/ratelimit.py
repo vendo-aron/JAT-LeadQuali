@@ -31,37 +31,16 @@ limit exists to stop a runaway integration rather than a determined attacker.
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from math import ceil
 from typing import Final, Protocol, runtime_checkable
 
+from leadquali.app.tenants import TenantRateLimit
 
-@dataclass(frozen=True, slots=True)
-class TenantRateLimit:
-    """One tenant's allowance, as stored on its row.
-
-    Args:
-        per_minute: Sustained requests per minute — the bucket's refill rate.
-        burst: How many requests may arrive at once — the bucket's capacity.
-    """
-
-    per_minute: int
-    burst: int
-
-    def __post_init__(self) -> None:
-        """Refuse a limit that would refuse everything.
-
-        ``per_minute = 0`` is a bucket that never refills and ``burst = 0`` one that holds
-        nothing; either would silently stop a customer's leads. The database has the same
-        CHECK, so this only catches a value that never came from a row.
-        """
-        if self.per_minute < 1 or self.burst < 1:
-            raise ValueError(
-                f"a tenant rate limit needs a positive rate and burst, got "
-                f"per_minute={self.per_minute}, burst={self.burst}"
-            )
+LOGGER: Final = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +117,14 @@ DEFAULT_TENANT_RATE_LIMIT: Final[TenantRateLimit] = TenantRateLimit(per_minute=6
 #: and so a flood costs one row read a minute rather than one per request.
 DEFAULT_LIMIT_CACHE_SECONDS: Final[int] = 60
 
+#: How long a limit that could not be refreshed is served before the source is tried again.
+#:
+#: The same shape as ``adapters/secrets_manager.STALE_RETRY_SECONDS``, and for the same
+#: reason: without it, a source that is failing is retried on *every* request, which turns
+#: a struggling database into a struggling database being hammered by the whole fleet, and
+#: writes one log line per lead while it happens.
+LIMIT_STALE_RETRY_SECONDS: Final[int] = 5
+
 
 @runtime_checkable
 class TenantRateLimitSource(Protocol):
@@ -189,6 +176,7 @@ class TenantRateLimiter:
         self._default = default
         self._cache_seconds = cache_seconds
         self._max_tenants = max_tenants
+        #: ``tenant_id -> (limit, the moment it stops being served without a refetch)``.
         self._limits: OrderedDict[str, tuple[TenantRateLimit, float]] = OrderedDict()
         self._buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
 
@@ -214,19 +202,44 @@ class TenantRateLimiter:
 
     def _limit_for(self, tenant_id: str, stamp: float) -> TenantRateLimit:
         cached = self._limits.get(tenant_id)
-        if cached is not None and stamp - cached[1] < self._cache_seconds:
+        if cached is not None and stamp < cached[1]:
             return cached[0]
-        limit = self._source.rate_limit_for(tenant_id) or self._default
-        self._limits[tenant_id] = (limit, stamp)
+        try:
+            limit = self._source.rate_limit_for(tenant_id) or self._default
+        except Exception:
+            # Broad, and deliberately so: the source is a Protocol over a database, and
+            # what it raises is the adapter's business. The point is that this code runs
+            # *after* authentication, so its caller is a paying customer holding a valid
+            # key — a blip reading a number that changes once a quarter must not become a
+            # 500 on their lead. A browser form that gets a 500 does not retry, and the
+            # lead is simply gone (invariant 3).
+            #
+            # Serve the last value we had, or the default, and re-stamp so the failing
+            # source is retried in LIMIT_STALE_RETRY_SECONDS rather than on every single
+            # request — otherwise a struggling database gets hammered by the whole fleet.
+            LOGGER.warning(
+                "ratelimit.limits_unavailable",
+                extra={"event": "ratelimit.limits_unavailable", "tenant_id": tenant_id},
+            )
+            served = cached[0] if cached is not None else self._default
+            self._remember(
+                tenant_id, served, stamp + min(LIMIT_STALE_RETRY_SECONDS, self._cache_seconds)
+            )
+            return served
+        self._remember(tenant_id, limit, stamp + self._cache_seconds)
+        return limit
+
+    def _remember(self, tenant_id: str, limit: TenantRateLimit, valid_until: float) -> None:
+        self._limits[tenant_id] = (limit, valid_until)
         self._limits.move_to_end(tenant_id)
         while len(self._limits) > self._max_tenants:
             self._limits.popitem(last=False)
-        return limit
 
 
 __all__ = [
     "DEFAULT_LIMIT_CACHE_SECONDS",
     "DEFAULT_TENANT_RATE_LIMIT",
+    "LIMIT_STALE_RETRY_SECONDS",
     "FixedWindowRateLimiter",
     "NoRateLimit",
     "RateLimitDecision",

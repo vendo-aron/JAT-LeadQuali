@@ -214,7 +214,10 @@ def _dispatch(args: argparse.Namespace, service: TenantService, out: TextIO, err
             name = args.name if args.name is not None else str(document.get("name", args.slug))
             record = service.create_tenant(slug=args.slug, name=name, config=document)
             print(f"created tenant {record.slug} ({record.name}), id {record.id}", file=out)
-            print(f"signing secret: {record.hmac_secret_ref}", file=out)
+            # "hmac secret:" and not "signing secret:", and matching what `show` prints:
+            # this is the ARN of the secret, not its value, and an operator who mistakes one
+            # for the other pastes an ARN into a customer's site configuration.
+            print(f"hmac secret: {record.hmac_secret_ref}", file=out)
             print(
                 f"next: issue a key with `python -m leadquali.tenantctl issue-key {record.slug}`",
                 file=err,
