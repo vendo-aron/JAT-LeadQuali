@@ -55,6 +55,7 @@ from leadquali.api.signing import (
 )
 from leadquali.app.api_keys import ApiKeyParts, KeyEnvironment
 from leadquali.app.assessment_result import AssessmentFailed, AssessmentOutcome
+from leadquali.app.credentials import AuthFailure, CredentialRejected
 from leadquali.app.ingest import IngestService, QueuedLead
 from leadquali.app.ports import RoutingOutcome
 from leadquali.config import Settings, set_secret_resolver
@@ -278,6 +279,49 @@ def test_suspending_one_tenant_does_not_stop_another(harness: Harness) -> None:
     """The acceptance criterion: ingest stops for that tenant only."""
     assert Harness(source=credentials(status="suspended")).post().status_code == 403
     assert harness.post().status_code == 202
+
+
+class UnavailableCredentials:
+    """A credential source whose dependency is down — Secrets Manager throttling, say."""
+
+    def resolve(self, *, tenant_id: str, api_key: str) -> CredentialRejected:
+        del tenant_id, api_key
+        return CredentialRejected(AuthFailure.UNAVAILABLE)
+
+
+def test_a_dependency_being_down_is_a_503_and_not_a_401(harness: Harness) -> None:
+    """The sender did nothing wrong, and it is the only party that can still save the lead.
+
+    A 401 would tell a good customer their key is bad; a 500 would be a response a browser
+    form does not retry, and the lead would simply be gone — invariant 3 broken by an
+    outage in something else. So: 503, and a Retry-After that asks it to come back.
+    """
+    broken = Harness(source=UnavailableCredentials())
+    try:
+        response = broken.post()
+
+        assert response.status_code == 503
+        assert int(response.headers["retry-after"]) >= 1
+        assert response.json() == {
+            "detail": "temporarily unable to accept submissions; retry shortly"
+        }
+        assert broken.store.leads == {}
+    finally:
+        broken.queue.close()
+
+
+def test_a_503_is_logged_as_such_rather_than_as_an_authentication_failure() -> None:
+    """An operator paging on a spike of 401s must not have this hiding among them."""
+    broken = Harness(source=UnavailableCredentials())
+    try:
+        with capture_json_logs() as logs:
+            broken.post()
+    finally:
+        broken.queue.close()
+
+    rejected = logs.one("ingest.rejected")
+    assert rejected["reason"] == "unavailable"
+    assert rejected["status"] == 503
 
 
 def test_a_body_changed_after_signing_is_rejected(harness: Harness) -> None:

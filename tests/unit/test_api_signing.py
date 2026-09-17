@@ -454,18 +454,49 @@ def test_the_replay_guard_is_bounded_in_size() -> None:
 
 
 def test_the_kdf_runs_only_after_every_free_check_has_passed() -> None:
-    """A revoked key, a suspended tenant and a foreign key_id must all cost nothing.
+    """The property the whole "argon2 on the request path" argument rests on.
 
-    This is the property the whole "argon2 on the request path" argument rests on, so it is
-    asserted by counting KDF calls rather than by reading the code.
+    The hasher is built **inside the test**, not shared with the rest of the file: the
+    module-level one has already memoised ``(KEY_HASH, sha256(KEY_SECRET))``, so a probe
+    presenting the correct secret would be a free memo hit and this test would pass with
+    the checks in any order at all. Each probe also presents a *wrong* secret, so that a
+    KDF call is the only way the counter can move.
     """
-    revoked = credentials(tenant_entry(revoked=True))
+    fresh = Argon2KeyHasher()
+    forged = key_text(KEY_ID, "w" * 43)
+
+    def source(**overrides: object) -> StaticCredentials:
+        entry = tenant_entry(**overrides)  # type: ignore[arg-type]
+        return StaticCredentials({entry.tenant_id: entry}, verifier=fresh, now=lambda: NOW)
+
+    assert rejection(check(source=source(revoked=True), api_key=forged)) is (
+        AuthFailure.REVOKED_KEY
+    )
+    assert (
+        rejection(check(source=source(expires_at=NOW - timedelta(days=1)), api_key=forged))
+        is AuthFailure.REVOKED_KEY
+    )
+    assert rejection(check(source=source(), tenant="nobody", api_key=forged)) is (
+        AuthFailure.UNKNOWN_TENANT
+    )
+    assert fresh.kdf_calls == 0, "a free check let the KDF run"
+
+    # ...and the same forged key, with nothing free left to refuse it, does cost one.
+    assert rejection(check(source=source(), api_key=forged)) is AuthFailure.BAD_KEY
+    assert fresh.kdf_calls == 1
+
+
+def test_a_suspended_tenant_is_not_an_oracle_for_someone_without_the_secret() -> None:
+    """The 403 is the one answer that says something about the account, so only a caller
+    that has proved it holds the secret may reach it. A wrong secret gets the ordinary,
+    indistinguishable rejection instead — which also means an integrator with a genuinely
+    wrong key is never told in writing that their key was fine."""
     suspended = credentials(tenant_entry(status="suspended"))
-    before = VERIFIER.kdf_calls
-    assert rejection(check(source=revoked)) is AuthFailure.REVOKED_KEY
+
+    assert rejection(check(source=suspended, api_key=key_text(KEY_ID, "w" * 43))) is (
+        AuthFailure.BAD_KEY
+    )
     assert rejection(check(source=suspended)) is AuthFailure.TENANT_SUSPENDED
-    assert rejection(check(tenant="nobody")) is AuthFailure.UNKNOWN_TENANT
-    assert VERIFIER.kdf_calls == before
 
 
 # ----------------------------------------------------------------------- credentials

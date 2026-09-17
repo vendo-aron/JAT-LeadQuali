@@ -342,6 +342,36 @@ def test_one_tenant_cannot_revoke_anothers_key(
     assert service.list_keys(slug=theirs)[0].revoked_at is None
 
 
+def test_one_tenant_cannot_expire_anothers_key(
+    service: TenantService, store: PostgresTenantAdminStore, a_config: dict[str, Any]
+) -> None:
+    """The other half of invariant 4 on this table, and the one with no service-level check
+    in front of it: ``expire_key`` is reached from ``rotate_key``, and its ``UPDATE`` is
+    the only thing standing between a wrong slug and somebody else's rotation deadline."""
+    mine, theirs = a_slug("mine"), a_slug("theirs")
+    onboard(service, a_config, mine)
+    onboard(service, a_config, theirs)
+    victim = service.issue_key(slug=theirs)
+
+    with pytest.raises(UnknownApiKeyError):
+        store.expire_key(slug=mine, key_id=victim.record.key_id, expires_at=NOW + timedelta(days=1))
+
+    assert service.list_keys(slug=theirs)[0].expires_at is None
+
+
+def test_expiring_a_key_through_its_own_tenant_works(
+    service: TenantService, store: PostgresTenantAdminStore, a_config: dict[str, Any]
+) -> None:
+    """The positive half, so the test above cannot pass by the method being broken."""
+    slug = a_slug()
+    onboard(service, a_config, slug)
+    issued = service.issue_key(slug=slug)
+
+    deadline = NOW + timedelta(days=7)
+    assert store.expire_key(slug=slug, key_id=issued.record.key_id, expires_at=deadline)
+    assert service.list_keys(slug=slug)[0].expires_at == deadline
+
+
 def test_revoking_twice_keeps_the_first_timestamp(
     service: TenantService, a_config: dict[str, Any]
 ) -> None:
@@ -483,7 +513,7 @@ def test_a_key_id_that_does_not_exist_costs_no_kdf(
     assert verifier.calls == 0
 
 
-def test_a_malformed_key_touches_the_database_at_all(
+def test_a_malformed_key_does_not_touch_the_database_at_all(
     credentials: PostgresIngestCredentials, verifier: StubVerifier
 ) -> None:
     """Cheaper still: refused on its shape, before a statement is built."""
@@ -542,6 +572,80 @@ def test_last_used_is_recorded_coarsely_and_never_on_every_request(
     )
     credentials.resolve(tenant_id=slug, api_key=issued.key)
     assert last_used() == NOW - timedelta(days=1)
+
+
+def test_a_signing_secret_that_cannot_be_read_is_a_503_and_not_a_401(
+    service: TenantService,
+    sessions: sessionmaker[Session],
+    verifier: StubVerifier,
+    a_config: dict[str, Any],
+) -> None:
+    """Secrets Manager throttles. The caller has just proved it holds a live key, so a 401
+    would tell a good customer their key is bad — and a browser form told that does not
+    retry, so the lead is gone (invariant 3). UNAVAILABLE becomes a 503 with a Retry-After.
+    """
+
+    class BrokenResolver:
+        def resolve(self, secret_arn: str) -> str:
+            raise RuntimeError(f"Throttling: {secret_arn}")
+
+        def resolve_mapping(self, secret_arn: str) -> dict[str, str]:
+            del secret_arn
+            return {}
+
+    slug = a_slug()
+    onboard(service, a_config, slug)
+    issued = service.issue_key(slug=slug)
+    source = PostgresIngestCredentials(
+        sessions,
+        verifier=verifier,
+        resolver=BrokenResolver(),
+        now=lambda: NOW,
+        last_used_coarseness=None,
+    )
+
+    assert source.resolve(tenant_id=slug, api_key=issued.key) == CredentialRejected(
+        AuthFailure.UNAVAILABLE
+    )
+
+
+def test_a_suspended_tenant_is_not_an_oracle_for_someone_without_the_secret(
+    service: TenantService, credentials: PostgresIngestCredentials, a_config: dict[str, Any]
+) -> None:
+    """The production resolver's half of the 403 ordering: a caller with only the public
+    ``key_id`` and a junk secret learns nothing about the account."""
+    slug = a_slug()
+    onboard(service, a_config, slug)
+    issued = service.issue_key(slug=slug)
+    service.set_status(slug=slug, status=TenantStatus.SUSPENDED)
+    forged = ApiKeyParts(
+        environment=KeyEnvironment.LIVE, key_id=issued.record.key_id, secret="w" * 43
+    ).text
+
+    assert credentials.resolve(tenant_id=slug, api_key=forged) == CredentialRejected(
+        AuthFailure.BAD_KEY
+    )
+
+
+def test_last_used_is_scoped_to_the_keys_own_tenant(
+    service: TenantService,
+    credentials: PostgresIngestCredentials,
+    connection: Connection,
+    a_config: dict[str, Any],
+) -> None:
+    """``_touch`` is a write, and invariant 4 says a write filters on its tenant. Asserted
+    positively — the row that *should* be touched is — because the negative case cannot be
+    reached through ``resolve``, which only ever passes the slug it just read."""
+    slug = a_slug()
+    onboard(service, a_config, slug)
+    issued = service.issue_key(slug=slug)
+
+    credentials.resolve(tenant_id=slug, api_key=issued.key)
+
+    stored = connection.execute(
+        select(TenantApiKey.last_used_at).where(TenantApiKey.key_id == issued.record.key_id)
+    ).scalar_one()
+    assert stored == NOW
 
 
 def test_last_used_can_be_switched_off_entirely(
