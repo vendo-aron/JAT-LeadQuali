@@ -479,15 +479,19 @@ def test_the_credential_source_accepts_a_key_under_its_own_tenant() -> None:
     assert resolver.calls == [SIGNING_SECRET_REF]
 
 
-def test_the_last_used_write_is_keyed_on_the_key_and_runs_after_the_decision() -> None:
-    """The one write in the adapters that carries no tenant predicate, pinned as such.
+def test_the_last_used_write_is_tenant_scoped_like_every_other_write() -> None:
+    """``_touch`` is swept by hand because the sweep cannot reach it.
 
-    ``_touch`` stamps ``tenant_api_keys.last_used_at`` and filters on ``key_id`` alone.
-    That is safe for two reasons that have to stay true, so they are asserted rather than
-    asserted-in-a-comment: ``key_id`` is globally unique (``uq_tenant_api_keys_key_id``),
-    and the write happens *after* the credential has been resolved, so the tenant it
-    belongs to is already established. It is listed in docs/tenant-isolation.md as the
-    documented exception it is.
+    It stamps ``tenant_api_keys.last_used_at`` and it is private, so the enumeration above
+    skips it — and it is a *write*, on the request path, which makes it the last place to
+    tolerate an exception to invariant 4. It has none: the ``UPDATE`` filters on the tenant
+    as well as on ``key_id``, redundantly against a unique index and against the row the
+    same call has just read, because the exception is what a later reader copies.
+
+    The second assertion is about *when* rather than *where*: the write is the second
+    statement, issued after the credential decision has already been made on the read
+    before it. A ``last_used`` stamp that ran before the decision would be a write on
+    behalf of a caller who turns out not to be authenticated.
     """
     verifier = Argon2KeyHasher()
     capture = SqlCapture()
@@ -517,12 +521,14 @@ def test_the_last_used_write_is_keyed_on_the_key_and_runs_after_the_decision() -
     ]
     assert len(touches) == 1, capture.sessions.statements
     assert "tenant_api_keys.key_id =" in touches[0]
-    assert "tenant_id" not in touches[0], (
-        "the last_used write has grown a tenant predicate; that is an improvement, and "
-        "docs/tenant-isolation.md should stop listing it as an exception"
+    assert scoping_evidence(touches[0]) == frozenset({"predicate"}), touches[0]
+    assert "tenants.slug =" in touches[0], (
+        "the tenant is resolved from the slug the decision was made against, not from a "
+        f"uuid recomputed here:\n{touches[0]}"
     )
     # It is the *second* statement: the decision is made on the read before it.
     assert len(capture.sessions.statements) == 2
+    assert sql_text(capture.sessions.statements[0]).startswith("select")
 
 
 def test_a_deleted_filter_is_visible_to_the_evidence_rules() -> None:

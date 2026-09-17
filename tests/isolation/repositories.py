@@ -237,10 +237,11 @@ class Repository:
 def _ingest_credentials(sessions: sessionmaker[Session]) -> PostgresIngestCredentials:
     """The request-path credential source, with the clock pinned and the touch write off.
 
-    ``last_used_coarseness=None`` switches off the ``last_used_at`` write, which is a second
-    statement issued *after* the credential decision and is no part of it. Leaving it on
-    would put an untenanted ``UPDATE`` into the sweep's captured statements while saying
-    nothing about isolation; it gets a test of its own instead.
+    ``last_used_coarseness=None`` switches off the ``last_used_at`` write. It is a second
+    statement issued *after* the credential decision and is no part of it, so it would tell
+    the sweep nothing about how that decision is scoped — and it is private, which puts it
+    outside the enumeration either way. It is tenant-scoped, and
+    ``test_the_last_used_write_is_tenant_scoped_like_every_other_write`` says so directly.
     """
     return PostgresIngestCredentials(
         sessions,
@@ -514,10 +515,12 @@ RECIPES: Final[Mapping[type, Mapping[str, ArgumentRecipe]]] = {
                 "The one method whose tenant check is not a WHERE clause. The lookup is by "
                 "key_id — globally unique, and the reason argon2 is affordable on the "
                 "request path — and the row it finds carries the owning tenant's slug, "
-                "which is compared in Python. The sweep therefore asserts the behaviour: a "
-                "real key presented under another tenant's name is refused, and refused as "
-                "UNKNOWN_TENANT so it is indistinguishable from a key that does not exist. "
-                "Recorded as an exception in docs/tenant-isolation.md."
+                "which leadquali.app.credentials.decide_credential then compares in Python. "
+                "The sweep therefore asserts the behaviour: a real key presented under "
+                "another tenant's name is refused, and refused as UNKNOWN_TENANT so it is "
+                "indistinguishable from a key that does not exist. test_auth_isolation.py "
+                "drives that decision directly, since #31's review fixes it is the "
+                "one place the rule is written. Recorded in docs/tenant-isolation.md."
             ),
         ),
     },

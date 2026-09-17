@@ -25,6 +25,17 @@ Suspension is here too rather than in a module of its own, because it is the sam
 mechanism seen from the other side: suspending one tenant must stop that tenant and only
 that tenant. Both halves are in one test, since a test that only proved A stopped would
 pass if the whole endpoint had.
+
+Where the decision actually lives
+---------------------------------
+
+Since #31's review fixes, every rule about whether a presented key may authenticate a
+request is :func:`~leadquali.app.credentials.decide_credential` — a pure function both
+resolvers call once their own ``key_id`` lookup has produced a row. That is #31's answer to
+the same trap this suite exists for: the rules used to be written twice, once on the path
+production runs and once on the path the offline suite exercised. So the first section below
+drives that function directly, exhaustively and with no database, and the two resolvers are
+then checked for agreeing with it.
 """
 
 from __future__ import annotations
@@ -42,6 +53,11 @@ from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
 from leadquali.adapters.store_tenants import PostgresIngestCredentials
 from leadquali.api.main import INGEST_PATH, IngestDeps, create_app
+from leadquali.api.ratelimit import (
+    DEFAULT_TENANT_RATE_LIMIT,
+    TenantRateLimit,
+    TenantRateLimiter,
+)
 from leadquali.api.signing import (
     ACTIVE_STATUS,
     HEADER_KEY,
@@ -49,6 +65,7 @@ from leadquali.api.signing import (
     HEADER_SIGNATURE,
     HEADER_TENANT,
     HEADER_TIMESTAMP,
+    TENANT_STATUSES,
     AuthFailure,
     CredentialLookup,
     CredentialRejected,
@@ -59,6 +76,7 @@ from leadquali.api.signing import (
     StoredApiKey,
     sign,
 )
+from leadquali.app.credentials import CredentialAccepted, CredentialDecision, decide_credential
 from leadquali.app.ingest import IngestService
 from tests.fakes import FakeClock, InMemoryLeadStore
 from tests.isolation.repositories import (
@@ -89,6 +107,144 @@ API_KEY_B: Final[str] = api_key_for(KEY_ID_B, KEY_SECRET_B)
 
 SECRETS: Final[Mapping[str, bytes]] = {TENANT_A: SECRET_A, TENANT_B: SECRET_B}
 API_KEYS: Final[Mapping[str, str]] = {TENANT_A: API_KEY_A, TENANT_B: API_KEY_B}
+
+
+# ------------------------------------------------------------------- the one decision
+
+
+def decide(
+    *,
+    claimed: str,
+    owner: str = TENANT_A,
+    status: str = ACTIVE_STATUS,
+    secret: str = KEY_SECRET_A,
+    revoked: bool = False,
+    expires_at: dt.datetime | None = None,
+    now: dt.datetime = NOW,
+) -> CredentialDecision:
+    """Run the shared decision over one key row, with each input independently selectable.
+
+    Every argument has a default that is the accepting case, so each test below changes
+    exactly one thing and the reader can see which.
+    """
+    return decide_credential(
+        claimed_tenant_id=claimed,
+        row_tenant_id=owner,
+        tenant_status=status,
+        key=StoredApiKey(
+            key_id=KEY_ID_A, key_hash=KEY_HASH_A, revoked=revoked, expires_at=expires_at
+        ),
+        presented_secret=secret,
+        now=now,
+        verifier=VERIFIER,
+    )
+
+
+def test_the_decision_accepts_a_live_key_under_its_own_tenant() -> None:
+    """The positive control. Every refusal below is one change away from this."""
+    decision = decide(claimed=TENANT_A)
+
+    assert isinstance(decision, CredentialAccepted)
+    assert decision.tenant_id == TENANT_A
+    assert decision.key_id == KEY_ID_A
+
+
+def test_the_decision_refuses_a_key_claimed_by_the_wrong_tenant() -> None:
+    """The cross-tenant rule, at the one place it is now written.
+
+    Reported as ``unknown_tenant`` rather than as anything more specific: a caller must not
+    be able to tell "that key belongs to somebody else" from "that key does not exist", or
+    the endpoint enumerates its own customers for anyone who has seen a key in a header.
+    """
+    decision = decide(claimed=TENANT_B, owner=TENANT_A)
+
+    assert decision == CredentialRejected(AuthFailure.UNKNOWN_TENANT)
+
+
+def test_the_tenant_check_runs_before_everything_that_could_leak_more() -> None:
+    """A key that is wrong in two ways reports only the first, and the first is ownership.
+
+    A revoked key belonging to somebody else must answer ``unknown_tenant``, not
+    ``revoked_key``: the second would confirm that the key_id exists and that the tenant
+    named in the header is not its owner, which is two facts more than a stranger should
+    get. The same for a suspended owner and for a wrong secret.
+    """
+    also_wrong: tuple[Mapping[str, Any], ...] = (
+        {"revoked": True},
+        {"status": "suspended"},
+        {"secret": "not-the-right-secret"},
+        {"expires_at": NOW - dt.timedelta(days=1)},
+    )
+    for changes in also_wrong:
+        decision = decide(claimed=TENANT_B, owner=TENANT_A, **changes)
+        assert decision == CredentialRejected(AuthFailure.UNKNOWN_TENANT), changes
+
+
+@pytest.mark.parametrize(
+    ("name", "changes", "failure"),
+    [
+        ("revoked", {"revoked": True}, AuthFailure.REVOKED_KEY),
+        (
+            "rotation overlap closed",
+            {"expires_at": NOW - dt.timedelta(seconds=1)},
+            AuthFailure.REVOKED_KEY,
+        ),
+        ("wrong secret", {"secret": "not-the-right-secret"}, AuthFailure.BAD_KEY),
+        ("tenant suspended", {"status": "suspended"}, AuthFailure.TENANT_SUSPENDED),
+        ("tenant disabled", {"status": "disabled"}, AuthFailure.TENANT_SUSPENDED),
+    ],
+)
+def test_the_decision_refuses_each_way_a_key_can_be_unusable(
+    name: str, changes: Mapping[str, Any], failure: AuthFailure
+) -> None:
+    """Every refusal the shared decision can produce, under the key's own tenant.
+
+    Exhaustive on purpose: this function is now the only implementation of these rules, so a
+    gap here is a gap everywhere rather than in one of two copies.
+    """
+    assert decide(claimed=TENANT_A, **changes) == CredentialRejected(failure), name
+
+
+def test_a_suspended_tenant_with_a_wrong_secret_is_told_its_key_is_bad() -> None:
+    """The consequence of checking status *after* the KDF, and it is the point of doing so.
+
+    ``tenant_suspended`` is the one refusal that is not the identical 401, so it must be
+    reachable only by a caller who has proved it holds the secret. An API key travels in a
+    header in the clear on every submission; if status were checked first, anyone who had
+    ever seen one could ask whether that account had been suspended for non-payment without
+    holding the secret at all.
+    """
+    assert decide(claimed=TENANT_A, status="suspended") == CredentialRejected(
+        AuthFailure.TENANT_SUSPENDED
+    )
+    assert decide(
+        claimed=TENANT_A, status="suspended", secret="not-the-right-secret"
+    ) == CredentialRejected(AuthFailure.BAD_KEY)
+
+
+def test_the_decision_never_answers_unavailable() -> None:
+    """``UNAVAILABLE`` means a dependency could not be read, and this function reads none.
+
+    It is pure — no database, no secret store, no clock of its own — so every outcome it
+    can produce is a statement about the caller. A dependency outage is the resolver's
+    business, and ``test_one_tenants_secret_store_outage_is_not_another_tenants_outage``
+    covers what that turns into.
+    """
+    outcomes = {
+        decide(claimed=claimed, owner=TENANT_A, status=status, secret=secret, revoked=revoked)
+        for claimed in (TENANT_A, TENANT_B)
+        for status in TENANT_STATUSES
+        for secret in (KEY_SECRET_A, "not-the-right-secret")
+        for revoked in (False, True)
+    }
+    failures = {item.failure for item in outcomes if isinstance(item, CredentialRejected)}
+    assert AuthFailure.UNAVAILABLE not in failures, failures
+    assert failures == {
+        AuthFailure.UNKNOWN_TENANT,
+        AuthFailure.REVOKED_KEY,
+        AuthFailure.BAD_KEY,
+        AuthFailure.TENANT_SUSPENDED,
+    }
 
 
 # --------------------------------------------------------------- the credential sources
@@ -170,7 +326,31 @@ class _KeyTableSessions(sessionmaker[Session]):
         return _KeyTableSession(self._rows, self.lookups)
 
 
-def postgres_credentials(*, suspended: frozenset[str] = frozenset()) -> PostgresIngestCredentials:
+class FlakySecretResolver(DictSecretResolver):
+    """A secret store that is down for some tenants and fine for the rest.
+
+    Models a Secrets Manager throttle or a network blip, which #31's review made a first
+    class outcome: a caller that has *already proved it holds a live key* must not be told
+    its key is bad, because a browser form told that does not retry and the lead is gone
+    (invariant 3). It is an outage on our side, so it is a 503.
+    """
+
+    def __init__(self, secrets: Mapping[str, str], *, down_for: frozenset[str]) -> None:
+        super().__init__(secrets)
+        self.down_for = down_for
+
+    def resolve(self, secret_arn: str) -> str:
+        """Fail for a tenant whose secret store is down; answer normally for the rest."""
+        if any(secret_arn.endswith(f"-{tenant}") for tenant in self.down_for):
+            raise RuntimeError(f"secrets manager is throttling ({secret_arn})")
+        return super().resolve(secret_arn)
+
+
+def postgres_credentials(
+    *,
+    suspended: frozenset[str] = frozenset(),
+    secret_store_down_for: frozenset[str] = frozenset(),
+) -> PostgresIngestCredentials:
     """The production credential source over a fake ``tenant_api_keys``/``tenants`` join."""
     rows = {
         key_id: _KeyRow(
@@ -189,11 +369,12 @@ def postgres_credentials(*, suspended: frozenset[str] = frozenset()) -> Postgres
     return PostgresIngestCredentials(
         _KeyTableSessions(rows),
         verifier=VERIFIER,
-        resolver=DictSecretResolver(
+        resolver=FlakySecretResolver(
             {
                 f"{SIGNING_SECRET_REF}-{tenant}": SECRETS[tenant].decode("utf-8")
                 for tenant in (TENANT_A, TENANT_B)
-            }
+            },
+            down_for=secret_store_down_for,
         ),
         now=lambda: NOW,
         # Off: the last_used stamp is a write made after the decision and is no part of it.
@@ -215,6 +396,37 @@ SOURCES: Final[tuple[tuple[str, SourceFactory], ...]] = (
 
 def _source_id(case: tuple[str, SourceFactory]) -> str:
     return case[0]
+
+
+@pytest.mark.parametrize("case", SOURCES, ids=_source_id)
+def test_both_resolvers_answer_exactly_what_the_shared_decision_answers(
+    case: tuple[str, SourceFactory],
+) -> None:
+    """The two implementations and the function they now share, compared on every input.
+
+    This is the assertion that would have caught #31's original defect: the rules existed
+    twice and only one copy was executed. It is written as a comparison rather than as two
+    sets of expectations so that it cannot be satisfied by updating one side.
+    """
+    _, factory = case
+    for claimed, suspended in (
+        (TENANT_A, frozenset[str]()),
+        (TENANT_B, frozenset[str]()),
+        (TENANT_A, frozenset({TENANT_A})),
+        (TENANT_B, frozenset({TENANT_A})),
+    ):
+        resolved = factory(suspended=suspended).resolve(tenant_id=claimed, api_key=API_KEY_A)
+        expected = decide(
+            claimed=claimed,
+            owner=TENANT_A,
+            status="suspended" if TENANT_A in suspended else ACTIVE_STATUS,
+        )
+        if isinstance(expected, CredentialAccepted):
+            assert isinstance(resolved, IngestCredential), (claimed, suspended, resolved)
+            assert resolved.tenant_id == expected.tenant_id
+            assert resolved.key_id == expected.key_id
+        else:
+            assert resolved == expected, (claimed, suspended)
 
 
 # ------------------------------------------------------------------------- the harness
@@ -512,3 +724,165 @@ def test_the_credential_lookup_is_one_read_and_never_a_write() -> None:
 
     assert isinstance(source.resolve(tenant_id=TENANT_A, api_key=API_KEY_A), IngestCredential)
     assert sessions.lookups == [KEY_ID_A]
+
+
+# ----------------------------------------------------- one tenant's outage is one tenant's
+
+
+def test_one_tenants_secret_store_outage_is_not_another_tenants_outage() -> None:
+    """Tenant A's signing secret cannot be read; tenant B keeps working, and A gets a 503.
+
+    Three separate claims, and the third is the one #31's review added. The failure is on
+    our side, so it must not be reported as an authentication failure: a 401 tells a
+    customer's form that its key is wrong, and a form told that stops trying — which loses
+    the lead, and invariant 3 says a lead is never silently dropped. It is a 503 with a
+    ``Retry-After``, the one answer that asks the sender to come back.
+
+    Only the Postgres resolver can produce this outcome, because it is the only one with a
+    secret store to lose. That asymmetry is exactly why it needs a test that executes: the
+    in-memory double this suite uses elsewhere holds its secrets in a dict and can never
+    exhibit it.
+    """
+    harness = Harness(source=postgres_credentials(secret_store_down_for=frozenset({TENANT_A})))
+
+    stopped = harness.post(as_tenant=TENANT_A)
+    working = harness.post(as_tenant=TENANT_B, nonce="nonce-isolation-0003")
+
+    assert stopped.status_code == 503
+    assert int(stopped.headers["Retry-After"]) > 0
+    assert stopped.json() != {"detail": "authentication failed"}, (
+        "a dependency outage reported as an auth failure tells a good caller to stop trying"
+    )
+    assert working.status_code == 202
+    assert harness.tenants_written == {TENANT_B}
+
+
+def test_an_outage_is_reported_as_unavailable_and_not_as_a_bad_key() -> None:
+    """The same property one layer down, on the reason rather than on the status code.
+
+    The status code is derived from this value in ``api/main.py``, so pinning the value is
+    what keeps the mapping honest if the handler is ever rewritten.
+    """
+    source = postgres_credentials(secret_store_down_for=frozenset({TENANT_A}))
+
+    refused = source.resolve(tenant_id=TENANT_A, api_key=API_KEY_A)
+    assert isinstance(refused, CredentialRejected)
+    assert refused.failure is AuthFailure.UNAVAILABLE
+
+    assert isinstance(source.resolve(tenant_id=TENANT_B, api_key=API_KEY_B), IngestCredential)
+
+
+def test_an_outage_still_does_not_let_a_key_be_used_under_another_name() -> None:
+    """A degraded dependency must not degrade the tenant check.
+
+    The secret is fetched only after :func:`decide_credential` has accepted, so a
+    cross-tenant attempt during an outage is still ``unknown_tenant`` — the outage never
+    enters the decision, and it cannot be used to tell an existing tenant from a
+    non-existent one either.
+    """
+    source = postgres_credentials(secret_store_down_for=frozenset({TENANT_A, TENANT_B}))
+    lookup = source.resolve(tenant_id=TENANT_B, api_key=API_KEY_A)
+
+    assert isinstance(lookup, CredentialRejected)
+    assert lookup.failure is AuthFailure.UNKNOWN_TENANT
+
+
+# ------------------------------------------------- the throttle is shared, per process
+
+
+class _Allowances:
+    """A :class:`~leadquali.api.ratelimit.TenantRateLimitSource` over a dict, optionally down.
+
+    ``TenantRateLimiter`` keeps two per-process, per-tenant maps — cached allowances and
+    token buckets — which #31's review fixes introduced. Shared mutable state keyed by
+    tenant is exactly the shape a one-character edit turns into a crossover, so the tests
+    below pin the keying rather than trusting it.
+    """
+
+    def __init__(self, limits: Mapping[str, TenantRateLimit], *, down: bool = False) -> None:
+        self.limits = dict(limits)
+        self.down = down
+        self.reads: list[str] = []
+
+    def rate_limit_for(self, tenant_id: str) -> TenantRateLimit | None:
+        """This tenant's allowance, or raise if the source is down."""
+        self.reads.append(tenant_id)
+        if self.down:
+            raise RuntimeError("the tenants table is unreachable")
+        return self.limits.get(tenant_id)
+
+
+def test_each_tenants_token_bucket_is_its_own() -> None:
+    """One tenant spending its whole burst leaves the other's allowance untouched.
+
+    Tenant A is given a bucket of one and spends it; tenant B, with a bucket of five, is
+    unaffected. A limiter that keyed its buckets on anything but the tenant would show up
+    here as B being refused for A's traffic.
+    """
+    limiter = TenantRateLimiter(
+        _Allowances(
+            {
+                TENANT_A: TenantRateLimit(per_minute=60, burst=1),
+                TENANT_B: TenantRateLimit(per_minute=60, burst=5),
+            }
+        )
+    )
+
+    assert limiter.check(tenant_id=TENANT_A, now=NOW).allowed
+    assert not limiter.check(tenant_id=TENANT_A, now=NOW).allowed
+    for _ in range(5):
+        assert limiter.check(tenant_id=TENANT_B, now=NOW).allowed, "A's traffic throttled B"
+
+
+def test_a_limits_outage_falls_back_to_the_default_and_never_to_another_tenant() -> None:
+    """When the allowance source is down, a tenant gets its own last value or the default.
+
+    Never another tenant's. The fallback path caches per tenant like the happy path does,
+    and the failure mode worth ruling out is a single shared "last known limit" that the
+    most recent tenant populates for everybody.
+    """
+    generous = TenantRateLimit(per_minute=6_000, burst=500)
+    source = _Allowances({TENANT_B: generous})
+    limiter = TenantRateLimiter(source, cache_seconds=0)
+
+    # B's generous allowance is read and cached first, then the source falls over.
+    assert limiter.check(tenant_id=TENANT_B, now=NOW).allowed
+    source.down = True
+
+    allowed = 0
+    for offset in range(DEFAULT_TENANT_RATE_LIMIT.burst + 5):
+        if limiter.check(tenant_id=TENANT_A, now=NOW + dt.timedelta(microseconds=offset)).allowed:
+            allowed += 1
+    assert allowed == DEFAULT_TENANT_RATE_LIMIT.burst, (
+        f"tenant A was served an allowance of {allowed}; the default burst is "
+        f"{DEFAULT_TENANT_RATE_LIMIT.burst} and B's is {generous.burst}"
+    )
+
+
+def test_bucket_eviction_can_reset_a_tenants_throttle_and_the_bound_is_explicit() -> None:
+    """A documented limit, pinned so it cannot quietly get worse.
+
+    The bucket map is capped and evicts least-recently-used, so enough traffic from enough
+    other tenants can drop a tenant's bucket and hand it a fresh full one. That is a bound
+    on the throttle's accuracy, not a data leak — nothing of one tenant's is readable by
+    another — but it *is* one tenant's volume affecting another's effective rate limit, so
+    it is recorded here and in docs/tenant-isolation.md rather than left to be discovered.
+
+    The mitigation is that the API Gateway stage throttle, not this, is the security
+    control; this is a fairness measure.
+    """
+    limiter = TenantRateLimiter(
+        _Allowances({TENANT_A: TenantRateLimit(per_minute=60, burst=1)}), max_tenants=2
+    )
+
+    assert limiter.check(tenant_id=TENANT_A, now=NOW).allowed
+    assert not limiter.check(tenant_id=TENANT_A, now=NOW).allowed
+
+    # Two other tenants arrive and push A's bucket out of a map that holds two.
+    for index in range(2):
+        limiter.check(tenant_id=f"noisy-neighbour-{index}", now=NOW)
+
+    assert limiter.check(tenant_id=TENANT_A, now=NOW).allowed, (
+        "this assertion documents the known limit; if eviction stops resetting a bucket, "
+        "that is an improvement and docs/tenant-isolation.md should say so"
+    )

@@ -40,7 +40,7 @@ to remember; `tests/isolation/test_suite_is_collected.py` asserts that the direc
 inside `testpaths`, that nothing filters it back out, and that no workflow narrows its
 `pytest` command line.
 
-**160 of the suite's 186 tests run with no database** — 159 pass and one is skipped, the
+**178 of the suite's 204 tests run with no database** — 177 pass and one is skipped, the
 one covering the single method whose tenant check is a comparison in Python rather than a
 `WHERE` clause, and whose behaviour is asserted elsewhere in the same sweep. **The remaining
 26 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
@@ -86,7 +86,7 @@ taking no tenant — which is exactly the behaviour it exists for.
 
 ### 2. Auth isolation
 
-`tests/isolation/test_auth_isolation.py` (17 tests, no database)
+`tests/isolation/test_auth_isolation.py` (35 tests, no database)
 
 - Tenant A's real, unrevoked API key presented with tenant B's `X-LeadQuali-Tenant` header is
   refused, and refused as `unknown_tenant` so it is indistinguishable on the wire from a key
@@ -102,17 +102,43 @@ taking no tenant — which is exactly the behaviour it exists for.
 - A forged cross-tenant request does not consume the nonce a legitimate request is about to
   use, so one tenant cannot deny another service by guessing nonces.
 
-Every credential test runs against **both** implementations of the credential port: the
-in-memory one used elsewhere in the test suite and `PostgresIngestCredentials`, the one that
-actually runs in production, driven through its real statement against a double of the
-`tenant_api_keys` table. That is a direct response to the review of #31, which found every
-security property proved against the double alone.
+**One decision, in one place.** Since #31's review fixes, every rule about whether a presented
+key may authenticate a request — is the row the claimed tenant's, is the key revoked, has its
+rotation overlap closed, does its secret verify, is the tenant active — lives in
+`decide_credential` in `src/leadquali/app/credentials.py`. It is pure: no database, no secret
+store, no clock of its own. Both resolvers call it once their own `key_id` lookup has produced
+a row. The suite drives it directly and exhaustively, and then asserts that **both**
+resolvers answer exactly what it answers on every input. That is the same trap this whole
+suite exists for, in #31's own words: the rules used to be written twice, once on the path
+production runs and once on the path the offline test suite exercised.
+
+Every credential test still runs against both implementations of the port — the in-memory one
+and `PostgresIngestCredentials`, driven through its real statement against a double of the
+`tenant_api_keys` table — because sharing a decision is not the same as sharing the lookup
+that feeds it.
 
 **Ingest suspension** is in the same module: suspending tenant A stops tenant A's ingest with
 a 403 and leaves tenant B's working with a 202, asserted in one test so that a change which
-broke the endpoint for everybody could not pass. A suspended tenant's key still cannot be
-used under another tenant's name — the ownership check runs before the status check, so the
-403 cannot be used as an oracle either.
+broke the endpoint for everybody could not pass. Two orderings matter here and both are
+tested. The **ownership check runs first**, so a suspended tenant's key presented under
+another tenant's name is an `unknown_tenant`, not a `tenant_suspended` — the 403 cannot be
+used to ask whether an account you do not hold a key for has been suspended. And the **status
+check runs after the secret is verified**, which costs an argon2 verification a cheaper
+ordering would avoid. That is deliberate: `403 "tenant is not active"` is the one answer this
+endpoint gives that is not identical to every other rejection, so it must be reachable only
+by a caller who has proved it holds the secret. An API key travels in a header, in the clear,
+on every submission; checking status first would let anyone who had ever seen one discover
+that the account had been suspended for non-payment. A suspended tenant presenting a *wrong*
+secret is told its key is bad, and the suite asserts exactly that.
+
+**A dependency outage is not an authentication failure.** If a tenant's signing secret cannot
+be read — Secrets Manager throttling, a network blip — the answer is `AuthFailure.UNAVAILABLE`,
+which becomes a **503 with a `Retry-After`**, not a 401 and not a 500. The caller has already
+proved it holds a live key, and a browser form told that its key is bad does not retry: the
+lead would be gone, which invariant 3 forbids. The isolation claim on top of that is tested
+too — one tenant's secret store being down leaves the other tenant posting leads normally,
+and an outage still does not let a key be used under another tenant's name, because the
+secret is fetched only *after* the decision has accepted.
 
 **Result: pass.**
 
@@ -211,8 +237,8 @@ A decision rather than a test. See [the next section](#row-level-security-the-de
 
 ## The documented exceptions
 
-Three places do not filter on a tenant. Each is enforced as an exception by the sweep — the
-tests fail if one of them quietly changes shape — rather than merely tolerated.
+Four methods do not carry a tenant predicate. Each is enforced as an exception by the sweep —
+the tests fail if one of them quietly changes shape — rather than merely tolerated.
 
 **`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`.** Reconciling our
 usage against Anthropic's invoice, and allocating shared infrastructure cost, are questions
@@ -235,14 +261,22 @@ has to go.**
 operator running `tenantctl`. It is on no request path and must never be reachable from an
 authenticated tenant context.
 
-**`PostgresIngestCredentials._touch`.** Stamps `tenant_api_keys.last_used_at`, filtered on
-`key_id` alone. Safe for two reasons that are asserted rather than assumed: `key_id` is
-globally unique (`uq_tenant_api_keys_key_id`), and the write happens *after* the credential
-decision, so the owning tenant is already established. The same module's `resolve` is the one
-method whose tenant check is a comparison in Python rather than a `WHERE` clause — the lookup
-is by `key_id`, which is what makes argon2 affordable on the request path — so the sweep
-asserts its *behaviour* instead: a real key presented under another tenant's name is refused,
-as `unknown_tenant`, and the signing secret is never fetched.
+**`PostgresIngestCredentials.resolve`.** The one method whose tenant check is a comparison in
+Python rather than a `WHERE` clause. Its single indexed read is by `key_id` — which is what
+makes argon2 affordable on the request path, since a stranger who does not hold a real
+`key_id` can never make us spend the KDF — and the row it finds carries the owning tenant's
+slug, which `decide_credential` then compares. So the sweep asserts its *behaviour* instead
+of its SQL: a real key presented under another tenant's name is refused, as `unknown_tenant`,
+and the signing secret is never fetched.
+
+This is the *only* place in the codebase where a tenant check is not a predicate. In
+particular `PostgresIngestCredentials._touch`, the `last_used_at` stamp, **is** tenant-scoped:
+its `UPDATE` filters on the tenant as well as on the globally unique `key_id`, redundantly
+against both the index and the row the same call has just read. An earlier version of this
+document listed it as a third exception on the grounds that it was provably safe; #31's
+review closed it, on the grounds that an exception is what a later reader copies.
+`tests/isolation/test_repository_isolation.py::test_the_last_used_write_is_tenant_scoped_like_every_other_write`
+holds it to that, and would have failed if the fix had not landed.
 
 ---
 
@@ -297,7 +331,7 @@ change was reverted. It was **not** committed.
                      RoutingEvent.dispatched_at.is_not(None),
 ```
 
-**The rest of the test suite stayed completely green: 1950 passed, 192 skipped.** That is the
+**The rest of the test suite stayed completely green: 1989 passed, 197 skipped.** That is the
 point of this exercise. Removing a cross-tenant filter from the code that runs in production
 was, until this suite existed, invisible.
 
@@ -317,7 +351,7 @@ and writes no tenant column.
 Every statement is filtered on the tenant, including the ones where the key is unique
 anyway (CLAUDE.md invariant 4).
 
-1 failed, 158 passed, 27 skipped
+1 failed, 176 passed, 27 skipped
 ```
 
 A second, subtler mutation was run and reverted the same way: the predicate was left in place
@@ -385,17 +419,26 @@ also separates the invoice.
 
 ### Shared replay guard and rate limiter, per process
 
-The nonce replay guard and the fixed-window rate limiter are in-process structures. Behind
-several concurrent Lambda instances, both are per-instance: a replayed request can land on a
-different instance inside the signing window, and a tenant's effective rate limit is the
-configured limit times the number of warm instances.
+The nonce replay guard and the per-tenant token-bucket rate limiter are in-process
+structures. Behind several concurrent Lambda instances, both are per-instance: a replayed
+request can land on a different instance inside the signing window, and a tenant's effective
+rate limit is the configured limit times the number of warm instances.
+
+The limiter holds two per-process maps keyed by tenant — cached allowances and token buckets
+— and **both are capped and evict the least recently used tenant**. So enough traffic from
+enough other tenants can drop a tenant's bucket and hand it a fresh full one. That is one
+tenant's volume affecting another's effective throttle. It is not a data leak: nothing of one
+tenant's is readable by another, and the tests pin the keying — one tenant spending its whole
+burst leaves the other's untouched, and a failure of the allowance source falls back to *the
+default*, never to whichever tenant's limit was read most recently.
 
 *Mitigation:* for replay, the ingest handler's own `(tenant_id, submission_id)` idempotency
 means a replayed body creates no second lead and no second enqueue, and the stage-level
 throttle caps how fast anyone can try. For rate limiting, the account-wide API Gateway
 throttle is the real backstop; the per-tenant limiter is a fairness measure, not a security
-control, and is documented as such. Neither is a cross-tenant leak — the guard is keyed by
-`(tenant_id, nonce)` and the limiter by tenant — but neither is as strong as it looks.
+control, and is documented as such. Eviction failing open — granting a fresh bucket rather
+than refusing — is the right direction for invariant 3, since the alternative is dropping a
+paying customer's lead to protect a fairness measure.
 
 *A dedicated tier would change:* nothing here by itself. Closing these properly means a
 shared nonce and counter store (Redis or DynamoDB), which is a change for every tier.
@@ -433,7 +476,7 @@ issue #29's per-rep identity work and a product decision rather than an infrastr
 ## Reproducing this
 
 ```bash
-pytest tests/isolation                 # 159 passed, 27 skipped, no database needed
+pytest tests/isolation                 # 177 passed, 27 skipped, no database needed
 docker compose up -d                   # see docs/local-database.md
 export DATABASE_URL=...
 pytest tests/isolation -m integration   # the 26 that need PostgreSQL
