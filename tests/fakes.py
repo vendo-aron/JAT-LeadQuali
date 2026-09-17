@@ -16,7 +16,8 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from leadquali.app.assessment_result import (
@@ -26,6 +27,14 @@ from leadquali.app.assessment_result import (
 )
 from leadquali.app.enrichment import Enrichment
 from leadquali.app.feedback import UnknownLeadError, Verdict
+from leadquali.app.metering import (
+    BillingPeriod,
+    DailySpend,
+    MeteringError,
+    TenantQuota,
+    UsageTotals,
+    is_billable,
+)
 from leadquali.app.ports import RecordedFeedback, RoutingOutcome, StoredLead
 from leadquali.app.tenant_ids import tenant_id_for
 from leadquali.app.tenants import (
@@ -566,3 +575,229 @@ def tenant_row(slug: str, **overrides: Any) -> TenantRecord:
     }
     values.update(overrides)
     return TenantRecord(**values)
+
+
+# ------------------------------------------------------------------------------ metering
+
+
+@dataclass(frozen=True, slots=True)
+class MeteredLead:
+    """One row of ``leads``, reduced to what the meter counts."""
+
+    tenant_id: str
+    received_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MeteredAssessment:
+    """One row of ``assessments``, reduced to what the meter counts."""
+
+    tenant_id: str
+    created_at: datetime
+    lead_id: str
+    """Which lead this attempt was made on. Several attempts can share one — a dispatch
+    failure re-raises and SQS redelivers — and that is exactly what ``leads_billable``
+    has to collapse, so the double has to be able to express it."""
+
+    status: str = "ok"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cost_usd: Decimal = Decimal(0)
+
+
+class InMemoryMeteringStore:
+    """A :class:`~leadquali.app.metering.MeteringStorePort` over three lists.
+
+    It is a real rollup, not a canned answer: :meth:`rollup_day` recomputes the day from
+    the seeded leads and assessments and *replaces* the stored row, exactly as the SQL
+    does, and :meth:`usage_for_period` reads only the stored rows. That is what lets the
+    unit tests exercise the properties that matter — the three counts diverging, the
+    rollup being idempotent, a period reading back what was rolled up — without a
+    database, while ``tests/integration/test_metering_postgres.py`` proves the SQL agrees.
+
+    The billing rule itself is imported rather than restated: this double and the adapter
+    both answer to :func:`~leadquali.app.metering.is_billable`.
+    """
+
+    def __init__(self, *, quotas: Mapping[str, TenantQuota] | None = None) -> None:
+        self.leads: list[MeteredLead] = []
+        self.assessments: list[MeteredAssessment] = []
+        #: The ``usage_daily`` table: ``(tenant_id, day) -> row``.
+        self.rows: dict[tuple[str, date], UsageTotals] = {}
+        #: Every ``rollup_day`` call, in order, so a test can prove how many were made.
+        self.rollups: list[tuple[str, date]] = []
+        #: Every ``compute_day`` call — the live read the quota check makes.
+        self.computed: list[tuple[str, date]] = []
+        self.quotas = dict(quotas or {})
+        self._computed_at = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
+        self._attempts = 0
+
+    # ------------------------------------------------------------------------ seeding
+
+    def add_lead(self, *, tenant_id: str, received_at: datetime) -> None:
+        """Record a submission, as ingest would."""
+        self.leads.append(MeteredLead(tenant_id=tenant_id, received_at=received_at))
+
+    def add_assessment(
+        self, *, tenant_id: str, created_at: datetime, lead_id: str | None = None, **values: Any
+    ) -> None:
+        """Record an assessment attempt, as the worker would.
+
+        ``lead_id`` defaults to a fresh one, so a test that does not care reads as "one
+        attempt, one lead". Pass the same id twice to model a redelivery.
+        """
+        self._attempts += 1
+        self.assessments.append(
+            MeteredAssessment(
+                tenant_id=tenant_id,
+                created_at=created_at,
+                lead_id=lead_id if lead_id is not None else f"lead-{self._attempts}",
+                **values,
+            )
+        )
+
+    def given_quota(self, quota: TenantQuota) -> None:
+        """Seed a tenant's plan directly, the way a ``tenants`` row would already have one.
+
+        Distinct from :meth:`set_quota`, which is the port method under test and refuses a
+        tenant it has never heard of.
+        """
+        self.quotas[quota.tenant_id] = quota
+
+    # -------------------------------------------------------------------------- port
+
+    def rollup_day(self, *, tenant_id: str, day: date) -> UsageTotals:
+        self.rollups.append((tenant_id, day))
+        totals = self.compute_day(tenant_id=tenant_id, day=day)
+        # A replacement, never an increment — the property the real upsert exists for.
+        self.rows[(tenant_id, day)] = totals
+        return totals
+
+    def compute_day(self, *, tenant_id: str, day: date) -> UsageTotals:
+        self.computed.append((tenant_id, day))
+        leads = [
+            lead
+            for lead in self.leads
+            if lead.tenant_id == tenant_id and lead.received_at.date() == day
+        ]
+        assessed = [
+            row
+            for row in self.assessments
+            if row.tenant_id == tenant_id and row.created_at.date() == day
+        ]
+        totals = UsageTotals(
+            tenant_id=tenant_id,
+            period=BillingPeriod.of_day(day),
+            leads_ingested=len(leads),
+            leads_assessed=len(assessed),
+            # Distinct leads, not attempts: one lead redelivered three times after a
+            # dispatch failure is one billable lead. The token sums below still count
+            # every attempt, because we paid for every attempt.
+            leads_billable=len(
+                {row.lead_id for row in assessed if is_billable(input_tokens=row.input_tokens)}
+            ),
+            assessments_failed=sum(1 for row in assessed if row.status == "failed"),
+            input_tokens=sum(row.input_tokens for row in assessed),
+            output_tokens=sum(row.output_tokens for row in assessed),
+            cache_read_tokens=sum(row.cache_read_tokens for row in assessed),
+            cache_creation_tokens=sum(row.cache_creation_tokens for row in assessed),
+            cost_usd=sum((row.cost_usd for row in assessed), Decimal(0)),
+            computed_at=self._computed_at,
+        )
+        return totals
+
+    def usage_for_period(self, *, tenant_id: str, period: BillingPeriod) -> UsageTotals:
+        rows = self.daily_usage(tenant_id=tenant_id, period=period)
+        stamps = [row.computed_at for row in rows if row.computed_at is not None]
+        return UsageTotals(
+            tenant_id=tenant_id,
+            period=period,
+            leads_ingested=sum(row.leads_ingested for row in rows),
+            leads_assessed=sum(row.leads_assessed for row in rows),
+            leads_billable=sum(row.leads_billable for row in rows),
+            assessments_failed=sum(row.assessments_failed for row in rows),
+            input_tokens=sum(row.input_tokens for row in rows),
+            output_tokens=sum(row.output_tokens for row in rows),
+            cache_read_tokens=sum(row.cache_read_tokens for row in rows),
+            cache_creation_tokens=sum(row.cache_creation_tokens for row in rows),
+            cost_usd=sum((row.cost_usd for row in rows), Decimal(0)),
+            computed_at=max(stamps) if stamps else None,
+        )
+
+    def daily_usage(self, *, tenant_id: str, period: BillingPeriod) -> Sequence[UsageTotals]:
+        return [
+            self.rows[(tenant_id, day)] for day in period.dates() if (tenant_id, day) in self.rows
+        ]
+
+    def quota_for(self, *, tenant_id: str) -> TenantQuota:
+        quota = self.quotas.get(tenant_id)
+        if quota is None:
+            raise MeteringError(f"no tenant '{tenant_id}'")
+        return quota
+
+    def set_quota(
+        self, *, tenant_id: str, monthly_lead_quota: int | None, alert_fraction: Decimal
+    ) -> TenantQuota:
+        if tenant_id not in self.quotas and tenant_id not in {stored for stored, _ in self.rows}:
+            # The real store finds the tenant row; here, a tenant is one that has either a
+            # quota or some usage, which is as much identity as this double has.
+            raise MeteringError(f"no tenant '{tenant_id}'")
+        quota = TenantQuota(
+            tenant_id=tenant_id,
+            monthly_lead_quota=monthly_lead_quota,
+            alert_fraction=alert_fraction,
+        )
+        self.quotas[tenant_id] = quota
+        return quota
+
+    def fleet_tenants_with_quota(self) -> Sequence[str]:
+        return sorted(
+            tenant_id
+            for tenant_id, quota in self.quotas.items()
+            if quota.monthly_lead_quota is not None
+        )
+
+    def fleet_billable_leads(self, *, period: BillingPeriod) -> Mapping[str, int]:
+        totals: dict[str, int] = {}
+        for (tenant_id, day), row in self.rows.items():
+            if period.contains(day):
+                totals[tenant_id] = totals.get(tenant_id, 0) + row.leads_billable
+        return totals
+
+    def fleet_daily_spend(self, *, period: BillingPeriod) -> Sequence[DailySpend]:
+        by_day: dict[date, DailySpend] = {}
+        for (_, day), row in sorted(self.rows.items()):
+            if not period.contains(day):
+                continue
+            running = by_day.get(day)
+            by_day[day] = DailySpend(
+                usage_date=day,
+                input_tokens=row.input_tokens + (running.input_tokens if running else 0),
+                output_tokens=row.output_tokens + (running.output_tokens if running else 0),
+                cache_read_tokens=(
+                    row.cache_read_tokens + (running.cache_read_tokens if running else 0)
+                ),
+                cache_creation_tokens=(
+                    row.cache_creation_tokens + (running.cache_creation_tokens if running else 0)
+                ),
+                cost_usd=row.cost_usd + (running.cost_usd if running else Decimal(0)),
+            )
+        return [by_day[day] for day in sorted(by_day)]
+
+
+class StaticRevenue:
+    """A :class:`~leadquali.app.metering.RevenuePort` that answers from a dict.
+
+    ``None`` for a tenant it has never heard of, which is the same answer
+    :class:`~leadquali.adapters.revenue_none.UnknownRevenue` gives for everyone — so a
+    test can cover both branches of the margin arithmetic with one double.
+    """
+
+    def __init__(self, amounts: Mapping[str, Decimal] | None = None) -> None:
+        self.amounts = dict(amounts or {})
+
+    def revenue_usd(self, *, tenant_id: str, period: BillingPeriod) -> Decimal | None:
+        del period
+        return self.amounts.get(tenant_id)

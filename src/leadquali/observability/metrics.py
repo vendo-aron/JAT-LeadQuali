@@ -126,6 +126,30 @@ INGESTED_LEADS: Final[str] = "IngestedLeads"
 #: Submissions the deterministic pre-filters stopped before any model call, by filter.
 INGEST_SUPPRESSIONS: Final[str] = "IngestSuppressions"
 
+#: Billable leads a tenant has used against its monthly plan so far (#33). Published only
+#: when a quota is crossed, not per lead: it is a metering figure produced by
+#: ``usagectl quota``, and publishing it on the request path would put a per-tenant gauge
+#: on the hot path to answer a question that is asked daily at most. Nothing in
+#: ``infra/template.yaml`` schedules that command yet — see ``docs/observability.md``.
+QUOTA_USED_LEADS: Final[str] = "QuotaUsedLeads"
+
+#: How much of the plan that is, as a fraction. ``Unit.NONE`` for the same reason
+#: :data:`COST_USD` is: it is a ratio, and labelling it ``Count`` makes a dashboard read
+#: "800 milli".
+QUOTA_FRACTION: Final[str] = "QuotaFraction"
+
+#: ``1`` when a tenant is past its plan, ``0`` when it is merely near it. A commercial
+#: signal, never a technical one: nothing in the system refuses a lead because of it.
+#:
+#: Published under ``[TenantId]`` like everything else here, and #29's alarm set
+#: deliberately does **not** grow an alarm for it — one alarm per customer does not scale.
+#: Note what that means in practice: because the only dimension set carries the tenant,
+#: CloudWatch has no dimensionless total to alarm on either, so this metric is a
+#: dashboard and Logs Insights signal rather than an alarm source. The thing that tells
+#: somebody is ``usagectl quota --all`` and the ``tenant.quota_crossed`` log events it
+#: emits, which is what ``docs/metering-and-billing.md`` prescribes.
+QUOTA_EXCEEDED: Final[str] = "QuotaExceeded"
+
 
 class Unit(StrEnum):
     """The CloudWatch units this system uses. Not the full list — the full list is noise.
@@ -283,6 +307,9 @@ __all__ = [
     "MODEL_LATENCY_MS",
     "OUTPUT_TOKENS",
     "PIPELINE_LATENCY_MS",
+    "QUOTA_EXCEEDED",
+    "QUOTA_FRACTION",
+    "QUOTA_USED_LEADS",
     "SUPPRESSIONS",
     "Metric",
     "MetricPayload",

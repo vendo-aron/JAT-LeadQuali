@@ -32,6 +32,7 @@ EXPECTED_TABLES = {
     "assessments",
     "routing_events",
     "feedback",
+    "usage_daily",
 }
 
 LEAD_CHILD_TABLES = {"assessments", "routing_events", "feedback"}

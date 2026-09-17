@@ -54,6 +54,9 @@ from leadquali.observability.metrics import (
     MODEL_LATENCY_MS,
     OUTPUT_TOKENS,
     PIPELINE_LATENCY_MS,
+    QUOTA_EXCEEDED,
+    QUOTA_FRACTION,
+    QUOTA_USED_LEADS,
     SUPPRESSIONS,
     Metric,
     MetricPayload,
@@ -81,6 +84,10 @@ EVENT_LEAD_DUPLICATE: Final[str] = "lead.duplicate"
 
 #: Dispatch raised. The lead is still on the queue and will be retried.
 EVENT_DISPATCH_FAILED: Final[str] = "lead.dispatch_failed"
+
+#: A tenant passed its plan's alert fraction, or its plan. A commercial event: it is the
+#: prompt for somebody to talk to the customer, and nothing anywhere acts on it.
+EVENT_QUOTA_CROSSED: Final[str] = "tenant.quota_crossed"
 
 
 class SuppressionCause(StrEnum):
@@ -348,6 +355,52 @@ def log_dispatch_failed(
     )
 
 
+def log_quota_crossed(
+    logger: logging.Logger,
+    *,
+    tenant_id: str,
+    period: str,
+    used: int,
+    quota: int,
+    fraction: Decimal,
+    level: str,
+) -> None:
+    """A tenant crossed its alert fraction or its plan (#33).
+
+    Takes plain numbers rather than a ``QuotaStatus`` so that this package keeps depending
+    on nothing above it: ``leadquali.app.metering`` calls this, and a signature naming its
+    types would make the import graph ``app`` -> ``observability`` -> ``app``.
+
+    Logged at WARNING and not at ERROR, in both states. Being over a plan is a billing
+    conversation, not an incident: nothing is broken, no lead was dropped, and paging
+    somebody at 3am about a customer who is doing well is how a level stops being read.
+    """
+    log_event(
+        logger,
+        EVENT_QUOTA_CROSSED,
+        level=logging.WARNING,
+        tenant_id=tenant_id,
+        period=period,
+        quota_level=level,
+        leads_billable=used,
+        monthly_lead_quota=quota,
+        quota_fraction=fraction,
+        metrics=MetricPayload(
+            dimensions={DIM_TENANT: tenant_id},
+            metric_sets=(
+                MetricSet(
+                    (DIM_TENANT,),
+                    (
+                        Metric(QUOTA_USED_LEADS, used),
+                        Metric(QUOTA_FRACTION, fraction, Unit.NONE),
+                        Metric(QUOTA_EXCEEDED, 1 if used > quota else 0),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
 def _metering_fields(metering: CallMetering | None) -> dict[str, str | int | Decimal | None]:
     """The metering, flattened into log fields under the names the plan uses."""
     if metering is None:
@@ -372,6 +425,7 @@ __all__ = [
     "EVENT_LEAD_DUPLICATE",
     "EVENT_LEAD_ROUTED",
     "EVENT_LEAD_SUPPRESSED",
+    "EVENT_QUOTA_CROSSED",
     "SuppressionCause",
     "log_assessment",
     "log_dispatch_failed",
@@ -379,5 +433,6 @@ __all__ = [
     "log_lead_duplicate",
     "log_lead_routed",
     "log_lead_suppressed",
+    "log_quota_crossed",
     "suppression_cause",
 ]

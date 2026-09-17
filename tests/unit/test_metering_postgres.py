@@ -1,0 +1,501 @@
+"""The metering adapter's offline half: is the SQL well-formed, and does it say the rule?
+
+Docker is not available in every environment this suite runs in, so
+``tests/integration/test_metering_postgres.py`` skips and this file carries the weight of
+"the statements are at least correct SQL". Every statement is compiled against the real
+``postgresql`` dialect — which catches a construct SQLAlchemy cannot render for Postgres,
+a column that does not exist and an ``ON CONFLICT`` target that is not a constraint — and
+then read back as text to check the three things the money depends on:
+
+* every tenant-scoped statement carries a tenant predicate (invariant 4),
+* the rollup is a full ``ON CONFLICT DO UPDATE`` replacement rather than an increment,
+* the billable filter is ``input_tokens > 0``, the same rule
+  :func:`~leadquali.app.metering.is_billable` states in Python.
+
+The behavioural half — that Postgres accepts these rows and that the sums are right — is
+the integration file.
+"""
+
+from __future__ import annotations
+
+import ast
+import datetime as dt
+import inspect
+import re
+from collections.abc import Iterator
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+from sqlalchemy import ClauseElement, Row
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine.result import IteratorResult, SimpleResultMetaData
+from sqlalchemy.orm import Session, sessionmaker
+
+from leadquali.adapters import metering_postgres
+from leadquali.adapters.metering_postgres import PostgresMeteringStore, _day_bounds
+from leadquali.app.metering import BillingPeriod, MeteringStorePort
+
+MODULE_PATH = Path(metering_postgres.__file__)
+
+TENANT = "acme"
+DAY = dt.date(2026, 9, 3)
+SEPTEMBER = BillingPeriod.of_month(2026, 9)
+
+
+class CapturedStatementError(Exception):
+    """Carries the statement a method built, instead of executing it."""
+
+    def __init__(self, statement: ClauseElement) -> None:
+        super().__init__("captured")
+        self.statement = statement
+
+
+class CapturingSession:
+    """A session that records the statement it is given and refuses to run it.
+
+    The adapter builds its statement, opens a session and executes — so the only way to
+    get at the SQL without a server is to let it do all three and intercept the last. That
+    also means these tests exercise the real code path rather than a copy of it.
+    """
+
+    def execute(self, statement: ClauseElement, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise CapturedStatementError(statement)
+
+    def __enter__(self) -> CapturingSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class ScriptedSession:
+    """A session that answers with one canned row, labelled as the statement labels it.
+
+    The values are supplied by name, so the row is built from *the statement's own*
+    labels — which is what makes a mapper reading the wrong name, or the right name in the
+    wrong position, fail here instead of passing quietly.
+    """
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self.values = values
+
+    def execute(self, statement: ClauseElement, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        labels = [str(column.key) for column in statement.selected_columns]  # type: ignore[attr-defined]  # a Select, by construction
+        metadata = SimpleResultMetaData(tuple(labels))
+        return IteratorResult(metadata, iter([tuple(self.values[label] for label in labels)]))
+
+    def __enter__(self) -> ScriptedSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class ScriptedSessions(sessionmaker[Session]):
+    """A ``sessionmaker`` whose ``begin()`` yields a :class:`ScriptedSession`."""
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        super().__init__()
+        self.values = values
+
+    def begin(self) -> Any:
+        """Hand out the scripted session instead of a real one."""
+        return ScriptedSession(self.values)
+
+
+class CapturingSessions(sessionmaker[Session]):
+    """A ``sessionmaker`` whose ``begin()`` yields the capturing session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def begin(self) -> Any:
+        """Hand out the capturing session instead of a real one."""
+        return CapturingSession()
+
+
+def capture(call: Any) -> ClauseElement:
+    """Run ``call`` and return the statement it tried to execute."""
+    try:
+        call()
+    except CapturedStatementError as captured:
+        return captured.statement
+    raise AssertionError("the method executed nothing")
+
+
+#: The dialect every statement here is compiled against. Built once because SQLAlchemy's
+#: dialect constructor carries no annotations of its own, so the ignore belongs in one
+#: place rather than on every call site.
+PG_DIALECT = postgresql.dialect()  # type: ignore[no-untyped-call]  # untyped in SQLAlchemy
+
+
+def sql_for(call: Any) -> str:
+    """The Postgres SQL one method emits, compiled and lowercased."""
+    return str(capture(call).compile(dialect=PG_DIALECT)).lower()
+
+
+@pytest.fixture
+def store() -> Iterator[PostgresMeteringStore]:
+    yield PostgresMeteringStore(CapturingSessions())
+
+
+# ------------------------------------------------------------------- the day boundary
+
+
+def test_a_day_is_the_utc_calendar_day() -> None:
+    start, end = _day_bounds(DAY)
+    assert start == dt.datetime(2026, 9, 3, tzinfo=dt.UTC)
+    assert end == dt.datetime(2026, 9, 4, tzinfo=dt.UTC)
+
+
+def test_the_day_range_is_half_open() -> None:
+    """Midnight belongs to the day that starts, not to the one that ends — otherwise a
+    lead at exactly 00:00:00 is billed twice or not at all."""
+    _, end = _day_bounds(DAY)
+    next_start, _ = _day_bounds(DAY + dt.timedelta(days=1))
+    assert end == next_start
+
+
+# --------------------------------------------------------------------------- the SQL
+
+
+def test_the_rollup_compiles_against_postgres(store: PostgresMeteringStore) -> None:
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "insert into usage_daily" in sql
+    assert "from assessments" in sql
+    assert "from leads" in sql
+
+
+def test_the_rollup_replaces_the_whole_row_rather_than_incrementing(
+    store: PostgresMeteringStore,
+) -> None:
+    """The idempotency guarantee, read off the SQL: every counter is set to the freshly
+    computed ``excluded`` value, and nothing anywhere adds to what is already stored."""
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "on conflict (tenant_id, usage_date) do update set" in sql
+    for column in (
+        "leads_ingested",
+        "leads_assessed",
+        "leads_billable",
+        "assessments_failed",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "cost_usd",
+        "computed_at",
+    ):
+        assert f"{column} = excluded.{column}" in sql
+    assert "usage_daily.leads_billable +" not in sql
+    assert "+ excluded" not in sql
+
+
+def test_the_rollup_returns_the_row_it_wrote(store: PostgresMeteringStore) -> None:
+    """``RETURNING`` rather than trusting the values sent: a CHECK constraint or a type
+    coercion must not be able to make the reported totals disagree with the stored ones."""
+    assert "returning usage_daily.tenant_id" in sql_for(
+        lambda: store.rollup_day(tenant_id=TENANT, day=DAY)
+    )
+
+
+def test_the_billable_filter_is_the_documented_rule(store: PostgresMeteringStore) -> None:
+    """``input_tokens > 0``, the SQL half of
+    :func:`~leadquali.app.metering.is_billable`. If these two ever disagree, a customer is
+    charged for something the documentation says is free."""
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "filter (where assessments.input_tokens > " in sql
+
+
+def test_billable_leads_are_counted_distinctly(store: PostgresMeteringStore) -> None:
+    """A dispatch failure re-raises, SQS redelivers and a second assessment row is written
+    for the same lead. Counting rows would bill the customer three times for our own SES
+    outage; the token and cost sums deliberately stay over every attempt, because we were
+    charged for every attempt."""
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "count(distinct assessments.lead_id) filter (where assessments.input_tokens > " in sql
+    assert "sum(assessments.input_tokens)" in sql
+    assert "distinct assessments.input_tokens" not in sql
+
+
+def test_a_failed_assessment_is_counted_by_status(store: PostgresMeteringStore) -> None:
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "count(*) filter (where assessments.status = " in sql
+
+
+def test_leads_are_counted_by_when_they_arrived(store: PostgresMeteringStore) -> None:
+    """``received_at``, not ``created_at``: a customer's "leads on 3 September" means the
+    ones they sent that day, not the ones a retried worker happened to write that day."""
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "leads.received_at >=" in sql
+    assert "leads.created_at" not in sql
+
+
+def test_the_day_predicate_is_a_range_and_not_a_function_on_the_column(
+    store: PostgresMeteringStore,
+) -> None:
+    """``date_trunc(created_at)`` would be the same days and could not use
+    ``ix_assessments_tenant_id_created_at``; a range over the column can."""
+    sql = sql_for(lambda: store.rollup_day(tenant_id=TENANT, day=DAY))
+    assert "date_trunc" not in sql
+    assert "assessments.created_at >=" in sql
+    assert "assessments.created_at <" in sql
+    # `<=` contains `<`, so the assertion above passes for both. Spelled out negatively
+    # because the difference is a row stamped exactly midnight being billed in two days,
+    # for ever, with nothing anywhere to notice.
+    assert "assessments.created_at <=" not in sql
+    assert "leads.received_at <=" not in sql
+    assert "leads.received_at <" in sql
+
+
+def test_reading_a_period_never_touches_the_assessments_table(
+    store: PostgresMeteringStore,
+) -> None:
+    """The whole reason ``usage_daily`` exists, asserted rather than assumed: a billing
+    read costs the same in month one and in year three."""
+    sql = sql_for(lambda: store.usage_for_period(tenant_id=TENANT, period=SEPTEMBER))
+    # The only table named anywhere in the statement, FROM or JOIN, is the rollup. The
+    # string "assessments" still appears, as the column `assessments_failed` — which is
+    # why this checks the tables rather than searching for the word.
+    assert re.findall(r"(?:from|join)\s+(\w+)", sql) == ["usage_daily"]
+
+
+def test_reading_a_period_sums_every_column_once(store: PostgresMeteringStore) -> None:
+    sql = sql_for(lambda: store.usage_for_period(tenant_id=TENANT, period=SEPTEMBER))
+    for column in ("leads_billable", "input_tokens", "cost_usd"):
+        assert f"sum(usage_daily.{column})" in sql
+    assert "max(usage_daily.computed_at)" in sql
+
+
+def test_the_daily_listing_is_ordered_by_day(store: PostgresMeteringStore) -> None:
+    sql = sql_for(lambda: store.daily_usage(tenant_id=TENANT, period=SEPTEMBER))
+    assert "order by usage_daily.usage_date" in sql
+
+
+def test_writing_a_quota_touches_one_tenant_and_stamps_it(
+    store: PostgresMeteringStore,
+) -> None:
+    """A plan change is an administrative write like any other, and "when did this
+    customer's plan change?" is the first question after a surprising invoice."""
+    sql = sql_for(
+        lambda: store.set_quota(
+            tenant_id=TENANT, monthly_lead_quota=100, alert_fraction=Decimal("0.80")
+        )
+    )
+    assert "update tenants set" in sql
+    assert "monthly_lead_quota=" in sql
+    assert "quota_alert_fraction=" in sql
+    assert "updated_at=now()" in sql
+    assert "where tenants.id = " in sql
+
+
+def test_the_quota_read_is_one_row_of_the_tenants_table(store: PostgresMeteringStore) -> None:
+    sql = sql_for(lambda: store.quota_for(tenant_id=TENANT))
+    assert "tenants.monthly_lead_quota" in sql
+    assert "tenants.quota_alert_fraction" in sql
+    assert "tenants.id = " in sql
+
+
+def test_the_fleet_allocation_groups_by_tenant(store: PostgresMeteringStore) -> None:
+    """Fleet-wide, and keyed by slug: a total with no tenant attached to it is exactly
+    what the tenant-scoping rule exists to prevent, so the fleet queries return the
+    breakdown rather than the sum."""
+    sql = sql_for(lambda: store.fleet_billable_leads(period=SEPTEMBER))
+    assert "group by tenants.slug" in sql
+    assert "join tenants" in sql
+
+
+def test_the_fleet_spend_groups_by_day(store: PostgresMeteringStore) -> None:
+    sql = sql_for(lambda: store.fleet_daily_spend(period=SEPTEMBER))
+    assert "group by usage_daily.usage_date" in sql
+    assert "sum(usage_daily.cost_usd)" in sql
+
+
+# ------------------------------------------------------------------- result mapping
+
+
+#: A row where every number is distinguishable from every other, so a mapper that reads
+#: the wrong column produces a visibly wrong value rather than a plausible one.
+DISTINCT_VALUES: dict[str, Any] = {
+    "usage_date": DAY,
+    "leads_ingested": 11,
+    "leads_assessed": 22,
+    "leads_billable": 33,
+    "assessments_failed": 44,
+    "input_tokens": 55,
+    "output_tokens": 66,
+    "cache_read_tokens": 77,
+    "cache_creation_tokens": 88,
+    "cost_usd": Decimal("99.000001"),
+    "computed_at": dt.datetime(2026, 10, 1, 6, 0, tzinfo=dt.UTC),
+}
+
+
+def row_of(values: dict[str, Any]) -> Row[Any]:
+    """A real SQLAlchemy ``Row`` with these labels, as a query would produce."""
+    metadata = SimpleResultMetaData(tuple(values))
+    return IteratorResult(metadata, iter([tuple(values.values())])).one()
+
+
+def test_a_rollup_row_maps_onto_every_field_by_name() -> None:
+    """The ten-column mapping, asserted field by field.
+
+    Positional mapping is one edit away from reading money out of the ``input_tokens``
+    slot — a $0.05 day rendered as a $4,200 invoice line — and no constraint, type checker
+    or other test in this suite would notice. This is the test that does.
+    """
+    totals = PostgresMeteringStore._totals_from_row(tenant_id=TENANT, row=row_of(DISTINCT_VALUES))
+
+    assert totals.tenant_id == TENANT
+    assert totals.period == BillingPeriod.of_day(DAY)
+    assert totals.leads_ingested == 11
+    assert totals.leads_assessed == 22
+    assert totals.leads_billable == 33
+    assert totals.assessments_failed == 44
+    assert totals.input_tokens == 55
+    assert totals.output_tokens == 66
+    assert totals.cache_read_tokens == 77
+    assert totals.cache_creation_tokens == 88
+    assert totals.cost_usd == Decimal("99.000001")
+    assert totals.computed_at == DISTINCT_VALUES["computed_at"]
+
+
+def test_the_period_read_maps_its_aggregate_by_name_too() -> None:
+    """The acceptance-criterion query, end to end against a canned result.
+
+    The values are keyed by the label the statement itself declares, so this fails if the
+    ``select()`` and the mapper ever disagree about which aggregate is which — including
+    the two that a positional mapping would silently swap.
+    """
+    values = {**DISTINCT_VALUES, "usage_date": SEPTEMBER.start}
+    store = PostgresMeteringStore(ScriptedSessions(values))
+
+    totals = store.usage_for_period(tenant_id=TENANT, period=SEPTEMBER)
+
+    assert totals.period == SEPTEMBER, "the read reports the period asked for, not one day"
+    assert totals.leads_assessed == 22
+    assert totals.leads_billable == 33
+    assert totals.input_tokens == 55
+    assert totals.cost_usd == Decimal("99.000001")
+
+
+def test_the_period_read_labels_every_aggregate_it_selects(
+    store: PostgresMeteringStore,
+) -> None:
+    """The other half of the guarantee: the statement carries the names the mapper reads."""
+    sql = sql_for(lambda: store.usage_for_period(tenant_id=TENANT, period=SEPTEMBER))
+    for name in ("leads_billable", "input_tokens", "cost_usd", "computed_at"):
+        assert f" as {name}" in sql, name
+
+
+# ------------------------------------------------------------------ tenant scoping
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "rollup_day",
+        "compute_day",
+        "usage_for_period",
+        "daily_usage",
+        "quota_for",
+        "set_quota",
+    ],
+)
+def test_every_tenant_scoped_statement_filters_on_the_tenant(
+    store: PostgresMeteringStore, method: str
+) -> None:
+    """Invariant 4, checked on the emitted SQL rather than on the signature.
+
+    A method that takes ``tenant_id`` and forgets to put it in the ``WHERE`` clause would
+    pass a signature check and hand one customer another customer's usage.
+    """
+    arguments: dict[str, Any] = {"tenant_id": TENANT}
+    if method in {"rollup_day", "compute_day"}:
+        arguments["day"] = DAY
+    elif method in {"usage_for_period", "daily_usage"}:
+        arguments["period"] = SEPTEMBER
+    elif method == "set_quota":
+        arguments |= {"monthly_lead_quota": 100, "alert_fraction": Decimal("0.80")}
+    sql = sql_for(lambda: getattr(store, method)(**arguments))
+    assert "tenant_id = " in sql or "tenants.id = " in sql, sql
+
+
+def test_no_store_method_is_reachable_without_a_tenant_or_a_fleet_name() -> None:
+    """The enumeration, so that a convenience getter added next year has to choose: name
+    the tenant, or say ``fleet_`` and return the breakdown."""
+    methods = {
+        name: member
+        for name, member in inspect.getmembers(PostgresMeteringStore, inspect.isfunction)
+        if not name.startswith(("_", "from_"))
+    }
+    assert set(methods) == {
+        "rollup_day",
+        "compute_day",
+        "usage_for_period",
+        "daily_usage",
+        "quota_for",
+        "set_quota",
+        "fleet_billable_leads",
+        "fleet_daily_spend",
+        "fleet_tenants_with_quota",
+    }
+    for name, method in methods.items():
+        parameters = inspect.signature(method).parameters
+        if name.startswith("fleet_"):
+            assert "tenant_id" not in parameters
+            continue
+        assert parameters["tenant_id"].kind is inspect.Parameter.KEYWORD_ONLY, name
+
+
+def test_the_adapter_satisfies_the_port() -> None:
+    """The Protocol is ``runtime_checkable``, so this is a real check of the method set."""
+    assert isinstance(PostgresMeteringStore(CapturingSessions()), MeteringStorePort)
+
+
+# ----------------------------------------------------------- structural properties
+
+
+def test_no_sql_is_assembled_from_strings() -> None:
+    """Every statement is a Core construct, so dates and tenant ids travel as bound
+    parameters. There is no textual fragment in this module at all — unlike
+    ``store_postgres.py``, which has the two ``(xmax = 0)`` idioms."""
+    module = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+    textual = {"text", "literal_column", "column", "table"}
+    for call in (node for node in ast.walk(module) if isinstance(node, ast.Call)):
+        name = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+        assert name not in textual, f"line {call.lineno}: {name}() builds SQL from text"
+
+
+def test_importing_the_module_creates_no_engine() -> None:
+    """The same rule ``store_postgres.py`` is held to: this module is imported by a CLI
+    that may be run to print a help string, and an engine at import time would open a
+    socket to do it."""
+    module = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+
+    def calls(node: ast.AST) -> list[ast.Call]:
+        found: list[ast.Call] = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                continue
+            if isinstance(child, ast.Call):
+                found.append(child)
+            found.extend(calls(child))
+        return found
+
+    for call in calls(module):
+        name = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+        assert name not in {"create_engine", "sessionmaker"}, f"line {call.lineno}"
+
+
+def test_a_bigint_sum_comes_back_as_an_integer() -> None:
+    """``SUM`` over ``bigint`` returns ``numeric`` in Postgres, so a token total arrives as
+    a ``Decimal``. Left as one, a JSON dump of a usage report would carry ``"4200"`` for
+    some fields and ``4200`` for others depending on which path produced them."""
+    assert metering_postgres._as_int(Decimal("4200")) == 4200
+    assert metering_postgres._as_int(None) == 0
+    assert metering_postgres._as_decimal(None) == Decimal(0)
+    assert metering_postgres._as_decimal(Decimal("0.054")) == Decimal("0.054")
