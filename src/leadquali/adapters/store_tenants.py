@@ -49,19 +49,21 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from leadquali.adapters.db_schema import Tenant, TenantApiKey
 from leadquali.adapters.unit_of_work import session_scope
-from leadquali.api.ratelimit import TenantRateLimit
-from leadquali.api.signing import (
-    ACTIVE_STATUS,
+from leadquali.app.api_keys import parse_api_key
+from leadquali.app.credentials import (
     AuthFailure,
+    CredentialAccepted,
     CredentialLookup,
     CredentialRejected,
     IngestCredential,
     SecretVerifierPort,
+    StoredApiKey,
+    decide_credential,
 )
-from leadquali.app.api_keys import parse_api_key
 from leadquali.app.tenants import (
     ApiKeyRecord,
     TenantAlreadyExistsError,
+    TenantRateLimit,
     TenantRecord,
     TenantStatus,
     UnknownApiKeyError,
@@ -402,9 +404,13 @@ class PostgresIngestCredentials:
     def resolve(self, *, tenant_id: str, api_key: str) -> CredentialLookup:
         """Resolve the presented key against ``tenant_api_keys``.
 
-        The order is the order of cost, and every step before the last is free relative to
-        it: parse (no I/O at all), one indexed read, four comparisons in Python, then the
-        KDF. See :mod:`leadquali.api.signing`.
+        Two steps belong to this class and one does not. Parsing (no I/O at all) and the
+        single indexed read by ``key_id`` are here; every rule about whether the row that
+        came back may authenticate this request is
+        :func:`~leadquali.app.credentials.decide_credential`, shared with
+        :class:`~leadquali.api.signing.StaticCredentials`. Writing those rules twice — once
+        on the path production runs and once on the path the offline suite exercises — is
+        how a security check ends up tested in the copy that never executes.
         """
         parsed = parse_api_key(api_key)
         if parsed is None:
@@ -427,15 +433,25 @@ class PostgresIngestCredentials:
 
         if row is None:
             return CredentialRejected(AuthFailure.UNKNOWN_TENANT)
-        if row.slug != tenant_id:
-            # A real key presented under someone else's name. Reported the same way as a
-            # key_id that does not exist, so the two are indistinguishable to the caller.
-            return CredentialRejected(AuthFailure.UNKNOWN_TENANT)
+
         now = self._now()
-        if row.revoked_at is not None or (row.expires_at is not None and row.expires_at <= now):
-            return CredentialRejected(AuthFailure.REVOKED_KEY)
-        if row.status != ACTIVE_STATUS:
-            return CredentialRejected(AuthFailure.TENANT_SUSPENDED)
+        decision = decide_credential(
+            claimed_tenant_id=tenant_id,
+            row_tenant_id=row.slug,
+            tenant_status=row.status,
+            key=StoredApiKey(
+                key_id=parsed.key_id,
+                key_hash=row.key_hash,
+                revoked=row.revoked_at is not None,
+                expires_at=row.expires_at,
+            ),
+            presented_secret=parsed.secret,
+            now=now,
+            verifier=self._verifier,
+        )
+        if not isinstance(decision, CredentialAccepted):
+            return decision
+
         if row.hmac_secret_ref is None:
             # A tenant with a key but no signing secret cannot produce a valid signature,
             # so there is nothing to authenticate against. Logged loudly because it means
@@ -449,24 +465,52 @@ class PostgresIngestCredentials:
                 key_id=parsed.key_id,
             )
             return CredentialRejected(AuthFailure.UNKNOWN_TENANT)
-        if not self._verifier.verify_secret(
-            key_id=parsed.key_id, secret=parsed.secret, key_hash=row.key_hash
-        ):
-            return CredentialRejected(AuthFailure.BAD_KEY)
 
-        self._touch(key_id=parsed.key_id, now=now)
+        try:
+            signing_secret = self._resolver.resolve(row.hmac_secret_ref)
+        except Exception:
+            # Broad on purpose, and at the right place for it: ``resolver`` is a Protocol,
+            # so what it raises is up to whichever implementation was wired in — the
+            # Secrets Manager adapter raises ``SecretResolutionError``, a future one will
+            # raise something else, and naming one of them here would let the others
+            # through as a 500. Catching it also keeps this module free of the AWS adapter,
+            # and therefore of ``boto3``, in its import graph.
+            #
+            # Secrets Manager is throttling, or the network blipped. This caller is a
+            # *good* one — it has just proved it holds a live key — so a 401 would tell it
+            # its key is bad, and a browser form told that does not retry: the lead is gone
+            # (invariant 3). UNAVAILABLE becomes a 503 with a Retry-After instead, which is
+            # the one answer that asks the sender to come back. The ARN and the error class
+            # go to the log; the value never existed here to leak.
+            log_event(
+                LOGGER,
+                "ingest.signing_secret_unavailable",
+                level=logging.ERROR,
+                tenant_id=row.slug,
+                key_id=parsed.key_id,
+                secret_arn=row.hmac_secret_ref,
+            )
+            return CredentialRejected(AuthFailure.UNAVAILABLE)
+
+        self._touch(key_id=parsed.key_id, tenant_slug=row.slug, now=now)
         return IngestCredential(
-            tenant_id=row.slug,
-            key_id=parsed.key_id,
-            signing_secret=self._resolver.resolve(row.hmac_secret_ref).encode("utf-8"),
+            tenant_id=decision.tenant_id,
+            key_id=decision.key_id,
+            signing_secret=signing_secret.encode("utf-8"),
         )
 
-    def _touch(self, *, key_id: str, now: datetime) -> None:
+    def _touch(self, *, key_id: str, tenant_slug: str, now: datetime) -> None:
         """Record that this key was used, coarsely, and never at the cost of the request.
 
         Outside the authentication decision — the credential is already established by the
         time this runs — rate-limited per key per process, and wrapped in a bare ``except``
         because there is no failure here worth turning a good lead into a 500.
+
+        The ``UPDATE`` filters on the tenant as well as on ``key_id`` even though ``key_id``
+        is unique and came from the row this very call just read. Invariant 4 says every
+        repository method filters on the tenant, and a *write* is the last place to start
+        making exceptions to that on the grounds that this particular one happens to be
+        safe: the exception is what a later reader copies.
         """
         if self._coarseness is None:
             return
@@ -478,7 +522,12 @@ class PostgresIngestCredentials:
             with self._sessions.begin() as session:
                 session.execute(
                     update(TenantApiKey)
-                    .where(TenantApiKey.key_id == key_id)
+                    .where(
+                        TenantApiKey.key_id == key_id,
+                        TenantApiKey.tenant_id.in_(
+                            select(Tenant.id).where(Tenant.slug == tenant_slug)
+                        ),
+                    )
                     .values(last_used_at=now)
                 )
         except Exception:  # see the docstring: recording use must never fail a lead

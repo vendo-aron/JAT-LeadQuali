@@ -337,7 +337,8 @@ class TenantApiKey(Base):
     # Set by revocation, and effective on the very next request: the row is read fresh from
     # Postgres every time, and nothing about it is cached anywhere.
     revoked_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
-    # Best-effort and deliberately coarse — see api/lastused.py. A write per request would
+    # Best-effort and deliberately coarse; written by
+    # store_tenants.PostgresIngestCredentials._touch. A write per request would
     # put a row-level lock contended by every concurrent request for the same key on the
     # hot path, to answer a question nobody asks to the minute.
     last_used_at: Mapped[dt.datetime | None] = mapped_column(

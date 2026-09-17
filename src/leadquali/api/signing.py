@@ -34,11 +34,21 @@ gain: it *replaces* the tenant-enumeration oracle the old scheme had to defend a
 a dummy-hash comparison, because ``unknown_tenant`` and ``bad_key`` are now literally the
 same code path and so cannot drift apart.
 
-**One exception to "every rejection looks the same".** A *suspended* tenant gets a 403, not
-a 401 (see :attr:`AuthFailure.TENANT_SUSPENDED`). Such a caller has already proved its
-identity with a valid key, so there is no enumeration left to protect and an operator on
-the customer's side deserves to be told that the account, not the integration, is the
-problem. A revoked *key* is a 401 like any other bad key.
+**Two exceptions to "every rejection looks the same".**
+
+A *suspended* tenant gets a 403 (:attr:`AuthFailure.TENANT_SUSPENDED`). Such a caller has
+already proved its identity, so there is no enumeration left to protect, and an operator on
+the customer's side deserves to be told that the account and not the integration is the
+problem. That claim is only true because the status is checked **after** the KDF, in
+:func:`~leadquali.app.credentials.decide_credential` — a ``key_id`` travels in the clear in
+a header on every submission, so checking the status first would let anyone who has ever
+seen a customer's key discover whether that account had been suspended for non-payment,
+without holding the secret. A revoked *key* is a 401 like any other bad key.
+
+A dependency that cannot be read — a tenant's signing secret, its rate limit — gets a 503
+with a ``Retry-After`` (:attr:`AuthFailure.UNAVAILABLE`). It is not the caller's fault, and
+a browser form told its key is bad does not retry, so a 401 there would silently lose the
+lead (invariant 3).
 
 **Replay.** The signed material carries a unix timestamp and a client nonce. A request
 outside :data:`MAX_CLOCK_SKEW_SECONDS` is refused, and a nonce already seen inside that
@@ -52,9 +62,12 @@ store (Redis/DynamoDB) would close it completely and is deliberately not built h
 endpoint.
 
 Everything in this module is standard library only — the argon2 implementation lives behind
-:class:`SecretVerifierPort` in ``adapters/keyhash_argon2.py`` — so #26's Lambda handler and
-#30's form-side signer can both import it, and so the construction can be reimplemented
-from :func:`signing_string` alone in whatever language the customer's site is written in.
+:class:`~leadquali.app.credentials.SecretVerifierPort`, and the credential types and the
+accept/refuse decision live in :mod:`leadquali.app.credentials`, which is stdlib-only for
+the same reason — so #26's Lambda handler and #30's form-side signer can both import it,
+and so the construction can be reimplemented from :func:`signing_string` alone in whatever
+language the customer's site is written in. The credential names are re-exported here so
+that the modules which already import them from this one keep working.
 """
 
 from __future__ import annotations
@@ -67,10 +80,22 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
-from typing import Final, Protocol, runtime_checkable
+from typing import Final
 
 from leadquali.app.api_keys import KEY_ID_CHARS, parse_api_key
+from leadquali.app.credentials import (
+    ACTIVE_STATUS,
+    TENANT_STATUSES,
+    AuthFailure,
+    CredentialAccepted,
+    CredentialLookup,
+    CredentialRejected,
+    IngestCredential,
+    IngestCredentialSource,
+    SecretVerifierPort,
+    StoredApiKey,
+    decide_credential,
+)
 from leadquali.domain.tenant_config import TENANT_ID_PATTERN
 
 #: Names the algorithm inside the signed string, so a future v2 with different material
@@ -103,11 +128,6 @@ _NONCE_RE: Final[re.Pattern[str]] = re.compile(
 #: well past what an HMAC needs; the check exists to catch a placeholder in a config file.
 MIN_SIGNING_SECRET_CHARS: Final[int] = 32
 
-#: The statuses a tenant row may carry. Mirrors the CHECK constraint on ``tenants.status``;
-#: only :data:`ACTIVE_STATUS` may submit leads.
-TENANT_STATUSES: Final[tuple[str, ...]] = ("active", "suspended", "disabled")
-ACTIVE_STATUS: Final[str] = "active"
-
 _SHA256_HEX_RE: Final[re.Pattern[str]] = re.compile(r"\A[0-9a-f]{64}\Z")
 _TENANT_ID_RE: Final[re.Pattern[str]] = re.compile(TENANT_ID_PATTERN)
 _KEY_ID_RE: Final[re.Pattern[str]] = re.compile(rf"\A[0-9a-f]{{{KEY_ID_CHARS}}}\Z")
@@ -126,137 +146,6 @@ class IngestCredentialsError(ValueError):
     worse, start with an empty credential set and a code path that treats "no credentials
     configured" as "no authentication required".
     """
-
-
-class AuthFailure(StrEnum):
-    """Why a request was refused.
-
-    For logs and metrics only. It is never returned to the caller, and every value but
-    :attr:`TENANT_SUSPENDED` produces the identical 401 on the wire: telling a stranger
-    that the tenant exists but the key is wrong is a free enumeration oracle.
-    """
-
-    MALFORMED = "malformed"
-    """A required header is missing, or a header — including the API key itself — cannot
-    be parsed. Costs no I/O and no KDF."""
-
-    UNKNOWN_TENANT = "unknown_tenant"
-    """No key row matched the presented ``key_id``, or the row that matched belongs to a
-    different tenant than the one in the header. One rejection for both, because a caller
-    must not be able to tell them apart."""
-
-    BAD_KEY = "bad_key"
-    """A key row was found and the argon2 check on its secret failed."""
-
-    REVOKED_KEY = "revoked_key"
-    """The key row exists but has been revoked, or its rotation overlap has expired."""
-
-    TENANT_SUSPENDED = "tenant_suspended"
-    """The key is valid and the tenant is not active. The one failure that is *not* a 401;
-    see the module docstring."""
-
-    BAD_SIGNATURE = "bad_signature"
-
-    STALE = "stale"
-    """The timestamp is outside the accepted window in either direction."""
-
-    REPLAY = "replay"
-    """This nonce was already used inside the window."""
-
-
-@runtime_checkable
-class SecretVerifierPort(Protocol):
-    """ "Does this secret match this stored hash?", and nothing else.
-
-    Declared here, where the request path needs it, and implemented by
-    :class:`~leadquali.adapters.keyhash_argon2.Argon2KeyHasher`. The indirection is what
-    keeps this module standard-library only: #30's form-side signer imports it, and a
-    reimplementation in another language must not have to install a KDF to read
-    :func:`signing_string`.
-    """
-
-    def verify_secret(self, *, key_id: str, secret: str, key_hash: str) -> bool:
-        """Return whether ``secret`` is the secret behind ``key_hash``.
-
-        Implementations must not raise for a wrong secret or an unreadable stored hash;
-        both are ``False``. ``key_id`` is the clear-text row handle, for rate-limiting the
-        KDF per key and for log lines — never for the comparison itself.
-        """
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class IngestCredential:
-    """One tenant's ingest identity, once a presented key has been accepted.
-
-    ``signing_secret`` is bytes because that is what :func:`hmac.new` wants and because it
-    discourages the string handling that ends with a secret in an f-string. ``key_id`` is
-    *not* secret and is carried so the caller can log which of a tenant's keys was used
-    and record ``last_used_at`` against it.
-    """
-
-    tenant_id: str
-    key_id: str
-    signing_secret: bytes
-
-    def __repr__(self) -> str:
-        """Never render the secret: a repr ends up in tracebacks, and tracebacks in logs."""
-        return (
-            f"IngestCredential(tenant_id={self.tenant_id!r}, key_id={self.key_id!r}, "
-            f"signing_secret='<redacted>')"
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class CredentialRejected:
-    """No usable credential, and the reason — which is for the log, not for the caller."""
-
-    failure: AuthFailure
-
-
-CredentialLookup = IngestCredential | CredentialRejected
-"""What a credential source answers with. Never ``None``: the reason a lookup failed is the
-only thing that lets an operator tell "a customer's form is using a revoked key" apart from
-"someone is probing us", and collapsing it to ``None`` at the port boundary loses it."""
-
-
-@runtime_checkable
-class IngestCredentialSource(Protocol):
-    """Where the ingest endpoint resolves a presented key to a tenant's secrets.
-
-    The source, not the caller, owns the whole decision: parse the key, find its row, check
-    that the row is live and belongs to the claimed tenant, check that the tenant is active,
-    and only then run the KDF. Doing it in one place is what makes the cheap rejections
-    *provably* cheap — every early return is a request that touched no KDF, and most of
-    them touched no database either.
-    """
-
-    def resolve(self, *, tenant_id: str, api_key: str) -> CredentialLookup:
-        """Resolve the presented key, or say why it was refused."""
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class StoredApiKey:
-    """One row of ``tenant_api_keys``, as the request path needs to see it."""
-
-    key_id: str
-    key_hash: str
-    """The encoded argon2id hash of the key's secret half. Never the key."""
-
-    revoked: bool = False
-    expires_at: datetime | None = None
-    """When a rotated key's overlap window closes; ``None`` means it never expires."""
-
-    def __repr__(self) -> str:
-        """A hash is not a secret, but it is not something to spill into a log either."""
-        return f"StoredApiKey(key_id={self.key_id!r}, revoked={self.revoked!r})"
-
-    def is_live(self, now: datetime) -> bool:
-        """Whether this key may still be used at ``now``."""
-        if self.revoked:
-            return False
-        return self.expires_at is None or self.expires_at > now
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,7 +205,12 @@ class StaticCredentials:
                 self._by_key_id[key.key_id] = (tenant, key)
 
     def resolve(self, *, tenant_id: str, api_key: str) -> CredentialLookup:
-        """Resolve the presented key. See :meth:`IngestCredentialSource.resolve`."""
+        """Resolve the presented key. See :meth:`IngestCredentialSource.resolve`.
+
+        Parsing and the row lookup are this class's; everything after that is
+        :func:`~leadquali.app.credentials.decide_credential`, shared with the Postgres
+        resolver so the two cannot drift.
+        """
         parsed = parse_api_key(api_key)
         if parsed is None:
             return CredentialRejected(AuthFailure.MALFORMED)
@@ -324,21 +218,21 @@ class StaticCredentials:
         if found is None:
             return CredentialRejected(AuthFailure.UNKNOWN_TENANT)
         tenant, key = found
-        if tenant.tenant_id != tenant_id:
-            # The key exists but was presented under someone else's name. Reported as an
-            # unknown tenant so it is indistinguishable from a key_id that does not exist.
-            return CredentialRejected(AuthFailure.UNKNOWN_TENANT)
-        if not key.is_live(self._now()):
-            return CredentialRejected(AuthFailure.REVOKED_KEY)
-        if tenant.status != ACTIVE_STATUS:
-            return CredentialRejected(AuthFailure.TENANT_SUSPENDED)
-        if not self._verifier.verify_secret(
-            key_id=key.key_id, secret=parsed.secret, key_hash=key.key_hash
-        ):
-            return CredentialRejected(AuthFailure.BAD_KEY)
+
+        decision = decide_credential(
+            claimed_tenant_id=tenant_id,
+            row_tenant_id=tenant.tenant_id,
+            tenant_status=tenant.status,
+            key=key,
+            presented_secret=parsed.secret,
+            now=self._now(),
+            verifier=self._verifier,
+        )
+        if not isinstance(decision, CredentialAccepted):
+            return decision
         return IngestCredential(
-            tenant_id=tenant.tenant_id,
-            key_id=key.key_id,
+            tenant_id=decision.tenant_id,
+            key_id=decision.key_id,
             signing_secret=tenant.signing_secret,
         )
 

@@ -84,6 +84,43 @@ def test_only_the_key_hasher_imports_argon2() -> None:
         )
 
 
+def test_neither_domain_nor_app_nor_adapters_imports_the_api_layer() -> None:
+    """``domain`` <- ``app`` <- ``adapters``/``api``, and the arrows only point one way.
+
+    Added by #31, which broke it and had to be put back: the Postgres credential resolver
+    needed ``IngestCredential``, ``AuthFailure`` and ``SecretVerifierPort``, and those had
+    been declared in ``api/signing.py``. An adapter importing ``api`` is not a stylistic
+    complaint — it makes the FastAPI module's import graph a dependency of every worker and
+    every CLI that touches the store, and it is the direction in which an import cycle
+    becomes a matter of which file was imported first. The types now live in
+    ``app/credentials.py``, which is where both sides can reach them.
+    """
+    for path in python_sources():
+        relative = path.relative_to(SRC).as_posix()
+        if not relative.startswith(("domain/", "app/", "adapters/")):
+            continue
+        reached = {
+            name
+            for name in _imported_paths(path)
+            if name == "leadquali.api" or name.startswith("leadquali.api.")
+        }
+        assert not reached, (
+            f"{relative} imports {sorted(reached)}; the api layer sits on top of this one, "
+            "so anything both need belongs in app/"
+        )
+
+
+def test_the_credentials_module_stays_standard_library_only() -> None:
+    """``app/credentials.py`` is imported by ``api/signing.py``, which #30's browser-side
+    form signer imports in turn. Anything third-party in here — or anything from
+    ``domain``, which is pydantic all the way down — breaks the property that the whole
+    construction is reimplementable from one file and a spec."""
+    imported = imported_modules(SRC / "app" / "credentials.py")
+    assert imported <= {"__future__", "dataclasses", "datetime", "enum", "typing"}, (
+        f"app/credentials.py imports {sorted(imported)}"
+    )
+
+
 def test_the_signing_module_stays_standard_library_only() -> None:
     """``api/signing.py`` is imported by #30's form-side signer and by the Lambda handler,
     and its construction must be reimplementable from the module alone. Anything
@@ -94,7 +131,6 @@ def test_the_signing_module_stays_standard_library_only() -> None:
         "collections",
         "dataclasses",
         "datetime",
-        "enum",
         "hashlib",
         "hmac",
         "json",

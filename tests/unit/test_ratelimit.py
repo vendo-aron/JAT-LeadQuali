@@ -14,6 +14,7 @@ import pytest
 
 from leadquali.api.ratelimit import (
     DEFAULT_TENANT_RATE_LIMIT,
+    LIMIT_STALE_RETRY_SECONDS,
     RateLimiterPort,
     TenantRateLimit,
     TenantRateLimiter,
@@ -205,3 +206,79 @@ def test_a_negative_cache_window_is_refused() -> None:
 def test_a_limiter_that_remembers_no_tenants_is_refused() -> None:
     with pytest.raises(ValueError, match="max_tenants"):
         TenantRateLimiter(StubLimits(), max_tenants=0)
+
+
+# ------------------------------------------------------- when the source cannot answer
+
+
+class BrokenLimits:
+    """A source that fails after the first read, the way a database blips."""
+
+    def __init__(self, limit: TenantRateLimit | None) -> None:
+        self.limit = limit
+        self.reads = 0
+        self.failing = False
+
+    def rate_limit_for(self, tenant_id: str) -> TenantRateLimit | None:
+        del tenant_id
+        self.reads += 1
+        if self.failing:
+            raise RuntimeError("connection reset by peer")
+        return self.limit
+
+
+def test_a_source_that_raises_does_not_turn_an_authenticated_lead_into_a_500() -> None:
+    """The limiter runs *after* authentication, so its caller is a paying customer with a
+    valid key. A database blip reading a number that changes once a quarter must not be the
+    thing that loses their lead (invariant 3)."""
+    limits = BrokenLimits(None)
+    limits.failing = True
+    limiter = TenantRateLimiter(limits, default=TenantRateLimit(per_minute=60, burst=2))
+
+    assert spend(limiter, tenant_id="acme", times=3, at=NOW) == [True, True, False]
+
+
+def test_a_failed_refresh_keeps_serving_the_limit_it_already_had() -> None:
+    """Better than the default: the value we hold is almost certainly still right."""
+    limits = BrokenLimits(TenantRateLimit(per_minute=600, burst=20))
+    limiter = TenantRateLimiter(limits, cache_seconds=60)
+    assert spend(limiter, tenant_id="acme", times=20, at=NOW) == [True] * 20
+
+    limits.failing = True
+    later = NOW + timedelta(seconds=61)
+    assert spend(limiter, tenant_id="acme", times=20, at=later) == [True] * 20
+    assert limits.reads == 2
+
+
+def test_a_failing_source_is_not_retried_on_every_single_request() -> None:
+    """A struggling database must not be hammered by the whole fleet, and an operator must
+    not get one log line per lead while it recovers."""
+    limits = BrokenLimits(TenantRateLimit(per_minute=6000, burst=100))
+    limiter = TenantRateLimiter(limits, cache_seconds=60)
+    limiter.check(tenant_id="acme", now=NOW)
+
+    limits.failing = True
+    later = NOW + timedelta(seconds=61)
+    spend(limiter, tenant_id="acme", times=50, at=later)
+    assert limits.reads == 2, "the failing source was retried more than once"
+
+    # ...and it *is* retried, once the short stale window has passed.
+    spend(
+        limiter, tenant_id="acme", times=1, at=later + timedelta(seconds=LIMIT_STALE_RETRY_SECONDS)
+    )
+    assert limits.reads == 3
+
+
+def test_a_source_that_recovers_is_read_again() -> None:
+    """The failure is not sticky: nothing about it is remembered beyond the short retry."""
+    limits = BrokenLimits(TenantRateLimit(per_minute=60, burst=1))
+    limiter = TenantRateLimiter(limits, cache_seconds=0)
+    limits.failing = True
+    assert limiter.check(tenant_id="acme", now=NOW).allowed
+    assert limits.reads == 1
+
+    limits.failing = False
+    limits.limit = TenantRateLimit(per_minute=600, burst=30)
+    later = NOW + timedelta(seconds=10)
+    assert spend(limiter, tenant_id="acme", times=25, at=later) == [True] * 25
+    assert limits.reads > 1

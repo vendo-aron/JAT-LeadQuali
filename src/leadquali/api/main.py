@@ -98,10 +98,21 @@ HEALTH_PATH: Final[str] = "/health"
 _UNAUTHORISED_DETAIL: Final[str] = "authentication failed"
 
 #: The one exception, and it is not an oracle. A caller that reaches this has already
-#: presented a valid, unrevoked key for the tenant it named, so there is nothing left to
-#: enumerate — and the integrator on the customer's side needs to know that the account,
-#: not their integration, is what stopped working. See :mod:`leadquali.api.signing`.
+#: presented a valid, unrevoked key *and passed the argon2 check* for the tenant it named,
+#: so there is nothing left to enumerate — and the integrator on the customer's side needs
+#: to know that the account, not their integration, is what stopped working. See
+#: :mod:`leadquali.app.credentials` for why the status is checked after the KDF.
 _SUSPENDED_DETAIL: Final[str] = "tenant is not active"
+
+#: A dependency of ours is down, not a problem with the request. Answered 503 rather than
+#: 401 or 500: a 401 would tell a good customer their key is bad, and a browser form that
+#: receives a 500 does not retry — the lead would simply be gone, which is invariant 3
+#: broken by an outage in something else.
+_UNAVAILABLE_DETAIL: Final[str] = "temporarily unable to accept submissions; retry shortly"
+
+#: How long a 503'd sender is asked to wait. Comfortably longer than a Secrets Manager
+#: throttle takes to clear and shorter than a visitor will keep a tab open.
+_UNAVAILABLE_RETRY_AFTER: Final[int] = 5
 
 _NO_STORE: Final[dict[str, str]] = {"Cache-Control": "no-store"}
 
@@ -256,6 +267,10 @@ def create_app(
             413: {"model": ErrorResponse, "description": "Body larger than the limit."},
             422: {"model": ValidationErrorResponse, "description": "Schema validation failed."},
             429: {"model": ErrorResponse, "description": "Rate limited."},
+            503: {
+                "model": ErrorResponse,
+                "description": "A dependency is unavailable; retry after the given delay.",
+            },
         },
     )
     async def ingest(request: Request) -> Response:
@@ -297,10 +312,7 @@ async def _handle_ingest_traced(request: Request, deps: IngestDeps, trace_id: st
         now=deps.clock.now(),
     )
     if isinstance(auth, AuthRejected):
-        suspended = auth.failure is AuthFailure.TENANT_SUSPENDED
-        status = 403 if suspended else 401
-        _log_rejection(auth.failure, request, status)
-        return _error(status, _SUSPENDED_DETAIL if suspended else _UNAUTHORISED_DETAIL)
+        return _refuse(auth.failure, request)
 
     limit = deps.rate_limiter.check(tenant_id=auth.tenant_id, now=deps.clock.now())
     if not limit.allowed:
@@ -379,13 +391,39 @@ async def _read_bounded_body(request: Request, limit: int) -> bytes | None:
     return b"".join(chunks)
 
 
+def _refuse(failure: AuthFailure, request: Request) -> JSONResponse:
+    """Turn a rejection into the one answer the caller is allowed to see.
+
+    Three answers, and the split matters more than it looks. Almost everything is an
+    identical 401, because a different status or a different message for "no such tenant"
+    than for "wrong key" is a free enumeration oracle. A suspended tenant is a 403 —
+    reachable only *after* the argon2 check, so only by someone who has proved they hold
+    the secret. And a dependency we could not read is a 503 with a ``Retry-After``: the
+    sender did nothing wrong and is the one party who can still save the lead by coming
+    back.
+    """
+    match failure:
+        case AuthFailure.TENANT_SUSPENDED:
+            status, detail, headers = 403, _SUSPENDED_DETAIL, None
+        case AuthFailure.UNAVAILABLE:
+            status, detail, headers = (
+                503,
+                _UNAVAILABLE_DETAIL,
+                {"Retry-After": str(_UNAVAILABLE_RETRY_AFTER)},
+            )
+        case _:
+            status, detail, headers = 401, _UNAUTHORISED_DETAIL, None
+    _log_rejection(failure, request, status)
+    return _error(status, detail, headers=headers)
+
+
 def _log_rejection(failure: AuthFailure, request: Request, status: int) -> None:
     """Record *why* a request was refused, where only we can see it.
 
     The tenant header is logged as claimed — it is an assertion by a stranger, not a fact,
     and it is the only handle an operator has on "a customer's form has the wrong key"
     versus "someone is probing us". The one case where it is a *fact* is a suspended
-    tenant, which is also the one case the caller is told about.
+    tenant, which is also the one case the caller is told anything about.
     """
     log_event(
         LOGGER,
