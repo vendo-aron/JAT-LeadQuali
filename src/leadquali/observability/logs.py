@@ -216,7 +216,12 @@ class _BaseFormatter(logging.Formatter):
         on the one path nobody rehearses. The message and the traceback text still go
         through the redactor, because the message is written by whatever raised.
         """
-        if record.exc_info is None or record.exc_info[1] is None:
+        # `not record.exc_info`, not `is None`: logging stores whatever was passed, and
+        # `exc_info=False` is legal and common. It would fail the `is None` test, reach
+        # the subscript, and raise TypeError *inside the formatter* — which
+        # `logging.Handler.handleError` swallows, so the record would vanish with no
+        # trace. A log line lost on the error path is the one you needed most.
+        if not record.exc_info or record.exc_info[1] is None:
             return None
         _, error, tb = record.exc_info
         stack = "".join(traceback.format_exception(type(error), error, tb))

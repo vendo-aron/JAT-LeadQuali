@@ -275,6 +275,24 @@ def test_an_address_in_a_traceback_never_reaches_the_line() -> None:
     assert "RuntimeError" in record["exception"]["stack"]
 
 
+def test_exc_info_false_still_emits_the_line() -> None:
+    """``exc_info=False`` must not make the record disappear.
+
+    ``logging`` stores whatever was passed, so ``record.exc_info`` is the literal
+    ``False`` here rather than ``None``. A formatter that guards with ``is None`` reaches
+    the subscript, raises ``TypeError``, and ``logging.Handler.handleError`` swallows it —
+    the line is gone and nothing says so. This test fails loudly instead, because the bug
+    it guards is *silence*: every other assertion in this file would still pass.
+    """
+    buffer = configured()
+
+    LOGGER.error("dispatch failed", exc_info=False)
+
+    emitted = records(buffer)
+    assert [record["message"] for record in emitted] == ["dispatch failed"]
+    assert "exception" not in emitted[0]
+
+
 def test_human_format_redacts_too() -> None:
     buffer = io.StringIO()
     configure_logging(settings_for(Environment.LOCAL), stream=buffer)
