@@ -24,6 +24,11 @@ dependencies = [
     # (usage records -> meter events) and an unattended bump would change which API
     # exists, not merely how it is spelled.
     "stripe>=15,<16",
+    # The staff admin UI (#36) is server-rendered HTML in the same Lambda as everything
+    # else: Jinja2 renders the templates, python-multipart lets FastAPI parse the form
+    # posts they submit. Both are runtime dependencies of the API, not dev tools.
+    "jinja2",
+    "python-multipart",
 ]
 
 [project.optional-dependencies]
@@ -51,7 +56,10 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-leadquali = ["prompts/*.md", "py.typed"]
+# A template that is not packaged is a 500 in Lambda and a pass in the tests, which is
+# the worst combination available. tests/unit/test_admin_templates.py asserts that every
+# file under api/templates matches one of these globs.
+leadquali = ["prompts/*.md", "py.typed", "api/templates/*.html", "api/templates/admin/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

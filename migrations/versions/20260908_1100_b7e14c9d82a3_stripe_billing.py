@@ -75,7 +75,7 @@ revision: str = "b7e14c9d82a3"
 # NOTE: single line on purpose. #36 adds a migration off the same head, so when the two
 # branches are stacked one of them has to be re-pointed — and that must be a one-line
 # change, not an archaeology exercise.
-down_revision: str | None = "a3f5c2b81d47"
+down_revision: str | None = "b6d2e94f7a13"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -1,0 +1,31 @@
+{#
+  Step one of edit → preview → confirm. This form never saves; it only previews.
+
+  `document` is whatever the operator last typed, re-rendered verbatim on a validation
+  failure. Losing somebody's edit because they mistyped a threshold is how people stop
+  using the tool and go back to psql, which is the outcome this screen exists to prevent.
+#}
+{% extends "admin/base.html" %}
+{% block title %}Edit {{ slug }}'s rubric — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Rubric for {{ slug }}</h1>
+<p class="muted">
+  Editing a rubric changes how every future lead for this tenant is scored and routed.
+  Nothing is saved until you have seen the diff and confirmed it.
+  <a href="{{ admin_prefix }}/tenants/{{ slug }}/config/history">Edit history</a> ·
+  <a href="{{ admin_prefix }}/tenants/{{ slug }}/rerun">Test against historical leads</a>
+</p>
+{% if errors %}
+<div class="errors">
+  <strong>This rubric was not accepted, and nothing has been changed.</strong>
+  <ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+<form method="post" action="{{ admin_prefix }}/tenants/{{ slug }}/config/preview">
+  <input type="hidden" name="{{ csrf_field }}" value="{{ csrf }}">
+  <p><textarea name="config" rows="28" spellcheck="false">{{ document }}</textarea></p>
+  <p><label>Why are you changing this? (optional, {{ max_note }} characters)<br>
+    <input name="note" value="{{ note }}" maxlength="{{ max_note }}" size="70"></label></p>
+  <p><button type="submit">Preview changes</button></p>
+</form>
+{% endblock %}

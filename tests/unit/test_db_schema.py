@@ -33,11 +33,13 @@ from leadquali.adapters.db_schema import (
     Assessment,
     Base,
     Feedback,
+    GoldenPromotion,
     Lead,
     RoutingEvent,
     StripeEventRow,
     Tenant,
     TenantApiKey,
+    TenantConfigVersion,
     UsageDaily,
     UsageReportRecord,
 )
@@ -55,9 +57,11 @@ EXPECTED_TABLES = {
     "usage_daily",
     "stripe_events",
     "usage_reports",
+    "tenant_config_versions",
+    "golden_promotions",
 }
 
-CHILD_TABLES = ("assessments", "routing_events", "feedback")
+CHILD_TABLES = ("assessments", "routing_events", "feedback", "golden_promotions")
 """The tables that hang off a lead, and therefore off a tenant through it."""
 
 # Every column this schema has, and what class of personal data it is allowed to hold.
@@ -201,6 +205,37 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("usage_reports", "reported_at"): "none",
     ("usage_reports", "external_id"): "none",
     ("usage_reports", "quantity"): "none",
+    # tenant_config_versions (#36) is the rubric's edit history. A rubric is policy about
+    # a *customer*, written by staff — the ICP prose, the weights, the thresholds and the
+    # sales inboxes leads are routed to. Nothing a lead submitted reaches it, which is why
+    # `tenants.icp_config` is classified the same way.
+    ("tenant_config_versions", "id"): "none",
+    ("tenant_config_versions", "tenant_id"): "none",
+    ("tenant_config_versions", "version"): "none",
+    ("tenant_config_versions", "config"): "none",
+    # The staff subject from the admin session: an opaque username, never an address, for
+    # the same reason `feedback.rater` is not one — an audit row outlives the payload.
+    ("tenant_config_versions", "changed_by"): "none",
+    ("tenant_config_versions", "changed_at"): "none",
+    ("tenant_config_versions", "note"): "none",
+    # golden_promotions (#36) records the *decision* to promote a lead into the eval set
+    # and the human label that goes with it. It deliberately holds no copy of the payload:
+    # a pseudonymised copy here would be a second home for data derived from
+    # `leads.raw_payload`, outside the one place invariant 5 allows it and outside what
+    # #37's retention job purges. The JSONL line is rendered from the lead on demand.
+    ("golden_promotions", "id"): "none",
+    ("golden_promotions", "tenant_id"): "none",
+    ("golden_promotions", "lead_id"): "none",
+    ("golden_promotions", "case_id"): "none",
+    ("golden_promotions", "expected_tier"): "none",
+    ("golden_promotions", "promoted_by"): "none",
+    # The labeller's rationale for the tier, in their own words. Staff-written prose about
+    # the *judgement*, classified like `feedback.notes` and for the same reason: #22's
+    # runbook is explicit that a rep's notes are summarised here rather than pasted, and
+    # that a labeler handle is never a person's name.
+    ("golden_promotions", "note"): "none",
+    ("golden_promotions", "promoted_at"): "none",
+    ("golden_promotions", "created_at"): "none",
 }
 
 
@@ -250,6 +285,8 @@ def test_model_classes_map_to_the_expected_table_names() -> None:
         (UsageDaily, "usage_daily"),
         (StripeEventRow, "stripe_events"),
         (UsageReportRecord, "usage_reports"),
+        (TenantConfigVersion, "tenant_config_versions"),
+        (GoldenPromotion, "golden_promotions"),
     ):
         assert model.__tablename__ == table_name
         # The class and the metadata entry are one object, so a repository written against
@@ -503,6 +540,8 @@ def test_the_tenant_rubric_has_no_usable_default() -> None:
         ("tenants", "ck_tenants_quota_alert_fraction_is_a_fraction"),
         ("usage_daily", "ck_usage_daily_usage_is_non_negative"),
         ("feedback", "ck_feedback_verdict_known"),
+        ("golden_promotions", "ck_golden_promotions_expected_tier_known"),
+        ("tenant_config_versions", "ck_tenant_config_versions_version_is_positive"),
     ],
 )
 def test_every_enumerated_column_is_constrained(table_name: str, constraint_name: str) -> None:
@@ -543,6 +582,9 @@ def test_the_enforced_vocabularies_match_the_domain() -> None:
         ("routing_events", "created_at"),
         ("feedback", "created_at"),
         ("usage_daily", "computed_at"),
+        ("tenant_config_versions", "changed_at"),
+        ("golden_promotions", "promoted_at"),
+        ("golden_promotions", "created_at"),
     ],
 )
 def test_timestamps_are_timezone_aware_with_a_server_default(
@@ -663,6 +705,9 @@ def test_indexes_cover_the_queries_the_product_actually_runs() -> None:
     assert ("lead_id",) in index_columns["feedback"]
     assert ("lead_id",) in index_columns["routing_events"]
     assert ("lead_id",) in index_columns["assessments"]
+    # #36's promotion listing and "has this lead already been promoted?" for a page of
+    # review rows: WHERE tenant_id = ? ORDER BY promoted_at DESC.
+    assert ("tenant_id", "promoted_at") in index_columns["golden_promotions"]
 
 
 def test_child_rows_are_deleted_with_their_lead() -> None:
@@ -678,3 +723,88 @@ def test_constraint_names_are_deterministic() -> None:
     """A naming convention is what lets Alembic autogenerate and downgrade stay stable."""
     convention = Base.metadata.naming_convention
     assert {"ix", "uq", "ck", "fk", "pk"} <= set(convention)
+
+
+def test_a_config_version_is_identified_by_its_tenant_and_number() -> None:
+    """``UNIQUE (tenant_id, version)`` is what settles two operators saving at once.
+
+    The version is allocated from this table inside the writing transaction, so the
+    constraint is not belt and braces — it is the mechanism. A counter kept in Python
+    would hand the same number to two admin processes and one edit would overwrite the
+    other's audit row.
+    """
+    unique_column_sets = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in _table("tenant_config_versions").constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("tenant_id", "version") in unique_column_sets
+
+
+def test_a_config_version_holds_a_whole_config_and_an_author() -> None:
+    """Full snapshots, not patches, and never an anonymous change."""
+    table = _table("tenant_config_versions")
+    assert isinstance(table.c["config"].type, JSONB)
+    assert not table.c["config"].nullable
+    assert not table.c["changed_by"].nullable
+    assert "ck_tenant_config_versions_changed_by_not_blank" in _check_constraint_names(
+        "tenant_config_versions"
+    )
+    # The reason is optional: refusing to save a rubric fix during an incident over a
+    # missing note is friction that gets worked around by editing the row in psql.
+    assert table.c["note"].nullable
+
+
+def test_a_config_version_goes_when_its_tenant_does() -> None:
+    """Like ``tenant_api_keys`` and unlike ``leads``: this is a record *about* the
+    customer's configuration, meaningless without them, so #37's deliberate erasure takes
+    it along rather than being blocked by it."""
+    foreign_keys = list(_table("tenant_config_versions").c["tenant_id"].foreign_keys)
+    assert [fk.column.table.name for fk in foreign_keys] == ["tenants"]
+    assert foreign_keys[0].ondelete == "CASCADE"
+
+
+def test_promoting_one_lead_twice_is_impossible() -> None:
+    """#36's acceptance criterion, stated in the database rather than in the handler.
+
+    A refreshed confirmation page, a double tap or a second operator must not put the same
+    lead in the eval set twice; the harness would then weigh that one lead twice.
+    """
+    unique_column_sets = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in _table("golden_promotions").constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("tenant_id", "lead_id") in unique_column_sets
+    assert ("case_id",) in unique_column_sets
+
+
+def test_a_promotion_carries_no_copy_of_the_payload() -> None:
+    """The golden case is rendered from the lead on demand and never stored here.
+
+    A pseudonymised copy would be a second home for data derived from
+    ``leads.raw_payload`` — outside the one place invariant 5 allows personal data to live,
+    and outside what #37's retention job purges.
+    """
+    columns = {column.name for column in _table("golden_promotions").c}
+    assert columns == {
+        "id",
+        "tenant_id",
+        "lead_id",
+        "case_id",
+        "expected_tier",
+        "promoted_by",
+        "note",
+        "promoted_at",
+        "created_at",
+    }
+    assert not any(isinstance(column.type, JSONB) for column in _table("golden_promotions").c)
+
+
+def test_a_promotion_must_carry_a_rationale_long_enough_for_the_golden_set() -> None:
+    """#22 refuses a label whose notes are shorter than 20 characters. Staging a promotion
+    that the file would then refuse tells the operator it worked when it did not."""
+    assert "ck_golden_promotions_note_is_a_rationale" in _check_constraint_names(
+        "golden_promotions"
+    )
+    assert not _table("golden_promotions").c["note"].nullable

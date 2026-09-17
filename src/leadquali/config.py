@@ -299,6 +299,33 @@ class Settings(BaseSettings):
             "this one authorises writes to the training data. See leadquali.app.feedback."
         ),
     )
+    admin_session_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Signing secret for the staff admin's session cookies (#36), 32+ bytes. A "
+            "third distinct secret: the ingest signing secrets are held by customers' "
+            "websites, the feedback secret authorises writes to the training data, and "
+            "this one authorises editing every tenant's rubric. Rotating it signs every "
+            "staff member out, which is the intended emergency response."
+        ),
+    )
+    admin_session_secret_arn: str | None = Field(
+        default=None,
+        description="Secrets Manager ARN holding ADMIN_SESSION_SECRET.",
+    )
+    admin_credentials: SecretStr | None = Field(
+        default=None,
+        description=(
+            'Staff credentials as JSON: {"<username>": "$argon2id$..."}. Hashes only — '
+            "there is no path by which a plaintext password reaches this system. See "
+            "docs/admin.md for how to generate one."
+        ),
+    )
+    admin_credentials_secret_arn: str | None = Field(
+        default=None,
+        description="Secrets Manager ARN holding ADMIN_CREDENTIALS.",
+    )
+
     feedback_token_ttl_days: int = Field(
         default=DEFAULT_TOKEN_TTL_DAYS,
         gt=0,
@@ -578,6 +605,41 @@ class Settings(BaseSettings):
                 "land on after managing their billing, e.g. https://acme.example/billing."
             )
         return self.stripe_portal_return_url
+
+    def require_admin_session_secret(self) -> str:
+        """Return the admin session signing secret, or raise if it was never configured.
+
+        There is deliberately no generated-at-startup fallback. A per-process random secret
+        would appear to work — until the second Lambda container served a request and
+        signed everybody out, or until a deploy did — and the failure would look like a
+        flaky login rather than like a missing setting.
+        """
+        return self._secret(
+            secret_arn=self.admin_session_secret_arn,
+            literal=self.admin_session_secret,
+            unset=(
+                "ADMIN_SESSION_SECRET is not set. The staff admin signs its session "
+                "cookies and there is no unsigned mode; export 32+ characters of random "
+                "material, or set ADMIN_SESSION_SECRET_ARN."
+            ),
+        )
+
+    def require_admin_credentials(self) -> str:
+        """Return the staff credential JSON, or raise if it was never configured.
+
+        No credentials means no admin, and that is the right failure: an admin that
+        started with an empty credential map would either refuse every login (confusing)
+        or, if anybody ever "fixed" that, accept any (catastrophic).
+        """
+        return self._secret(
+            secret_arn=self.admin_credentials_secret_arn,
+            literal=self.admin_credentials,
+            unset=(
+                "ADMIN_CREDENTIALS is not set. The staff admin authenticates against a "
+                'JSON map of {"username": "$argon2id$..."}; generate one with '
+                "`python -m leadquali.adminctl hash`, or set ADMIN_CREDENTIALS_SECRET_ARN."
+            ),
+        )
 
     def require_database_url(self) -> str:
         """Return the database URL, assembled from parts in AWS and given whole locally.

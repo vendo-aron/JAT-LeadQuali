@@ -4,9 +4,26 @@ This is the ingest API's own schema, deliberately separate from
 :class:`~leadquali.prompts.lead.LeadSubmission`. They answer different questions —
 "what may a stranger send us?" and "what does the renderer need?" — and they change for
 different reasons: adding a form field is a change here, changing how a lead is presented
-to the model is a change there. :meth:`LeadForm.to_submission` is the one seam between
-them, and it is a mapping rather than an inheritance so neither can quietly acquire the
-other's fields.
+to the model is a change there.
+:meth:`~leadquali.app.lead_payload.LeadForm.to_submission` is the one seam between them,
+and it is a mapping rather than an inheritance so neither can quietly acquire the other's
+fields.
+
+What is here and what is not
+----------------------------
+
+The **envelope** is here: the idempotency key, the source, the honeypot, the timing signal,
+and ``extra="forbid"`` around the lot. That is the HTTP protocol between a customer's
+website and this endpoint, and it is this module's to own.
+
+:class:`~leadquali.app.lead_payload.LeadForm` is **not** here; it lives in
+:mod:`leadquali.app.lead_payload` and is imported back for the endpoint's use. It describes
+the *content* of a submission rather than the protocol around it, and it is therefore also
+the parser for ``leads.raw_payload`` — which #36's re-run reads from an adapter, where
+``CLAUDE.md``'s one-directional layering rule forbids importing ``leadquali.api``. Moving
+it is what keeps one description of "what a lead payload looks like" instead of two that
+drift. Every name it took with it is re-exported below, so this module's public surface is
+unchanged.
 
 Everything is bounded. The envelope forbids unknown keys, every string has a maximum
 length, and unknown *form* fields are kept but only as scalars: a form nobody anticipated
@@ -22,9 +39,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from leadquali.prompts.lead import LeadSubmission
+from leadquali.app.lead_payload import (
+    MAX_EXTRA_FIELDS,
+    MAX_MESSAGE_CHARS,
+    MAX_SHORT_FIELD_CHARS,
+    LeadForm,
+)
 
 #: Largest body the endpoint will read, before parsing. A web-form lead is a few hundred
 #: bytes; 64 KiB is room for a very long enquiry and far less than it takes to make
@@ -39,62 +61,11 @@ SUBMISSION_ID_PATTERN: Final[str] = r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
 #: Where the lead came from, recorded on the row. A short identifier, not free text.
 SOURCE_PATTERN: Final[str] = r"^[a-z][a-z0-9_-]{0,31}$"
 
-MAX_SHORT_FIELD_CHARS: Final[int] = 1_000
-MAX_MESSAGE_CHARS: Final[int] = 20_000
-MAX_EXTRA_FIELDS: Final[int] = 50
-
 #: A day. Anything outside this is not a plausible form-fill duration, in either
 #: direction, and a negative value is a bot signal the pre-filters read (not an error).
+#: An envelope concern, unlike the form's own caps: the timing signal is part of the
+#: protocol between a customer's page and this endpoint, not part of what a lead said.
 _MAX_ELAPSED_MS: Final[int] = 24 * 60 * 60 * 1_000
-
-
-class LeadForm(BaseModel):
-    """The form's fields. Known ones are typed; anything else is kept as a scalar."""
-
-    model_config = ConfigDict(extra="allow")
-
-    full_name: str | None = Field(default=None, max_length=MAX_SHORT_FIELD_CHARS)
-    email: str | None = Field(default=None, max_length=MAX_SHORT_FIELD_CHARS)
-    company: str | None = Field(default=None, max_length=MAX_SHORT_FIELD_CHARS)
-    role: str | None = Field(default=None, max_length=MAX_SHORT_FIELD_CHARS)
-    phone: str | None = Field(default=None, max_length=MAX_SHORT_FIELD_CHARS)
-    website: str | None = Field(default=None, max_length=MAX_SHORT_FIELD_CHARS)
-    message: str | None = Field(default=None, max_length=MAX_MESSAGE_CHARS)
-
-    @model_validator(mode="after")
-    def _unknown_fields_are_scalars(self) -> LeadForm:
-        """An unanticipated field is welcome; an unanticipated document is not.
-
-        A nested object or array in a form field is not something a form produces, and
-        accepting one would mean stringifying arbitrarily deep structure on the request
-        path. Rejecting it keeps the work per request bounded by the body-size limit.
-        """
-        for name, value in (self.model_extra or {}).items():
-            if isinstance(value, dict | list):
-                raise ValueError(f"form field '{name[:64]}' must be a single value, not a list")
-        return self
-
-    def to_submission(self) -> LeadSubmission:
-        """Map the wire form onto the renderer's input.
-
-        Unknown fields become :attr:`~leadquali.prompts.lead.LeadSubmission.extra`,
-        stringified and capped in count. The renderer sanitises, truncates and escapes
-        every one of them, so nothing here needs to decide whether a value is safe — only
-        whether it is bounded.
-        """
-        extras: dict[str, str | None] = {}
-        for name, value in list((self.model_extra or {}).items())[:MAX_EXTRA_FIELDS]:
-            extras[name] = None if value is None else str(value)
-        return LeadSubmission(
-            full_name=self.full_name,
-            email=self.email,
-            company=self.company,
-            role=self.role,
-            phone=self.phone,
-            website=self.website,
-            message=self.message,
-            extra=extras,
-        )
 
 
 class LeadIngestRequest(BaseModel):
@@ -177,6 +148,10 @@ class ValidationErrorResponse(ErrorResponse):
     errors: list[FieldError] = Field(default_factory=list)
 
 
+#: Unchanged by ``LeadForm``'s move to :mod:`leadquali.app.lead_payload`: the four names it
+#: took with it are imported above and named here, so every existing import of
+#: ``leadquali.api.schemas`` keeps working and there is one ``LeadForm`` class rather than
+#: two. ``tests/unit/test_lead_payload.py`` pins both halves of that.
 __all__ = [
     "MAX_BODY_BYTES",
     "MAX_EXTRA_FIELDS",

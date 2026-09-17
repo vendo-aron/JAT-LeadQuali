@@ -1,0 +1,91 @@
+{#
+  One lead, in full, including the submitter's own words and contact details.
+
+  That is deliberate and invariant 5 permits it: the rule is about logs, not about a screen
+  a person is looking at on purpose. What must never happen is the same data reaching a log
+  line or an error page, which is a property of leadquali.api.admin's handlers and of
+  error.html, and is tested there.
+#}
+{% extends "admin/base.html" %}
+{% block title %}Lead — LeadQuali admin{% endblock %}
+{% block content %}
+{% if detail is none %}
+<h1>No such lead</h1>
+<p class="muted">This tenant has no lead with that id. It may have been purged by the
+  retention policy, or the link may be for a different tenant.</p>
+{% else %}
+<h1>Lead {{ detail.lead_id }}</h1>
+<p class="muted">
+  {{ detail.tenant_slug }} · submission <code>{{ detail.submission_id }}</code> ·
+  source {{ detail.source }} · received
+  {{ detail.received_at.strftime('%Y-%m-%d %H:%M') }} ·
+  contact hash <code>{{ (detail.contact_email_hash or '—')[:16] }}</code>
+</p>
+
+<h2>What they sent</h2>
+<pre>{{ detail.raw_payload | pretty_json }}</pre>
+
+<h2>Assessments</h2>
+{% for assessment in detail.assessments %}
+<table>
+  <tr><th>Assessed</th><td>{{ assessment.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+      <th>Status</th><td>{{ assessment.status }}</td></tr>
+  <tr><th>Tier</th>
+      <td>{% if assessment.tier %}<span class="tier-{{ assessment.tier.value }}"
+          >{{ assessment.tier.value }}</span>{% else %}—{% endif %}</td>
+      <th>Score</th>
+      <td>{{ assessment.total_score if assessment.total_score is not none else '—' }}</td></tr>
+  <tr><th>Confidence</th>
+      <td>{{ assessment.confidence if assessment.confidence is not none else '—' }}</td>
+      <th>Escalated because</th><td>{{ assessment.escalation_reason or '—' }}</td></tr>
+  <tr><th>Model</th><td>{{ assessment.model_id }}</td>
+      <th>Prompt</th><td>{{ assessment.prompt_version }}
+          {% if assessment.effort %}· effort {{ assessment.effort }}{% endif %}</td></tr>
+  <tr><th>Cost</th><td>{{ assessment.cost_usd | money }}</td>
+      <th>Latency</th><td>{{ assessment.latency_ms }} ms</td></tr>
+</table>
+{% if assessment.reasoning %}<p><strong>Reasoning.</strong> {{ assessment.reasoning }}</p>{% endif %}
+{% if assessment.dimension_scores %}
+<pre>{{ assessment.dimension_scores | pretty_json }}</pre>
+{% endif %}
+{% if assessment.extracted %}<pre>{{ assessment.extracted | pretty_json }}</pre>{% endif %}
+{% if assessment.missing_information %}
+<p><strong>Missing information.</strong>
+  {{ assessment.missing_information | join(', ') }}</p>
+{% endif %}
+{% else %}
+<p class="muted">This lead has never been assessed.</p>
+{% endfor %}
+
+<h2>Routing</h2>
+<table>
+  <tr><th>When</th><th>Action</th><th>Destination</th><th>Outcome</th><th>Provider id</th></tr>
+  {% for event in detail.routing %}
+  <tr>
+    <td>{{ event.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td>{{ event.action }}</td>
+    <td>{{ event.destination or '—' }}</td>
+    <td>{{ event.outcome }}</td>
+    <td><code>{{ event.provider_message_id or '—' }}</code></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">Nothing was ever dispatched for this lead.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Feedback</h2>
+<table>
+  <tr><th>When</th><th>Rater</th><th>Verdict</th><th>Notes</th></tr>
+  {% for note in detail.feedback %}
+  <tr>
+    <td>{{ note.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td><code>{{ note.rater }}</code></td>
+    <td>{{ note.verdict.value }}</td>
+    <td>{{ note.notes or '' }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="muted">Nobody has rated this lead.</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

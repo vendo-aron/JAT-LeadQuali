@@ -14,12 +14,27 @@ proves nothing about invariant 3.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol
 
+from leadquali.app.admin_views import (
+    AgreementPoint,
+    FeedbackNote,
+    LeadAssessmentRow,
+    LeadDetail,
+    LeadFilter,
+    LeadPage,
+    LeadRow,
+    PageCursor,
+    RerunCandidate,
+    ReviewRow,
+    RoutingRow,
+    TierCount,
+)
 from leadquali.app.assessment_result import (
     AssessmentFailed,
     AssessmentOutcome,
@@ -35,8 +50,10 @@ from leadquali.app.billing import (
     SubscriptionState,
     UsageReport,
 )
+from leadquali.app.config_versions import ConfigVersion, UnknownConfigVersionError
 from leadquali.app.enrichment import Enrichment
 from leadquali.app.feedback import UnknownLeadError, Verdict
+from leadquali.app.golden_promotion import GoldenPromotion
 from leadquali.app.metering import (
     BillingPeriod,
     DailySpend,
@@ -55,8 +72,9 @@ from leadquali.app.tenants import (
     UnknownApiKeyError,
     UnknownTenantError,
 )
-from leadquali.domain.models import Action, LeadAssessment, RoutingDecision
+from leadquali.domain.models import Action, LeadAssessment, RoutingDecision, Tier
 from leadquali.domain.tenant_config import TenantConfig, TenantNotFoundError
+from leadquali.observability import contact_email_hash
 from leadquali.prompts.lead import LeadSubmission
 
 
@@ -517,6 +535,21 @@ class InMemoryTenantAdminStore:
         if existing.revoked_at is not None:
             return existing
         return self._update_key(owner, key_id, revoked_at=revoked_at)
+
+    # ---------------------------------------------------------------- unit of work
+
+    def snapshot(self) -> tuple[dict[str, TenantRecord], dict[str, tuple[str, ApiKeyRecord]]]:
+        """State to restore if the surrounding :class:`FakeUnitOfWork` rolls back.
+
+        A shallow copy of each dict is enough because every value is a frozen dataclass:
+        an update replaces the value rather than mutating it.
+        """
+        return dict(self.tenants), dict(self.keys)
+
+    def restore(
+        self, snapshot: tuple[dict[str, TenantRecord], dict[str, tuple[str, ApiKeyRecord]]]
+    ) -> None:
+        self.tenants, self.keys = dict(snapshot[0]), dict(snapshot[1])
 
     # ----------------------------------------------------------------------- internals
 
@@ -1101,3 +1134,477 @@ class InMemoryBillingStore:
         if tenant is None:
             raise FakeStoreError(f"no tenant '{tenant_id}'")
         return tenant
+
+
+# ------------------------------------------------------------------------- admin (#36)
+
+
+class InMemoryConfigVersionStore:
+    """A :class:`~leadquali.app.config_versions.ConfigVersionStorePort` over a dict.
+
+    Allocates the version number from what it holds, exactly as the Postgres one allocates
+    it from the table, so a test that asserts "version 2 followed version 1" is asserting
+    the same rule in both.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, list[ConfigVersion]] = {}
+        self.appends = 0
+
+    def seed(
+        self, *, tenant_slug: str, config: Mapping[str, Any], changed_by: str
+    ) -> ConfigVersion:
+        """Write version 1 the way the migration does, without counting as an append."""
+        return self._append(
+            tenant_slug=tenant_slug,
+            config=config,
+            changed_by=changed_by,
+            changed_at=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+            note="seeded from the tenant's stored config",
+        )
+
+    def append(
+        self,
+        *,
+        tenant_slug: str,
+        config: Mapping[str, Any],
+        changed_by: str,
+        changed_at: datetime,
+        note: str | None,
+    ) -> ConfigVersion:
+        self.appends += 1
+        return self._append(
+            tenant_slug=tenant_slug,
+            config=config,
+            changed_by=changed_by,
+            changed_at=changed_at,
+            note=note,
+        )
+
+    def list_versions(
+        self, *, tenant_slug: str, limit: int | None = None
+    ) -> Sequence[ConfigVersion]:
+        newest_first = sorted(
+            self.rows.get(tenant_slug, ()), key=lambda row: row.version, reverse=True
+        )
+        return newest_first if limit is None else newest_first[:limit]
+
+    def get_version(self, *, tenant_slug: str, version: int) -> ConfigVersion:
+        for row in self.rows.get(tenant_slug, ()):
+            if row.version == version:
+                return row
+        raise UnknownConfigVersionError(f"tenant '{tenant_slug}' has no config version {version}")
+
+    # ------------------------------------------------------------------- assertions
+
+    def versions(self, tenant_slug: str) -> list[ConfigVersion]:
+        """Every version for one tenant, oldest first."""
+        return sorted(self.rows.get(tenant_slug, ()), key=lambda row: row.version)
+
+    def snapshot(self) -> dict[str, list[ConfigVersion]]:
+        """State to restore if the surrounding unit of work rolls back."""
+        return {slug: list(rows) for slug, rows in self.rows.items()}
+
+    def restore(self, snapshot: dict[str, list[ConfigVersion]]) -> None:
+        self.rows = {slug: list(rows) for slug, rows in snapshot.items()}
+
+    def _append(
+        self,
+        *,
+        tenant_slug: str,
+        config: Mapping[str, Any],
+        changed_by: str,
+        changed_at: datetime,
+        note: str | None,
+    ) -> ConfigVersion:
+        rows = self.rows.setdefault(tenant_slug, [])
+        row = ConfigVersion(
+            tenant_slug=tenant_slug,
+            version=max((existing.version for existing in rows), default=0) + 1,
+            config=dict(config),
+            changed_by=changed_by,
+            changed_at=changed_at,
+            note=note,
+        )
+        rows.append(row)
+        return row
+
+
+class ExplodingConfigVersionStore(InMemoryConfigVersionStore):
+    """A version store whose append always fails, after the config write has happened.
+
+    The double that drives the one property worth the most: a config saved with no audit
+    row must be impossible. It still counts the attempt, so a test can tell "the append
+    raised" from "the append was never reached".
+    """
+
+    def append(
+        self,
+        *,
+        tenant_slug: str,
+        config: Mapping[str, Any],
+        changed_by: str,
+        changed_at: datetime,
+        note: str | None,
+    ) -> ConfigVersion:
+        del config, changed_by, changed_at, note
+        self.appends += 1
+        raise FakeStoreError(f"could not append a config version for '{tenant_slug}'")
+
+
+class SupportsSnapshot(Protocol):
+    """A fake that can be rolled back by :class:`FakeUnitOfWork`."""
+
+    def snapshot(self) -> Any:
+        """Capture the state to restore on a rollback."""
+        ...
+
+    def restore(self, snapshot: Any) -> None:
+        """Put the captured state back."""
+        ...
+
+
+class FakeUnitOfWork:
+    """A :class:`~leadquali.app.config_versions.UnitOfWorkPort` that really does roll back.
+
+    It snapshots every participant on entry and restores them if the block raises, which
+    makes "these two writes are atomic" a property a unit test can actually observe rather
+    than a claim about SQL nobody here can run. What it deliberately does *not* prove is
+    that the Postgres implementation opens one transaction — that is asserted against a
+    real engine in ``tests/unit/test_unit_of_work.py``.
+    """
+
+    def __init__(self, *participants: SupportsSnapshot) -> None:
+        self.participants = participants
+        self.depth = 0
+        self.rollbacks = 0
+
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        """Run the block, undoing every participant's writes if it raises."""
+        snapshots = [(participant, participant.snapshot()) for participant in self.participants]
+        self.depth += 1
+        try:
+            yield
+        except BaseException:
+            self.rollbacks += 1
+            for participant, snapshot in snapshots:
+                participant.restore(snapshot)
+            raise
+        finally:
+            self.depth -= 1
+
+
+class InMemoryGoldenPromotionStore:
+    """A :class:`~leadquali.app.golden_promotion.GoldenPromotionStorePort` over a dict.
+
+    Keyed on ``(tenant_slug, lead_id)``, exactly as
+    ``uq_golden_promotions_tenant_id_lead_id`` keys it in the schema, so the idempotency a
+    test asserts here is the idempotency the database enforces there.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, str], GoldenPromotion] = {}
+
+    def record(
+        self,
+        *,
+        tenant_slug: str,
+        lead_id: str,
+        case_id: str,
+        expected_tier: Tier,
+        promoted_by: str,
+        note: str,
+        promoted_at: datetime,
+    ) -> tuple[GoldenPromotion, bool]:
+        key = (tenant_slug, lead_id)
+        existing = self.rows.get(key)
+        if existing is not None:
+            # The first label is the one that was reviewed. A later click reads it back
+            # rather than replacing the tier it recorded.
+            return existing, False
+        row = GoldenPromotion(
+            tenant_slug=tenant_slug,
+            lead_id=lead_id,
+            case_id=case_id,
+            expected_tier=expected_tier,
+            promoted_by=promoted_by,
+            note=note,
+            promoted_at=promoted_at,
+        )
+        self.rows[key] = row
+        return row, True
+
+    def list_promotions(
+        self, *, tenant_slug: str, limit: int | None = None
+    ) -> Sequence[GoldenPromotion]:
+        newest_first = sorted(
+            (row for (slug, _), row in self.rows.items() if slug == tenant_slug),
+            key=lambda row: (row.promoted_at, row.case_id),
+            reverse=True,
+        )
+        return newest_first if limit is None else newest_first[:limit]
+
+    def promoted_lead_ids(self, *, tenant_slug: str, lead_ids: Sequence[str]) -> frozenset[str]:
+        wanted = set(lead_ids)
+        return frozenset(
+            lead_id for (slug, lead_id) in self.rows if slug == tenant_slug and lead_id in wanted
+        )
+
+
+@dataclass
+class AdminLead:
+    """One lead and its one assessment, as the in-memory admin query store keeps them.
+
+    Flattened on purpose: the Postgres query the browser runs is an ``assessments`` scan
+    joined to ``leads``, so a double that modelled two collections would be modelling a
+    shape the real query does not have.
+    """
+
+    lead_id: str
+    tenant_slug: str
+    submission_id: str
+    created_at: datetime
+    tier: Tier | None = Tier.HOT
+    total_score: Decimal | None = Decimal("82.00")
+    confidence: Decimal | None = Decimal("0.900")
+    status: str = "ok"
+    escalation_reason: str | None = None
+    industry: str | None = "logistics"
+    company: str | None = "Northwind"
+    raw_payload: Mapping[str, Any] = field(default_factory=dict)
+    verdict: Verdict | None = None
+    rater: str = "rep-1"
+    feedback_notes: str | None = None
+    assessment_id: str | None = None
+
+    @property
+    def row_id(self) -> str:
+        """The assessment's id — what the keyset cursor pages on."""
+        return self.assessment_id if self.assessment_id is not None else f"assess-{self.lead_id}"
+
+
+class InMemoryAdminQueryStore:
+    """An :class:`~leadquali.app.admin_views.AdminQueryPort` with the real one's ordering.
+
+    The one behaviour worth modelling faithfully is the keyset cursor: rows are ordered by
+    ``(created_at, id)`` descending and a page resumes *strictly after* the cursor, which
+    is the same rule ``PostgresAdminQueryStore`` writes as a row-value comparison. A double
+    that paged by list index would let the pagination test pass against SQL that skips
+    rows under insertion, which is the exact bug keyset paging exists to prevent.
+    """
+
+    def __init__(self, leads: Iterable[AdminLead] = ()) -> None:
+        self.leads: list[AdminLead] = list(leads)
+
+    def add(self, lead: AdminLead) -> AdminLead:
+        """Insert a lead, including mid-traversal."""
+        self.leads.append(lead)
+        return lead
+
+    # ------------------------------------------------------------------------ browsing
+
+    def browse_leads(
+        self, *, criteria: LeadFilter, cursor: PageCursor | None, limit: int
+    ) -> LeadPage:
+        matching = [lead for lead in self._ordered() if self._matches(lead, criteria)]
+        if cursor is not None:
+            matching = [
+                lead
+                for lead in matching
+                if (lead.created_at, lead.row_id) < (cursor.created_at, cursor.row_id)
+            ]
+        # One more than asked for, so "is there another page?" costs a row rather than a
+        # COUNT(*) — the same trick the SQL uses.
+        window = matching[: limit + 1]
+        rows = tuple(self._row(lead) for lead in window[:limit])
+        return LeadPage(
+            rows=rows,
+            next_cursor=rows[-1].cursor if len(window) > limit and rows else None,
+        )
+
+    def lead_detail(self, *, tenant_slug: str, lead_id: str) -> LeadDetail | None:
+        for lead in self.leads:
+            if lead.tenant_slug == tenant_slug and lead.lead_id == lead_id:
+                return self._detail(lead)
+        return None
+
+    def feedback_review(
+        self,
+        *,
+        tenant_slug: str,
+        tier: Tier,
+        verdict: Verdict,
+        start: date,
+        end: date,
+        limit: int,
+    ) -> Sequence[ReviewRow]:
+        found = [
+            lead
+            for lead in self._ordered()
+            if lead.tenant_slug == tenant_slug
+            and lead.tier is tier
+            and lead.verdict is verdict
+            and start <= lead.created_at.date() <= end
+        ]
+        return [self._review_row(lead) for lead in found[:limit]]
+
+    def tier_mix(self, *, tenant_slug: str, start: date, end: date) -> Sequence[TierCount]:
+        counts: dict[Tier | None, int] = {}
+        for lead in self.leads:
+            if lead.tenant_slug == tenant_slug and start <= lead.created_at.date() <= end:
+                counts[lead.tier] = counts.get(lead.tier, 0) + 1
+        return [
+            TierCount(tier=tier, count=counts[tier])
+            for tier in sorted(counts, key=lambda found: found.rank if found else -1, reverse=True)
+        ]
+
+    def feedback_agreement(
+        self, *, tenant_slug: str, start: date, end: date
+    ) -> Sequence[AgreementPoint]:
+        by_day: dict[date, dict[Verdict, int]] = {}
+        for lead in self.leads:
+            if lead.verdict is None or lead.tenant_slug != tenant_slug:
+                continue
+            day = lead.created_at.date()
+            if not start <= day <= end:
+                continue
+            tally = by_day.setdefault(day, {})
+            tally[lead.verdict] = tally.get(lead.verdict, 0) + 1
+        return [
+            AgreementPoint(
+                day=day,
+                good=by_day[day].get(Verdict.GOOD, 0),
+                bad=by_day[day].get(Verdict.BAD, 0),
+                unsure=by_day[day].get(Verdict.UNSURE, 0),
+            )
+            for day in sorted(by_day)
+        ]
+
+    def rerun_candidates(self, *, tenant_slug: str, limit: int) -> Sequence[RerunCandidate]:
+        found = [lead for lead in self._ordered() if lead.tenant_slug == tenant_slug]
+        return [
+            RerunCandidate(
+                lead_id=lead.lead_id,
+                submission_id=lead.submission_id,
+                submission=LeadSubmission(**dict(lead.raw_payload)),
+                assessed_at=lead.created_at,
+                previous_tier=lead.tier,
+                previous_score=lead.total_score,
+            )
+            for lead in found[:limit]
+        ]
+
+    # ----------------------------------------------------------------------- internals
+
+    def _ordered(self) -> list[AdminLead]:
+        return sorted(self.leads, key=lambda lead: (lead.created_at, lead.row_id), reverse=True)
+
+    @staticmethod
+    def _matches(lead: AdminLead, criteria: LeadFilter) -> bool:
+        if lead.tenant_slug != criteria.tenant_slug:
+            return False
+        if criteria.tier is not None and lead.tier is not criteria.tier:
+            return False
+        day = lead.created_at.date()
+        if criteria.start is not None and day < criteria.start:
+            return False
+        if criteria.end is not None and day > criteria.end:
+            return False
+        if criteria.min_confidence is not None and (
+            lead.confidence is None or lead.confidence < criteria.min_confidence
+        ):
+            return False
+        return not (
+            criteria.max_confidence is not None
+            and (lead.confidence is None or lead.confidence > criteria.max_confidence)
+        )
+
+    @staticmethod
+    def _row(lead: AdminLead) -> LeadRow:
+        return LeadRow(
+            lead_id=lead.lead_id,
+            assessment_id=lead.row_id,
+            submission_id=lead.submission_id,
+            created_at=lead.created_at,
+            received_at=lead.created_at,
+            tier=lead.tier,
+            total_score=lead.total_score,
+            confidence=lead.confidence,
+            status=lead.status,
+            escalation_reason=lead.escalation_reason,
+            company=lead.company,
+            industry=lead.industry,
+            contact_email_hash=contact_email_hash(str(lead.raw_payload.get("email") or "")),
+            verdict=lead.verdict,
+        )
+
+    @staticmethod
+    def _review_row(lead: AdminLead) -> ReviewRow:
+        assert lead.verdict is not None
+        return ReviewRow(
+            lead_id=lead.lead_id,
+            assessed_at=lead.created_at,
+            tier=lead.tier,
+            total_score=lead.total_score,
+            confidence=lead.confidence,
+            industry=lead.industry,
+            company=lead.company,
+            verdict=lead.verdict,
+            rater=lead.rater,
+            notes=lead.feedback_notes,
+            feedback_at=lead.created_at,
+        )
+
+    @staticmethod
+    def _detail(lead: AdminLead) -> LeadDetail:
+        return LeadDetail(
+            lead_id=lead.lead_id,
+            tenant_slug=lead.tenant_slug,
+            submission_id=lead.submission_id,
+            source="web_form",
+            received_at=lead.created_at,
+            contact_email_hash=contact_email_hash(str(lead.raw_payload.get("email") or "")),
+            raw_payload=dict(lead.raw_payload),
+            assessments=(
+                LeadAssessmentRow(
+                    assessment_id=lead.row_id,
+                    created_at=lead.created_at,
+                    status=lead.status,
+                    tier=lead.tier,
+                    total_score=lead.total_score,
+                    confidence=lead.confidence,
+                    escalation_reason=lead.escalation_reason,
+                    dimension_scores={"icp_fit": 28},
+                    extracted={"industry": lead.industry, "company_name": lead.company},
+                    reasoning="strong fit",
+                    missing_information=[],
+                    model_id="claude-test",
+                    prompt_version="v1",
+                    effort=None,
+                    cost_usd=Decimal("0.0180"),
+                    latency_ms=900,
+                ),
+            ),
+            routing=(
+                RoutingRow(
+                    action="email_sales",
+                    destination="hot@example.com",
+                    outcome="dispatched",
+                    provider_message_id="ses-1",
+                    created_at=lead.created_at,
+                ),
+            ),
+            feedback=(
+                ()
+                if lead.verdict is None
+                else (
+                    FeedbackNote(
+                        rater=lead.rater,
+                        verdict=lead.verdict,
+                        notes=lead.feedback_notes,
+                        created_at=lead.created_at,
+                    ),
+                )
+            ),
+        )

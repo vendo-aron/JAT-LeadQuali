@@ -1,0 +1,77 @@
+{#
+  The lead browser. Listing rows carry `contact_email_hash` rather than the address: the
+  address belongs on the detail page, where a human is looking at one lead on purpose.
+
+  Paging is a keyset cursor carried in the query string, never an offset — see
+  leadquali.app.admin_views for why that is a correctness decision.
+#}
+{% extends "admin/base.html" %}
+{% block title %}Leads — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Leads</h1>
+{% if errors %}
+<div class="errors"><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>
+{% endif %}
+<form class="filters" method="get" action="{{ admin_prefix }}/leads">
+  <label>Tenant
+    <select name="tenant" required>
+      <option value="">choose…</option>
+      {% for tenant in tenants %}
+      <option value="{{ tenant.slug }}"
+        {% if criteria and criteria.tenant_slug == tenant.slug %}selected{% endif %}>
+        {{ tenant.slug }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Tier
+    <select name="tier">
+      <option value="">any</option>
+      {% for name in ['hot', 'warm', 'cold', 'disqualified'] %}
+      <option value="{{ name }}"
+        {% if params.get('tier') == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select></label>
+  <label>From <input type="date" name="from" value="{{ params.get('from', '') }}"></label>
+  <label>To <input type="date" name="to" value="{{ params.get('to', '') }}"></label>
+  <label>Min confidence
+    <input name="min_confidence" size="5" value="{{ params.get('min_confidence', '') }}"></label>
+  <label>Max confidence
+    <input name="max_confidence" size="5" value="{{ params.get('max_confidence', '') }}"></label>
+  <button type="submit">Filter</button>
+</form>
+{% if page is none %}
+<p class="muted">Choose a tenant to browse their leads.</p>
+{% elif not page.rows %}
+<p class="muted">No leads match that filter.</p>
+{% else %}
+<table>
+  <tr><th>Assessed</th><th>Tier</th><th>Score</th><th>Confidence</th><th>Company</th>
+      <th>Industry</th><th>Contact (hashed)</th><th>Feedback</th><th></th></tr>
+  {% for row in page.rows %}
+  <tr>
+    <td>{{ row.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td>{% if row.tier %}<span class="tier-{{ row.tier.value }}">{{ row.tier.value }}</span>
+        {% else %}<span class="muted">not assessed</span>{% endif %}</td>
+    <td class="num">{{ row.total_score if row.total_score is not none else '—' }}</td>
+    <td class="num">{{ row.confidence if row.confidence is not none else '—' }}</td>
+    <td>{{ row.company or '' }}</td>
+    <td>{{ row.industry or '' }}</td>
+    <td><code class="muted">{{ (row.contact_email_hash or '')[:12] }}</code></td>
+    <td>{{ row.verdict.value if row.verdict else '' }}</td>
+    <td><a href="{{ admin_prefix }}/leads/{{ row.lead_id }}?tenant={{ criteria.tenant_slug }}"
+        >open</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% if page.next_cursor %}
+<form class="inline" method="get" action="{{ admin_prefix }}/leads">
+  {% for key, value in params.items() %}
+    {% if key != 'cursor' %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endif %}
+  {% endfor %}
+  <input type="hidden" name="cursor" value="{{ page.next_cursor.encode() }}">
+  <button type="submit">Next page</button>
+</form>
+{% else %}
+<p class="muted">End of results.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

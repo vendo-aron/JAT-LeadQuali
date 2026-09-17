@@ -64,6 +64,7 @@ from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
 from leadquali.adapters.store_postgres import PostgresLeadStore, session_factory_from_env
 from leadquali.adapters.store_tenants import PostgresIngestCredentials, PostgresTenantAdminStore
+from leadquali.api.admin import AdminDeps, register_admin_routes
 from leadquali.api.feedback import FeedbackDeps, register_feedback_routes
 from leadquali.api.ratelimit import NoRateLimit, RateLimiterPort, TenantRateLimiter
 from leadquali.api.schemas import (
@@ -203,17 +204,25 @@ def create_app(
     deps: IngestDeps | None = None,
     feedback_deps: FeedbackDeps | None = None,
     billing_deps: BillingDeps | None = None,
+    admin_deps: AdminDeps | None = None,
 ) -> FastAPI:
     """Build the ASGI application.
 
-    Two public surfaces share it and share nothing else: ``POST /leads``, which a customer's
-    website calls with a signed request, and ``GET``/``POST /feedback/{token}``, which a
-    sales rep opens from an email. One app because it is one deployment — the feedback link
-    has to resolve on a host the rep can reach, and standing up a second service for two
-    routes would mean a second domain, a second certificate and a second thing to page
-    someone about. Their dependencies stay separate objects (see
-    :class:`~leadquali.api.feedback.FeedbackDeps`) so that neither endpoint can reach the
-    other's collaborators.
+    Three surfaces share it and share nothing else: ``POST /leads``, which a customer's
+    website calls with a signed request; ``GET``/``POST /feedback/{token}``, which a sales
+    rep opens from an email; and ``/admin``, which a member of staff signs in to. One app
+    because it is one deployment — the feedback link has to resolve on a host the rep can
+    reach, and standing up a second service would mean a second domain, a second
+    certificate and a second thing to page someone about. Their dependencies stay separate
+    objects (:class:`~leadquali.api.feedback.FeedbackDeps`,
+    :class:`~leadquali.api.admin.AdminDeps`) so that no endpoint can reach another's
+    collaborators — ingest must not be able to reach a
+    :class:`~leadquali.app.tenants.TenantService`, and the admin has no business holding
+    the lead queue.
+
+    **The admin routes are mounted behind their own session dependency**, declared on the
+    router rather than on each handler, so a route added later is protected by where it
+    lives. ``tests/unit/test_api_admin.py`` enumerates them from this app and checks it.
 
     Args:
         deps: the ingest wiring. ``None`` — the default, and what uvicorn and Mangum get —
@@ -223,6 +232,7 @@ def create_app(
             portal — resolved the same way. A third separate deps object for a third
             separate surface: the webhook handler holds no lead store and no queue, and
             ingest holds no Stripe secret.
+        admin_deps: the admin wiring, resolved the same way.
 
     Returns:
         A deployment-agnostic ASGI app. It is served by uvicorn locally (``run_local.py``)
@@ -242,6 +252,7 @@ def create_app(
     )
     register_feedback_routes(app, feedback_deps)
     register_billing_routes(app, billing_deps)
+    register_admin_routes(app, admin_deps)
 
     @app.get(
         HEALTH_PATH,
@@ -484,6 +495,7 @@ app = create_app()
 __all__ = [
     "HEALTH_PATH",
     "INGEST_PATH",
+    "AdminDeps",
     "IngestDeps",
     "app",
     "build_deps",

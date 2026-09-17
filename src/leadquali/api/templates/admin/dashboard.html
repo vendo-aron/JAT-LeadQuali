@@ -1,0 +1,102 @@
+{#
+  One tenant's dashboard.
+
+  Volume and cost come from #33's usage_daily rollups and never from `assessments`, so the
+  page costs the same in month one and in year three. Tier mix and feedback agreement are
+  two direct queries, both bounded by this tenant and this window.
+
+  Days still in progress are marked. #33 sets `partial` on the open day, and rendering a
+  half-finished day as a settled number is how a dashboard quietly lies every morning.
+#}
+{% extends "admin/base.html" %}
+{% block title %}{{ tenant.slug }} — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>{{ tenant.name }} <span class="muted">({{ tenant.slug }}, {{ tenant.status.value }})</span></h1>
+<p class="muted">
+  <a href="{{ admin_prefix }}/tenants/{{ tenant.slug }}/config">Edit rubric</a> ·
+  <a href="{{ admin_prefix }}/tenants/{{ tenant.slug }}/config/history">History</a> ·
+  <a href="{{ admin_prefix }}/tenants/{{ tenant.slug }}/rerun">Test a rubric</a> ·
+  <a href="{{ admin_prefix }}/leads?tenant={{ tenant.slug }}">Leads</a> ·
+  <a href="{{ admin_prefix }}/review?tenant={{ tenant.slug }}">Feedback review</a>
+</p>
+<form class="filters" method="get" action="{{ admin_prefix }}/tenants/{{ tenant.slug }}">
+  <label>Window
+    <select name="window">
+      {% for option in windows %}
+      <option value="{{ option.value }}" {% if option == window %}selected{% endif %}>
+        last {{ option.days }} days</option>
+      {% endfor %}
+    </select></label>
+  <button type="submit">Show</button>
+</form>
+
+<h2>{{ period }}</h2>
+<table>
+  <tr><th>Leads received</th><td class="num">{{ totals.leads_ingested }}</td>
+      <th>Assessed</th><td class="num">{{ totals.leads_assessed }}</td></tr>
+  <tr><th>Billable leads</th><td class="num">{{ totals.leads_billable }}</td>
+      <th>Filtered as spam</th><td class="num">{{ totals.leads_filtered }}</td></tr>
+  <tr><th>Failed assessments</th><td class="num">{{ totals.assessments_failed }}</td>
+      <th>Inference cost</th><td class="num">{{ totals.cost_usd | money }}</td></tr>
+  <tr><th>Cost per billable lead</th>
+      <td class="num">{{ totals.cost_per_billable_lead_usd | money }}</td>
+      <th>Tokens</th><td class="num">{{ totals.total_tokens }}</td></tr>
+</table>
+{% if totals.partial %}
+<p class="muted">Today is not over, so these numbers can still grow.</p>
+{% endif %}
+
+<h2>Volume and cost, day by day</h2>
+<table>
+  <tr><th>Day</th><th>Received</th><th>Assessed</th><th>Billable</th><th>Cost</th></tr>
+  {% for day in daily %}
+  <tr>
+    <td>{{ day.period.start }}{% if day.partial %}
+        <span class="muted">(in progress)</span>{% endif %}</td>
+    <td class="num">{{ day.leads_ingested }}</td>
+    <td class="num">{{ day.leads_assessed }}</td>
+    <td class="num">{{ day.leads_billable }}</td>
+    <td class="num">{{ day.cost_usd | money }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">No rollup rows in this window. Run
+      <code>python -m leadquali.usagectl rollup {{ tenant.slug }}</code>.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Tier mix</h2>
+<table>
+  <tr><th>Tier</th><th>Assessments</th></tr>
+  {% for row in tier_mix %}
+  <tr>
+    <td>{% if row.tier %}<span class="tier-{{ row.tier.value }}">{{ row.tier.value }}</span>
+        {% else %}<span class="muted">could not assess</span>{% endif %}</td>
+    <td class="num">{{ row.count }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="2" class="muted">No assessments in this window.</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Feedback agreement over time</h2>
+<p class="muted">
+  The share of decisive verdicts that agreed with the system. <code>unsure</code> is
+  counted but left out of the ratio: it is neither agreement nor disagreement. A day with
+  no decisive verdict shows a dash rather than 0%, because "nobody rated anything" and
+  "everybody disagreed" are opposite facts.
+</p>
+<table>
+  <tr><th>Day</th><th>Good</th><th>Bad</th><th>Unsure</th><th>Agreement</th></tr>
+  {% for point in agreement %}
+  <tr>
+    <td>{{ point.day }}</td>
+    <td class="num">{{ point.good }}</td>
+    <td class="num">{{ point.bad }}</td>
+    <td class="num">{{ point.unsure }}</td>
+    <td class="num">{{ point.agreement | percent }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">Nobody has rated a lead in this window.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

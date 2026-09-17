@@ -36,7 +36,7 @@ MIGRATION = REPO_ROOT / "migrations" / "versions" / "20260908_1100_b7e14c9d82a3_
 #: The head #35 chains off. Stated here as a literal so that re-pointing it when #36's
 #: branch is stacked is a change somebody has to make on purpose, in two places, and not
 #: something that drifts.
-EXPECTED_DOWN_REVISION = "a3f5c2b81d47"
+EXPECTED_DOWN_REVISION = "b6d2e94f7a13"
 
 DIALECT = PGDialect()  # type: ignore[no-untyped-call]  # untyped in SQLAlchemy
 

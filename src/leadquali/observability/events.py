@@ -89,6 +89,40 @@ EVENT_DISPATCH_FAILED: Final[str] = "lead.dispatch_failed"
 #: prompt for somebody to talk to the customer, and nothing anywhere acts on it.
 EVENT_QUOTA_CROSSED: Final[str] = "tenant.quota_crossed"
 
+#: A staff login was refused (#36). Carries the username, which is a staff handle and not
+#: a lead's anything — but never the password, and never which half was wrong.
+EVENT_ADMIN_LOGIN_FAILED: Final[str] = "admin.login_failed"
+
+#: A tenant's rubric was changed through the admin (#36): who, which tenant, which version
+#: it became, and how many fields moved. Deliberately **not** the values: a routing rule
+#: carries a sales inbox, and the config itself is in ``tenant_config_versions`` where it
+#: belongs. This is the line that answers "when did this tenant's rubric change?" from a
+#: log search, which is the first question after a routing surprise.
+EVENT_ADMIN_CONFIG_CHANGED: Final[str] = "admin.config_changed"
+
+#: A rubric re-run finished (#36). The only record of what a rubric experiment cost:
+#: #33's ``usage_daily`` is computed from ``assessments`` rows and a re-run writes none, so
+#: there is no column that could hold "spent on this tenant, not billable to them".
+EVENT_ADMIN_RERUN_COMPLETED: Final[str] = "admin.rerun_completed"
+
+#: A lead was promoted into the eval golden set (#36).
+EVENT_ADMIN_LEAD_PROMOTED: Final[str] = "admin.lead_promoted"
+
+#: A request arrived at an admin route with no session, a forged one or an expired one.
+#: Carries which check failed — for the operator's logs only; the browser is told nothing,
+#: because "your cookie was well-formed but expired" tells a stranger the signing secret
+#: has not changed.
+EVENT_ADMIN_SESSION_REJECTED: Final[str] = "admin.session_rejected"
+
+#: A state-changing admin post arrived without this session's CSRF token, and wrote
+#: nothing. Worth alerting on: the benign cause is a page left open past a logout.
+EVENT_ADMIN_CSRF_REJECTED: Final[str] = "admin.csrf_rejected"
+
+#: An admin page raised. Carries the exception's **class** and nothing else — a traceback's
+#: frames hold the row being rendered, and the exception's own message is written by
+#: whatever raised it (a driver quoting the bytes it could not decode, say).
+EVENT_ADMIN_PAGE_FAILED: Final[str] = "admin.page_failed"
+
 
 class SuppressionCause(StrEnum):
     """Why a lead was never contacted. The two answers are not interchangeable.
@@ -401,6 +435,111 @@ def log_quota_crossed(
     )
 
 
+def log_admin_login_failed(logger: logging.Logger, *, username: str, gated: bool) -> None:
+    """A staff login did not succeed (#36).
+
+    The username is logged because an operator investigating a burst of failures needs to
+    know whose account is being guessed at, and a staff handle is not personal data in the
+    sense invariant 5 governs — it is the same class of value as ``feedback.rater``. The
+    password is not logged, in any form, and neither is *which* check failed: the page
+    tells a stranger nothing, and a log line that distinguishes "no such user" from "wrong
+    password" would hand the same oracle to anybody with log access.
+
+    Args:
+        logger: Where the line goes.
+        username: What was typed into the username box, already stripped.
+        gated: Whether the attempt was refused by the failure gate without reaching the
+            KDF. The one field that separates "somebody mistyped" from "somebody is
+            enumerating passwords", and therefore the one worth alerting on.
+    """
+    log_event(
+        logger,
+        EVENT_ADMIN_LOGIN_FAILED,
+        level=logging.WARNING,
+        username=username,
+        gated=gated,
+    )
+
+
+def log_admin_config_changed(
+    logger: logging.Logger,
+    *,
+    tenant_id: str,
+    changed_by: str,
+    version: int,
+    fields_changed: int,
+    reverted_from: int | None = None,
+) -> None:
+    """A tenant's rubric was changed through the admin (#36).
+
+    Counts and identifiers only. The values are deliberately absent: a routing rule holds a
+    sales inbox, the ICP prose is a customer's commercial positioning, and the whole
+    document is already in ``tenant_config_versions`` — which is a table with access
+    control, unlike a log aggregator.
+
+    Args:
+        logger: Where the line goes.
+        tenant_id: The tenant whose rubric moved.
+        changed_by: The staff subject from the session.
+        version: The version number that was appended.
+        fields_changed: How many fields the diff had.
+        reverted_from: The version whose config was restored, when this was a revert.
+    """
+    log_event(
+        logger,
+        EVENT_ADMIN_CONFIG_CHANGED,
+        tenant_id=tenant_id,
+        changed_by=changed_by,
+        config_version=version,
+        fields_changed=fields_changed,
+        reverted_from=reverted_from,
+    )
+
+
+def log_admin_rerun_completed(
+    logger: logging.Logger,
+    *,
+    tenant_id: str,
+    leads: int,
+    tier_changes: int,
+    cost_usd: Decimal,
+) -> None:
+    """A rubric re-run finished, and here is what it cost us (#36).
+
+    ``billable`` is emitted as a constant ``False`` rather than left implicit. The point of
+    the field is that somebody totalling spend from these lines can filter on it without
+    having to know that ``admin.rerun_completed`` is never billable, and that a future
+    event which *is* billable cannot be confused with this one.
+    """
+    log_event(
+        logger,
+        EVENT_ADMIN_RERUN_COMPLETED,
+        tenant_id=tenant_id,
+        leads=leads,
+        tier_changes=tier_changes,
+        cost_usd=cost_usd,
+        billable=False,
+    )
+
+
+def log_admin_lead_promoted(
+    logger: logging.Logger, *, tenant_id: str, lead_id: str, case_id: str, promoted_by: str
+) -> None:
+    """A lead was promoted into the eval golden set (#36).
+
+    Ids and handles. Not the tier and not the rationale: the rationale is free text a
+    human wrote about a lead, and the one place it is meant to live is the row.
+    """
+    log_event(
+        logger,
+        EVENT_ADMIN_LEAD_PROMOTED,
+        tenant_id=tenant_id,
+        lead_id=lead_id,
+        case_id=case_id,
+        promoted_by=promoted_by,
+    )
+
+
 def _metering_fields(metering: CallMetering | None) -> dict[str, str | int | Decimal | None]:
     """The metering, flattened into log fields under the names the plan uses."""
     if metering is None:
@@ -419,6 +558,13 @@ def _metering_fields(metering: CallMetering | None) -> dict[str, str | int | Dec
 
 
 __all__ = [
+    "EVENT_ADMIN_CONFIG_CHANGED",
+    "EVENT_ADMIN_CSRF_REJECTED",
+    "EVENT_ADMIN_LEAD_PROMOTED",
+    "EVENT_ADMIN_LOGIN_FAILED",
+    "EVENT_ADMIN_PAGE_FAILED",
+    "EVENT_ADMIN_RERUN_COMPLETED",
+    "EVENT_ADMIN_SESSION_REJECTED",
     "EVENT_ASSESSMENT",
     "EVENT_DISPATCH_FAILED",
     "EVENT_LEAD_ACCEPTED",
@@ -427,6 +573,10 @@ __all__ = [
     "EVENT_LEAD_SUPPRESSED",
     "EVENT_QUOTA_CROSSED",
     "SuppressionCause",
+    "log_admin_config_changed",
+    "log_admin_lead_promoted",
+    "log_admin_login_failed",
+    "log_admin_rerun_completed",
     "log_assessment",
     "log_dispatch_failed",
     "log_lead_accepted",
