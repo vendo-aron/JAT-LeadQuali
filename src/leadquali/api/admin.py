@@ -83,7 +83,12 @@ from leadquali.app.admin_views import (
     PageCursor,
     group_by_industry,
 )
-from leadquali.app.config_versions import MAX_NOTE_CHARS, ConfigEditor, UnknownConfigVersionError
+from leadquali.app.config_versions import (
+    MAX_NOTE_CHARS,
+    ConfigEditor,
+    ConfigVersionConflictError,
+    UnknownConfigVersionError,
+)
 from leadquali.app.feedback import Verdict
 from leadquali.app.golden_promotion import GoldenPromotionError, GoldenPromotionService
 from leadquali.app.metering import BillingPeriod, MeteringService
@@ -138,6 +143,11 @@ _PAGE_HEADERS: Final[dict[str, str]] = {
         "frame-ancestors 'none'"
     ),
 }
+
+#: Methods that read and do not change anything, and are therefore exempt from the CSRF
+#: check. Exactly HTTP's own safe methods: anything else — POST, PUT, PATCH, DELETE — must
+#: carry the token, so a verb added later is covered by default rather than by amendment.
+_SAFE_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
 
 #: Rows the feedback review will render. The view exists to find a pattern, and a pattern
 #: that needs more than 500 rows to see is one a chart should be showing instead.
@@ -328,10 +338,49 @@ def register_admin_routes(app: FastAPI, deps: AdminDeps | None = None) -> None:
                 reason=verified.failure.value,
             )
             raise HTTPException(status_code=303, detail="sign in", headers={"Location": LOGIN_PATH})
+        # The layout's sign-out form needs a token on every guarded page, including the
+        # ones with no form of their own. Derived once here rather than in each handler.
+        request.state.nav_csrf = csrf_token(
+            secret=current.session_secret, session_token=request.cookies.get(SESSION_COOKIE, "")
+        )
         return verified
 
+    async def csrf_of(request: Request) -> None:
+        """Verify the CSRF token on any request that is not a safe read.
+
+        On the router beside :func:`session_of`, and for the same reason: a new POST is
+        protected because of where it lives, not because its author remembered to call a
+        helper. The per-handler version of this check shipped first and was wrong in the
+        way per-handler checks are always wrong — a route added later to the same router
+        satisfied every test in the suite, including the one that enumerates routes for
+        *authentication*, and rewrote a tenant's rubric with no token at all.
+
+        The form is read here and cached on ``request.state``, because a request body can
+        only be consumed once: the handlers that need the fields take them from
+        :func:`_form`, which returns the cached copy rather than reading the stream again.
+        """
+        if request.method in _SAFE_METHODS:
+            return
+        current = provide()
+        form = dict(await request.form())
+        request.state.admin_form = form
+        if not csrf_token_matches(
+            str(form.get(CSRF_FIELD, "")),
+            secret=current.session_secret,
+            session_token=request.cookies.get(SESSION_COOKIE, ""),
+        ):
+            log_event(
+                LOGGER,
+                EVENT_ADMIN_CSRF_REJECTED,
+                level=logging.WARNING,
+                method=request.method,
+            )
+            raise HTTPException(status_code=403, detail="this form has expired; reload the page")
+
     public = APIRouter(prefix=ADMIN_PREFIX)
-    guarded = APIRouter(prefix=ADMIN_PREFIX, dependencies=[Depends(session_of)])
+    # Order matters: the session is verified before the CSRF token, so an expired session
+    # gets the login redirect rather than a "this form has expired" page it cannot act on.
+    guarded = APIRouter(prefix=ADMIN_PREFIX, dependencies=[Depends(session_of), Depends(csrf_of)])
 
     _register_login(public, provide)
     _register_pages(guarded, provide, session_of)
@@ -368,13 +417,15 @@ def _register_login(router: APIRouter, provide: Callable[[], AdminDeps]) -> None
             now=deps.clock.now(),
         )
         if not outcome.authenticated:
-            log_admin_login_failed(LOGGER, username=username.strip()[:64], gated=outcome.gated)
+            log_admin_login_failed(LOGGER, username=username.strip(), gated=outcome.gated)
             return _render("admin/login.html", {"message": LOGIN_FAILED_MESSAGE}, status=401)
         assert outcome.subject is not None  # narrowed by `authenticated`
         token = mint_session(
             secret=deps.session_secret, subject=outcome.subject, now=deps.clock.now()
         )
-        response = RedirectResponse(url=f"{ADMIN_PREFIX}/", status_code=303)
+        response = RedirectResponse(
+            url=f"{ADMIN_PREFIX}/", status_code=303, headers=dict(_PAGE_HEADERS)
+        )
         _set_session_cookie(response, token)
         return response
 
@@ -400,6 +451,29 @@ def _set_session_cookie(response: Response, token: str) -> None:
     )
 
 
+def _clear_session_cookie(response: Response) -> None:
+    """Expire the session cookie, with the same flags it was set with.
+
+    Every flag is repeated, and ``Secure`` is the one that matters: Starlette's
+    ``delete_cookie`` defaults to ``secure=False``, and RFC 6265bis §4.1.3 says a browser
+    MUST ignore a ``__Host-``-prefixed cookie that arrives without it. The deletion was
+    therefore dropped on the floor by exactly the conforming browsers the prefix was chosen
+    for, and the session survived a logout. A cookie is only replaced by one whose name,
+    path and domain match, so this has to mirror :func:`_set_session_cookie` attribute for
+    attribute rather than merely name the cookie.
+    """
+    response.set_cookie(
+        SESSION_COOKIE,
+        "",
+        max_age=0,
+        expires=0,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+
+
 # -------------------------------------------------------------------- the guarded pages
 
 
@@ -418,20 +492,34 @@ def _register_pages(
 
     @router.post("/logout", summary="End this session.")
     async def sign_out(request: Request) -> Response:
-        """Clear the cookie. A POST, because a link that logs you out is a nuisance a
-        prefetcher can trigger."""
-        _check_csrf(request, provide(), await _form(request))
-        response = RedirectResponse(url=LOGIN_PATH, status_code=303)
-        response.delete_cookie(SESSION_COOKIE, path="/")
+        """Clear the browser's copy of the session cookie.
+
+        A POST, because a link that logs you out is a nuisance any prefetcher can trigger
+        — and, being on the guarded router, it carries the CSRF token like every other
+        write.
+
+        **This clears the browser's copy and nothing else.** The session token is a signed
+        bearer credential with an absolute expiry and no server-side record, so a copy
+        taken off the machine keeps working until it expires. That is the trade the design
+        made (``app/admin_auth.py``) and it is what makes rotating ``ADMIN_SESSION_SECRET``
+        the answer to a suspected theft rather than this button; ``docs/admin.md`` §3 says
+        so where an operator will read it.
+        """
+        del request
+        response = RedirectResponse(url=LOGIN_PATH, status_code=303, headers=dict(_PAGE_HEADERS))
+        _clear_session_cookie(response)
         return response
 
     @router.get("/", response_class=HTMLResponse, summary="Every tenant.")
     async def home(request: Request) -> Response:
         """The tenant list: the way in to every other screen."""
-        del request
         deps = provide()
         return _guarded(
-            lambda: _render("admin/tenants.html", {"tenants": deps.tenants.list_tenants()})
+            lambda: _render(
+                "admin/tenants.html",
+                {"tenants": deps.tenants.list_tenants()},
+                request=request,
+            )
         )
 
     # ------------------------------------------------------------------- the dashboard
@@ -474,6 +562,7 @@ def _register_pages(
                         tenant_slug=slug, start=period.start, end=period.end
                     ),
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -516,8 +605,7 @@ def _register_pages(
         exists to prevent.
         """
         deps = provide()
-        form = await _form(request)
-        _check_csrf(request, deps, form)
+        form = _form(request)
         raw = str(form.get("config", ""))
         note = str(form.get("note", ""))[:MAX_NOTE_CHARS]
 
@@ -548,6 +636,7 @@ def _register_pages(
                     "csrf": _csrf_for(request, deps),
                     "rerun_cap": RERUN_BATCH_CAP,
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -563,8 +652,7 @@ def _register_pages(
         request and the document travelled through the browser in between.
         """
         deps = provide()
-        form = await _form(request)
-        _check_csrf(request, deps, form)
+        form = _form(request)
         subject = session_of(request).subject
         raw = str(form.get("config", ""))
         note = str(form.get("note", ""))[:MAX_NOTE_CHARS] or None
@@ -584,6 +672,19 @@ def _register_pages(
                 version = deps.config_editor.apply(
                     slug=slug, document=parsed, changed_by=subject, note=note
                 )
+            except ConfigVersionConflictError as error:
+                # Somebody else saved while this form was open. 409, and the operator's
+                # text is handed back so the edit is not lost — a lost race must cost a
+                # reload, not a retype.
+                return _config_form(
+                    request=request,
+                    deps=deps,
+                    slug=slug,
+                    document=raw,
+                    note=note or "",
+                    errors=(str(error),),
+                    status=409,
+                )
             except (TenantConfigError, ValueError) as error:
                 return _config_form(
                     request=request,
@@ -601,7 +702,9 @@ def _register_pages(
                 fields_changed=len(deps.config_editor.preview(slug=slug, document=parsed).changes),
             )
             return RedirectResponse(
-                url=f"{ADMIN_PREFIX}/tenants/{slug}/config/history", status_code=303
+                url=f"{ADMIN_PREFIX}/tenants/{slug}/config/history",
+                status_code=303,
+                headers=dict(_PAGE_HEADERS),
             )
 
         return _guarded(page)
@@ -625,6 +728,7 @@ def _register_pages(
                     "current_version": versions[0].version if versions else None,
                     "csrf": _csrf_for(request, deps),
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -636,8 +740,7 @@ def _register_pages(
     async def revert_config(slug: str, request: Request) -> Response:
         """A revert appends; it never deletes. See :meth:`ConfigEditor.revert`."""
         deps = provide()
-        form = await _form(request)
-        _check_csrf(request, deps, form)
+        form = _form(request)
         subject = session_of(request).subject
 
         def page() -> Response:
@@ -662,7 +765,9 @@ def _register_pages(
                 reverted_from=target,
             )
             return RedirectResponse(
-                url=f"{ADMIN_PREFIX}/tenants/{slug}/config/history", status_code=303
+                url=f"{ADMIN_PREFIX}/tenants/{slug}/config/history",
+                status_code=303,
+                headers=dict(_PAGE_HEADERS),
             )
 
         return _guarded(page)
@@ -690,6 +795,7 @@ def _register_pages(
                     "csrf": _csrf_for(request, deps),
                     "report": None,
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -706,8 +812,7 @@ def _register_pages(
         must not be one a stray click or a prefetcher can make.
         """
         deps = provide()
-        form = await _form(request)
-        _check_csrf(request, deps, form)
+        form = _form(request)
         raw = str(form.get("config", ""))
         confirmed = str(form.get("confirm", "")) == "yes"
 
@@ -734,6 +839,7 @@ def _register_pages(
                         "message": str(error),
                     },
                     status=400,
+                    request=request,
                 )
             return _render(
                 "admin/rerun.html",
@@ -744,6 +850,7 @@ def _register_pages(
                     "csrf": _csrf_for(request, deps),
                     "report": report,
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -768,6 +875,7 @@ def _register_pages(
                         "params": dict(params),
                         "errors": (),
                     },
+                    request=request,
                 )
             try:
                 criteria = LeadFilter(
@@ -789,6 +897,7 @@ def _register_pages(
                         "errors": (str(error),),
                     },
                     status=400,
+                    request=request,
                 )
             found = deps.queries.browse_leads(
                 criteria=criteria,
@@ -804,6 +913,7 @@ def _register_pages(
                     "params": dict(params),
                     "errors": (),
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -822,8 +932,10 @@ def _register_pages(
         def page() -> Response:
             detail = deps.queries.lead_detail(tenant_slug=slug, lead_id=lead_id) if slug else None
             if detail is None:
-                return _render("admin/lead_detail.html", {"detail": None}, status=404)
-            return _render("admin/lead_detail.html", {"detail": detail})
+                return _render(
+                    "admin/lead_detail.html", {"detail": None}, status=404, request=request
+                )
+            return _render("admin/lead_detail.html", {"detail": detail}, request=request)
 
         return _guarded(page)
 
@@ -859,6 +971,7 @@ def _register_pages(
                         "csrf": _csrf_for(request, deps),
                         "promoted": frozenset(),
                     },
+                    request=request,
                 )
             tier = Tier(params["tier"]) if params.get("tier") else Tier.HOT
             verdict = Verdict(params["verdict"]) if params.get("verdict") else Verdict.BAD
@@ -885,6 +998,7 @@ def _register_pages(
                         tenant_slug=slug, lead_ids=[row.lead_id for row in rows]
                     ),
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -893,8 +1007,7 @@ def _register_pages(
     async def promote(request: Request) -> Response:
         """One click from a disagreement to a golden case. Idempotent by construction."""
         deps = provide()
-        form = await _form(request)
-        _check_csrf(request, deps, form)
+        form = _form(request)
         subject = session_of(request).subject
 
         def page() -> Response:
@@ -944,6 +1057,7 @@ def _register_pages(
                 return _render(
                     "admin/promotions.html",
                     {"tenants": deps.tenants.list_tenants(), "slug": None, "rows": (), "jsonl": ""},
+                    request=request,
                 )
             rows = deps.promotions.promotions_for(tenant_slug=slug)
             payloads: dict[str, Mapping[str, Any]] = {}
@@ -959,6 +1073,7 @@ def _register_pages(
                     "rows": rows,
                     "jsonl": deps.promotions.export_jsonl(promotions=rows, payloads=payloads),
                 },
+                request=request,
             )
 
         return _guarded(page)
@@ -990,8 +1105,14 @@ def _config_form(
     document: str,
     note: str,
     errors: Sequence[str],
+    status: int | None = None,
 ) -> Response:
-    """Re-render the editor, keeping whatever the operator typed."""
+    """Re-render the editor, keeping whatever the operator typed.
+
+    ``status`` defaults to 400 when there are errors, which is right for a document the
+    operator can fix by editing it. A lost save race passes 409 instead: nothing about the
+    document is wrong, somebody else just got there first.
+    """
     return _render(
         "admin/config_edit.html",
         {
@@ -1002,7 +1123,8 @@ def _config_form(
             "csrf": _csrf_for(request, deps),
             "max_note": MAX_NOTE_CHARS,
         },
-        status=400 if errors else 200,
+        status=status if status is not None else (400 if errors else 200),
+        request=request,
     )
 
 
@@ -1030,26 +1152,18 @@ def _csrf_for(request: Request, deps: AdminDeps) -> str:
     )
 
 
-def _check_csrf(request: Request, deps: AdminDeps, form: Mapping[str, Any]) -> None:
-    """Refuse a state-changing post that does not carry this session's token.
+def _form(request: Request) -> Mapping[str, Any]:
+    """The posted form, as the router's CSRF dependency already read it.
 
-    Raised before the handler body runs, so a refused post writes nothing — which is the
-    property ``tests/unit/test_api_admin.py`` asserts directly rather than inferring from
-    the status code.
+    Not re-read from the stream: an ASGI request body is consumed once, and the dependency
+    that verified the token had to read it to find the token. Taking the cached copy is
+    also what makes the ordering safe — by the time a handler body runs, the form it is
+    about to act on is the same bytes the token was checked against.
     """
-    presented = str(form.get(CSRF_FIELD, ""))
-    if not csrf_token_matches(
-        presented,
-        secret=deps.session_secret,
-        session_token=request.cookies.get(SESSION_COOKIE, ""),
-    ):
-        log_event(LOGGER, EVENT_ADMIN_CSRF_REJECTED, level=logging.WARNING)
-        raise HTTPException(status_code=403, detail="this form has expired; reload the page")
-
-
-async def _form(request: Request) -> Mapping[str, Any]:
-    """The posted form, as a plain mapping."""
-    return dict(await request.form())
+    cached: Mapping[str, Any] | None = getattr(request.state, "admin_form", None)
+    if cached is None:  # pragma: no cover - unreachable behind the router dependency
+        raise HTTPException(status_code=400, detail="that request carried no form")
+    return cached
 
 
 def _guarded(page: Callable[[], Response]) -> Response:
@@ -1090,12 +1204,31 @@ def _failure_page(message: str, *, status: int = 500) -> Response:
     return _render("admin/error.html", {"message": message}, status=status)
 
 
-def _render(template: str, context: Mapping[str, Any], *, status: int = 200) -> Response:
-    """Render one template with the admin's standard headers."""
+def _render(
+    template: str,
+    context: Mapping[str, Any],
+    *,
+    status: int = 200,
+    request: Request | None = None,
+) -> Response:
+    """Render one template with the admin's standard headers.
+
+    ``request`` is passed by the guarded pages and carries the token the layout's sign-out
+    form needs — separate from the ``csrf`` a page puts in its own forms, because the
+    layout needs one on *every* guarded page including those with no form of their own.
+    Omitting it is how the login page and the error page say "draw no sign-out button",
+    which is right for both.
+    """
+    nav_csrf: str | None = getattr(request.state, "nav_csrf", None) if request is not None else None
     body = (
         _templates()
         .get_template(template)
-        .render(**context, admin_prefix=ADMIN_PREFIX, csrf_field=CSRF_FIELD)
+        .render(
+            **context,
+            admin_prefix=ADMIN_PREFIX,
+            csrf_field=CSRF_FIELD,
+            nav_csrf=nav_csrf,
+        )
     )
     return HTMLResponse(content=body, status_code=status, headers=dict(_PAGE_HEADERS))
 
@@ -1128,13 +1261,21 @@ def _date(raw: str | None) -> dt.date | None:
 
 
 def _decimal(raw: str | None) -> Decimal | None:
-    """A number from a query string, or ``None`` if it is not one."""
+    """A number from a query string, or ``None`` if it is not a usable one.
+
+    ``Decimal`` accepts ``NaN``, ``Infinity`` and ``1E+10000`` — all of which arrive from a
+    query string as easily as ``0.5``. ``NaN`` compares false against everything, so it
+    would silently return an empty page rather than an error; the others become a bind
+    parameter the driver has to render. A confidence is a probability, so anything that is
+    not a finite number is not one.
+    """
     if not raw:
         return None
     try:
-        return Decimal(raw)
+        value = Decimal(raw)
     except ArithmeticError:
         return None
+    return value if value.is_finite() else None
 
 
 def _money(value: Decimal | None) -> str:

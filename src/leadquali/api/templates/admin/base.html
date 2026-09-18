@@ -60,6 +60,17 @@
   <a href="{{ admin_prefix }}/promotions">Golden set</a>
   <span class="spacer"></span>
   {% block nav %}{% endblock %}
+  {#
+    Sign out. A POST carrying the CSRF token, because a GET here is something any link
+    prefetcher can trigger. `nav_csrf` is absent on the login page and on the error page,
+    which is why this is conditional rather than always drawn.
+  #}
+  {% if nav_csrf %}
+  <form class="inline" method="post" action="{{ admin_prefix }}/logout">
+    <input type="hidden" name="{{ csrf_field }}" value="{{ nav_csrf }}">
+    <button type="submit">Sign out</button>
+  </form>
+  {% endif %}
 </header>
 <main>
 {% block content %}{% endblock %}

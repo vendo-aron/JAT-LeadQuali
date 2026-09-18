@@ -108,15 +108,48 @@ _PSEUDONYM_COMPANIES: Final[tuple[str, ...]] = (
     "Wide World",
 )
 
-#: Addresses in free text. Loose on purpose: over-matching costs a ``[removed]``, and
-#: under-matching costs a customer's contact in a file that goes into git.
+#: The four code points IDNA maps to a label separator (RFC 3490 / UTS #46): the ASCII full
+#: stop, the fullwidth full stop, and the ideographic ones. A browser and a mail client
+#: treat a host written with U+FF0E as the ASCII one; a pattern that only knows ``.``
+#: does not, and an address written that way went into the golden set untouched because
+#: of it.
+_DOT: Final[str] = r"[.\uff0e\u3002\uff61]"
+
+#: The commercial at, and its fullwidth twin. Same reasoning as :data:`_DOT`: a mail client
+#: reads a local part joined by U+FF20 as an address, so a finder that only knows the
+#: ASCII one does not.
+_AT: Final[str] = r"[@\uff20]"
+
+#: What cannot appear inside an address or a host: whitespace, the delimiters a sentence
+#: puts around one, and brackets.
+_NOT_IN_HOST: Final[str] = r"[^\s@\uff20<>,;:\"'()\[\]]"
+
+#: Addresses in free text. Loose on purpose, and the looseness is the whole point:
+#: over-matching costs a ``[removed]``, under-matching costs a customer's contact in a file
+#: that goes into git.
+#:
+#: Defined by what an address *cannot* contain rather than by what it can. The first version
+#: was ``[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,24}`` — ASCII on both sides — and it
+#: silently passed ``priya@nörthstar-logistics.de``, an IDN domain and therefore most of the
+#: German-speaking web. An allowlist of characters is a promise that nobody will ever use a
+#: script you did not think of.
 _EMAIL_IN_TEXT: Final[re.Pattern[str]] = re.compile(
-    r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}"
+    rf"{_NOT_IN_HOST}{{1,64}}{_AT}{_NOT_IN_HOST}{{1,255}}{_DOT}"
+    rf"(?:(?!{_DOT}){_NOT_IN_HOST}){{2,24}}"
 )
 
-#: URLs in free text, with or without a scheme.
+#: URLs in free text, **with or without a scheme**. Requiring ``https://`` or ``www.``
+#: missed ``linkedin.com/in/priya-raghunathan``, which is how a person is actually named in
+#: a sales note.
+#:
+#: A scheme-less host is only treated as a URL when a **path** follows it. A bare domain is
+#: deliberately left alone: "we are replacing acme.com" is the signal the case exists to
+#: test, while "linkedin.com/in/..." identifies a person.
 _URL_IN_TEXT: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:https?://|www\.)[^\s<>\"']{1,300}", re.IGNORECASE
+    rf"\b(?:https?://|www{_DOT})[^\s<>\"']{{1,300}}"
+    rf"|\b(?:(?!{_DOT})[^\s/<>,;:\"'()\[\]]){{1,80}}"
+    rf"(?:{_DOT}(?:(?!{_DOT})[^\s/<>,;:\"'()\[\]]){{1,80}}){{1,5}}/[^\s<>\"']{{1,300}}",
+    re.IGNORECASE,
 )
 
 #: Anything long enough and digit-dense enough to be a phone number. Bounded quantifiers

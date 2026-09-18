@@ -457,7 +457,7 @@ class Settings(BaseSettings):
                 "or set FEEDBACK_TOKEN_SECRET_ARN."
             ),
         )
-        self._reject_reused_ingest_secret(secret)
+        self._reject_reused_ingest_secret(secret, name="the feedback token secret")
         return secret
 
     def require_admin_session_secret(self) -> str:
@@ -467,8 +467,17 @@ class Settings(BaseSettings):
         would appear to work — until the second Lambda container served a request and
         signed everybody out, or until a deploy did — and the failure would look like a
         flaky login rather than like a missing setting.
+
+        Raises:
+            RuntimeError: the secret is unset, or it is the same value as one of the ingest
+                signing secrets or as the feedback token secret. This is the third distinct
+                secret and the most powerful of the three: an ingest signing secret is
+                *given to a customer's website*, the feedback secret authorises writes to
+                the training data, and this one mints a staff session — which can rewrite
+                every tenant's rubric. Reusing an ingest secret as this one would hand a
+                customer the ability to forge an admin cookie.
         """
-        return self._secret(
+        secret = self._secret(
             secret_arn=self.admin_session_secret_arn,
             literal=self.admin_session_secret,
             unset=(
@@ -477,6 +486,9 @@ class Settings(BaseSettings):
                 "material, or set ADMIN_SESSION_SECRET_ARN."
             ),
         )
+        self._reject_reused_ingest_secret(secret, name="the admin session secret")
+        self._reject_reused_feedback_secret(secret)
+        return secret
 
     def require_admin_credentials(self) -> str:
         """Return the staff credential JSON, or raise if it was never configured.
@@ -557,21 +569,58 @@ class Settings(BaseSettings):
             password=password,
         )
 
-    def _reject_reused_ingest_secret(self, feedback_secret: str) -> None:
-        """Raise if ``feedback_secret`` is also one tenant's ingest signing secret.
+    def _reject_reused_ingest_secret(self, candidate: str, *, name: str) -> None:
+        """Raise if ``candidate`` is also one tenant's ingest signing secret.
 
         Only runs where both are configured — the worker holds the feedback secret and no
         ingest credentials at all, and demanding them would mean giving the worker read
         access to a secret it has no business reading.
+
+        Args:
+            candidate: The secret being validated.
+            name: How to describe it in the error, so an operator is told which of the
+                three secrets to regenerate.
         """
         for tenant_id, signing_secret in self._ingest_signing_secrets():
-            if hmac.compare_digest(feedback_secret.encode(), signing_secret.encode()):
+            if hmac.compare_digest(candidate.encode(), signing_secret.encode()):
                 raise RuntimeError(
-                    f"the feedback token secret is the same value as tenant "
-                    f"'{tenant_id}''s ingest signing secret. They authorise opposite "
-                    "things and must be distinct (#60): generate fresh material for "
-                    "FEEDBACK_TOKEN_SECRET."
+                    f"{name} is the same value as tenant '{tenant_id}''s ingest signing "
+                    "secret. An ingest signing secret is given to a customer's website; "
+                    "these authorise opposite things and must be distinct (#60). "
+                    "Generate fresh material."
                 )
+
+    def _reject_reused_feedback_secret(self, candidate: str) -> None:
+        """Raise if ``candidate`` is also the feedback token secret.
+
+        The admin session secret mints a staff session, which can rewrite every tenant's
+        rubric; the feedback secret authorises a verdict on one lead. Sharing them means a
+        forged feedback link and a forged admin cookie are the same forgery.
+
+        Resolved through :meth:`_secret` so that an ARN-configured feedback secret is
+        compared by *value*, not by ARN — two ARNs holding the same string is exactly the
+        mistake a copy-paste makes. Any failure to resolve it is swallowed: a deployment
+        where only the admin secret is configured is legitimate (the admin Lambda has no
+        business reading the feedback secret), and turning "I could not check" into a
+        startup failure would break it.
+        """
+        if not (self.feedback_token_secret_arn or self.feedback_token_secret):
+            return
+        try:
+            feedback_secret = self._secret(
+                secret_arn=self.feedback_token_secret_arn,
+                literal=self.feedback_token_secret,
+                unset="",
+            )
+        except Exception:  # pragma: no cover - an unreadable secret is not this check's business
+            return
+        if hmac.compare_digest(candidate.encode(), feedback_secret.encode()):
+            raise RuntimeError(
+                "the admin session secret is the same value as FEEDBACK_TOKEN_SECRET. "
+                "One mints a staff session that can rewrite every tenant's rubric and the "
+                "other authorises a verdict on one lead; they must be distinct. Generate "
+                "fresh material for ADMIN_SESSION_SECRET."
+            )
 
     def _ingest_signing_secrets(self) -> Iterator[tuple[str, str]]:
         """Yield ``(tenant_id, signing_secret)`` for each configured ingest credential.

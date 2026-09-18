@@ -27,19 +27,24 @@ from leadquali.domain.models import Tier
 
 NOW = dt.datetime(2026, 9, 16, 9, 0, tzinfo=dt.UTC)
 
+#: A real assessment id. The cursor names a row, and the adapter turns this half of it
+#: into a ``uuid.UUID`` for the keyset predicate — so a cursor carrying anything else is
+#: not a cursor.
+ROW_ID = "0f3c9a12-4d5e-4f60-9a1b-2c3d4e5f6071"
+
 
 # ----------------------------------------------------------------------------- cursor
 
 
 def test_a_cursor_round_trips() -> None:
-    cursor = PageCursor(created_at=NOW, row_id="0f3c9a12")
+    cursor = PageCursor(created_at=NOW, row_id=ROW_ID)
 
     assert PageCursor.decode(cursor.encode()) == cursor
 
 
 def test_a_cursor_keeps_its_timezone() -> None:
     """A naive timestamp compared against a timestamptz column is a silent day's drift."""
-    decoded = PageCursor.decode(PageCursor(created_at=NOW, row_id="x").encode())
+    decoded = PageCursor.decode(PageCursor(created_at=NOW, row_id=ROW_ID).encode())
 
     assert decoded is not None
     assert decoded.created_at.tzinfo is not None
@@ -55,6 +60,10 @@ def test_a_cursor_keeps_its_timezone() -> None:
         "MjAyNi0wOS0xNnw=",  # a timestamp and an empty id
         "bm90LWEtZGF0ZXwx",  # "not-a-date|1"
         "MjAyNi0wOS0xNlQwOTowMDowMHwx",  # naive timestamp: no offset
+        # A well-formed cursor whose row id is not a UUID. This parsed cleanly before, and
+        # then raised one layer down inside the adapter's uuid.UUID(...) — a 500 on a page
+        # anybody can request, from the one function documented never to produce one.
+        "MjAyNi0wOS0xNlQwOTowMDowMCswMDowMHxub3QtYS11dWlk",
     ],
 )
 def test_a_cursor_that_is_not_one_is_none_rather_than_an_exception(raw: str) -> None:
@@ -69,6 +78,16 @@ def test_cursors_order_by_time_then_id() -> None:
 
     assert earlier < later
     assert PageCursor(created_at=NOW - dt.timedelta(seconds=1), row_id="z") < earlier
+
+
+def test_a_decoded_cursor_carries_a_row_id_the_adapter_can_use() -> None:
+    """The contract the adapter relies on, stated where the parsing happens."""
+    import uuid
+
+    decoded = PageCursor.decode(PageCursor(created_at=NOW, row_id=ROW_ID).encode())
+
+    assert decoded is not None
+    assert uuid.UUID(decoded.row_id) == uuid.UUID(ROW_ID)
 
 
 # ----------------------------------------------------------------------------- filter

@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime as dt
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -117,6 +118,12 @@ class PageCursor:
         a stack trace on a mistyped cursor would be a 500 on a page anybody can request.
         It carries no authority — it only says where to resume within a query whose tenant
         predicate the handler has already fixed — so it is not signed.
+
+        **Both halves are validated here**, which is the whole point of the contract above.
+        The timestamp always was; the row id was not, so a well-formed cursor carrying a
+        non-UUID id parsed cleanly and then raised ``ValueError`` one layer down, inside
+        the adapter's ``uuid.UUID(cursor.row_id)`` — a 500 on a page anybody can request,
+        from the one function that promises not to produce one.
         """
         if not raw:
             return None
@@ -129,6 +136,9 @@ class PageCursor:
             return None
         try:
             created_at = dt.datetime.fromisoformat(stamp)
+            # Parsed rather than pattern-matched, so the accepted spellings are exactly the
+            # ones the adapter will accept when it builds the predicate.
+            uuid.UUID(row_id)
         except ValueError:
             return None
         if created_at.tzinfo is None:

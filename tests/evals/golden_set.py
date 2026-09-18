@@ -134,10 +134,27 @@ _SLUG_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z][a-z0-9_]{2,63}\Z")
 #: puts on ``feedback.rater`` and invariant 5 puts on everything.
 _LABELER_RE: Final[re.Pattern[str]] = re.compile(r"\A[a-z][a-z0-9_-]{1,31}\Z")
 
+#: The code points IDNA maps to a label separator (RFC 3490 / UTS #46) and to the
+#: commercial at. A mail client reads a host written with U+FF0E exactly as it reads the
+#: ASCII spelling, so a finder that knows only ``.`` and ``@`` does not see an address that
+#: every mail client would.
+_IDNA_DOT: Final[str] = r"[.\uff0e\u3002\uff61]"
+_IDNA_AT: Final[str] = r"[@\uff20]"
+
 #: Loose on purpose: this is a *finder*, not a validator. Anything that could be read as an
 #: address by a human skimming the diff should be caught and made to justify itself.
+#:
+#: Widened from ``[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)``, which was ASCII
+#: on both sides of the ``@``. That excluded every internationalised domain — most of the
+#: German-, Nordic- and CJK-language web — and the fullwidth punctuation a copy-paste from
+#: some clients produces. It mattered more than it looks: #36's promotion pseudonymiser had
+#: the *identical* blind spot, so the finder and the gate failed on exactly the same inputs
+#: and "the validator is the authority" was true only for addresses both already handled.
+#: The class is now defined by what a host cannot contain rather than by what it may.
 _EMAIL_RE: Final[re.Pattern[str]] = re.compile(
-    r"[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)"
+    rf"[^\s@\uff20<>,;:\"'()\[\]]+{_IDNA_AT}"
+    rf"((?:(?!{_IDNA_DOT})[^\s@\uff20<>,;:\"'()\[\]])+"
+    rf"(?:{_IDNA_DOT}(?:(?!{_IDNA_DOT})[^\s@\uff20<>,;:\"'()\[\]])+)+)"
 )
 
 #: The handle every synthetic seed case is labeled with. Naming it in the data is the
@@ -796,15 +813,32 @@ def _reject_real_contact_details(form: Mapping[str, str | None], at: str) -> Non
                 )
 
 
+#: Maps every IDNA label separator and the fullwidth at onto their ASCII spellings, so a
+#: domain is compared against the allowlist in the form it actually resolves to.
+_IDNA_NORMALISATION: Final[dict[int, str]] = {
+    0xFF0E: ".",
+    0x3002: ".",
+    0xFF61: ".",
+    0xFF20: "@",
+}
+
+
 def _is_allowed_domain(domain: str) -> bool:
-    lowered = domain.lower().rstrip(".")
+    lowered = domain.translate(_IDNA_NORMALISATION).lower().rstrip(".")
     if lowered in RESERVED_EMAIL_DOMAINS or lowered in FREE_EMAIL_PROVIDERS:
         return True
     return lowered.endswith(RESERVED_EMAIL_SUFFIXES)
 
 
 def _url_host(value: str) -> str | None:
-    remainder = value.split("://", 1)[-1].strip()
+    """The host a ``website`` field names, whether or not it carries a scheme.
+
+    The separators are normalised to their ASCII forms first, so a host written with the
+    fullwidth full stop is checked against the allowlist as the domain it actually
+    resolves to rather than sailing past as an unrecognised string.
+    """
+    normalised = value.translate(_IDNA_NORMALISATION).strip()
+    remainder = normalised.split("://", 1)[-1].strip()
     host = remainder.split("/", 1)[0].split("?", 1)[0].split("@")[-1].split(":", 1)[0]
     host = host.removeprefix("www.")
     return host or None
