@@ -59,6 +59,7 @@ __all__ = [
     "ConfigEditor",
     "ConfigPreview",
     "ConfigVersion",
+    "ConfigVersionConflictError",
     "ConfigVersionStorePort",
     "FieldChange",
     "UnitOfWorkPort",
@@ -78,6 +79,21 @@ MIGRATION_SUBJECT: Final[str] = "migration"
 
 class UnknownConfigVersionError(LookupError):
     """No such version for this tenant."""
+
+
+class ConfigVersionConflictError(RuntimeError):
+    """Another change to this tenant took the version number this one was allocating.
+
+    Distinct from :class:`~leadquali.app.tenants.UnknownTenantError`, which it used to be
+    reported as. The two look similar from inside the store — both mean "the insert matched
+    no row" — and they are opposite facts to the person reading the page. A second operator
+    editing the same tenant during an incident was told *the tenant does not exist*, with a
+    404, and the reasonable next move from there is psql, which is the thing the screen
+    exists to prevent.
+
+    It is retryable, and that is the whole content of it: reload the config, look at what
+    the other person changed, and decide again.
+    """
 
 
 class ChangeKind(StrEnum):
@@ -169,6 +185,8 @@ class ConfigVersionStorePort(Protocol):
 
         Raises:
             UnknownTenantError: no such tenant.
+            ConfigVersionConflictError: a concurrent change took this version number.
+                Nothing was written and the caller may retry.
         """
         ...
 

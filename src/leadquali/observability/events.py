@@ -89,9 +89,17 @@ EVENT_DISPATCH_FAILED: Final[str] = "lead.dispatch_failed"
 #: prompt for somebody to talk to the customer, and nothing anywhere acts on it.
 EVENT_QUOTA_CROSSED: Final[str] = "tenant.quota_crossed"
 
-#: A staff login was refused (#36). Carries the username, which is a staff handle and not
-#: a lead's anything — but never the password, and never which half was wrong.
+#: A staff login was refused (#36). Carries a bounded prefix of the username — never the
+#: password, and never which half was wrong.
 EVENT_ADMIN_LOGIN_FAILED: Final[str] = "admin.login_failed"
+
+#: How much of a failed login's username reaches the log. Eight characters: enough that a
+#: human recognises ``ada`` or ``icp_own``, and strictly shorter than the shortest password
+#: this system will mint (:data:`leadquali.adminctl.MIN_PASSWORD_CHARS`), so a password
+#: typed into the username box by mistake cannot land in CloudWatch whole.
+#: ``tests/unit/test_api_admin.py`` pins the two together, because the bound is only a
+#: defence while that inequality holds.
+MAX_LOGGED_USERNAME_CHARS: Final[int] = 8
 
 #: A tenant's rubric was changed through the admin (#36): who, which tenant, which version
 #: it became, and how many fields moved. Deliberately **not** the values: a routing rule
@@ -438,12 +446,20 @@ def log_quota_crossed(
 def log_admin_login_failed(logger: logging.Logger, *, username: str, gated: bool) -> None:
     """A staff login did not succeed (#36).
 
-    The username is logged because an operator investigating a burst of failures needs to
-    know whose account is being guessed at, and a staff handle is not personal data in the
-    sense invariant 5 governs — it is the same class of value as ``feedback.rater``. The
-    password is not logged, in any form, and neither is *which* check failed: the page
-    tells a stranger nothing, and a log line that distinguishes "no such user" from "wrong
-    password" would hand the same oracle to anybody with log access.
+    An operator investigating a burst of failures needs to know *whose* account is being
+    guessed at, and a staff handle is the same class of value as ``feedback.rater``. But
+    the field is unauthenticated: it is whatever was typed into the username box, and the
+    realistic incident is a staff member typing their **password** there — one line out of
+    place and a live credential is in CloudWatch, retained for as long as logs are.
+
+    So it is truncated to :data:`MAX_LOGGED_USERNAME_CHARS`, which is shorter than any
+    password worth having, and a value that had to be truncated is marked. A hash was the
+    alternative and was rejected: the whole point of the field is that a human reads it and
+    recognises the account, and a digest cannot be recognised.
+
+    Neither is *which* check failed ever logged. The page tells a stranger nothing; a log
+    line distinguishing "no such user" from "wrong password" would hand the same oracle to
+    anybody with log access.
 
     Args:
         logger: Where the line goes.
@@ -456,7 +472,8 @@ def log_admin_login_failed(logger: logging.Logger, *, username: str, gated: bool
         logger,
         EVENT_ADMIN_LOGIN_FAILED,
         level=logging.WARNING,
-        username=username,
+        username=username[:MAX_LOGGED_USERNAME_CHARS],
+        username_truncated=len(username) > MAX_LOGGED_USERNAME_CHARS,
         gated=gated,
     )
 
@@ -572,6 +589,7 @@ __all__ = [
     "EVENT_LEAD_ROUTED",
     "EVENT_LEAD_SUPPRESSED",
     "EVENT_QUOTA_CROSSED",
+    "MAX_LOGGED_USERNAME_CHARS",
     "SuppressionCause",
     "log_admin_config_changed",
     "log_admin_lead_promoted",

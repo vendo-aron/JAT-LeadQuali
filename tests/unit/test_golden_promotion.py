@@ -154,6 +154,64 @@ def test_identifiers_buried_in_free_text_are_removed() -> None:
     assert message.count(REDACTED_TEXT) == 3, message
 
 
+#: Identifiers the first version of the finder passed through untouched, **and** that #22's
+#: gate then accepted — so the "the validator is the authority" argument did not hold for
+#: them. The first two are how most of the non-English web writes an address; the third is
+#: how a person is actually named in a sales note.
+UNCAUGHT_BEFORE = [
+    pytest.param("priya@n\u00f6rthstar-logistics.de", id="idn-domain"),
+    pytest.param("priya@northstar\uff0ecom", id="fullwidth-dot"),
+    pytest.param("priya\uff20northstar.com", id="fullwidth-at"),
+    pytest.param("linkedin.com/in/priya-raghunathan", id="scheme-less-url"),
+]
+
+
+@pytest.mark.parametrize("identifier", UNCAUGHT_BEFORE)
+def test_an_identifier_the_ascii_patterns_missed_is_stripped(identifier: str) -> None:
+    """Under-matching costs a customer's contact in a file that goes into git."""
+    message = strip_pii({"message": f"reach me at {identifier}"}, lead_id=LEAD)["message"]
+
+    assert message is not None
+    assert identifier not in message
+    assert REDACTED_TEXT in message
+
+
+@pytest.mark.parametrize("identifier", UNCAUGHT_BEFORE)
+def test_the_golden_set_gate_would_also_have_refused_it(identifier: str) -> None:
+    """The other half, and the one that broke the argument at ``golden_promotion.py``'s top.
+
+    The finder and the gate failed on exactly the same inputs, so "#22's validator is the
+    authority" was true only for addresses both already handled. Here the gate is fed the
+    raw identifier directly — bypassing the pseudonymiser entirely — and must refuse it.
+    """
+    promotion, _, _ = promote()
+    case = render_case(promotion=promotion, form=A_REAL_PAYLOAD)
+    case["form"] = {**case["form"], "message": f"reach me at {identifier}"}
+
+    if identifier.endswith("priya-raghunathan"):
+        # A scheme-less URL in free text is the pseudonymiser's to catch; #22's gate checks
+        # addresses everywhere and URLs only in the `website` field, which is its documented
+        # scope. Put it where the gate looks.
+        case["form"] = {**case["form"], "website": identifier, "message": "a normal message"}
+
+    with pytest.raises(GoldenSetError):
+        parse_golden_set(as_golden_file(case))
+
+
+@pytest.mark.parametrize(
+    "kept",
+    [
+        "We are a 300-person logistics firm replacing a spreadsheet this quarter.",
+        "We are replacing acme.com internally and have budget signed off.",
+        "Budget is $50k-$100k and the VP of RevOps has signed off.",
+    ],
+)
+def test_the_widened_patterns_do_not_eat_the_signal(kept: str) -> None:
+    """Over-matching is the cheap failure, but it is not free: a bare domain is the signal
+    a case exists to test, while a domain with a path identifies somebody."""
+    assert strip_pii({"message": kept}, lead_id=LEAD)["message"] == kept
+
+
 def test_the_rewrite_is_deterministic_so_a_re_export_is_not_a_diff() -> None:
     assert strip_pii(A_REAL_PAYLOAD, lead_id=LEAD) == strip_pii(A_REAL_PAYLOAD, lead_id=LEAD)
 

@@ -87,7 +87,11 @@ from leadquali.app.admin_views import (
     RoutingRow,
     TierCount,
 )
-from leadquali.app.config_versions import ConfigVersion, UnknownConfigVersionError
+from leadquali.app.config_versions import (
+    ConfigVersion,
+    ConfigVersionConflictError,
+    UnknownConfigVersionError,
+)
 from leadquali.app.feedback import Verdict
 from leadquali.app.golden_promotion import GoldenPromotion
 from leadquali.app.lead_payload import LeadForm
@@ -174,16 +178,23 @@ class PostgresConfigVersionStore:
     ) -> ConfigVersion:
         """Append the next version for this tenant, allocating the number from the table.
 
-        One statement: the ``SELECT`` that finds ``MAX(version)`` is the same statement
-        that inserts, so there is no window in which a second process can read the same
-        maximum. It is sourced from ``tenants`` so that a slug naming no tenant inserts
-        nothing and is reported as such, rather than writing an orphan row against a
-        plausible-looking UUID.
+        One statement, so there is no *application-level* window between reading the
+        maximum and inserting against it. That is not the same as no window at all: under
+        READ COMMITTED — Postgres's default and what this runs under — two concurrent
+        transactions both see the committed maximum and both compute the same next number.
+        ``UNIQUE (tenant_id, version)`` is what actually settles it, exactly as the module
+        docstring says: one transaction commits and the other gets a constraint violation.
+
+        The statement is sourced from ``tenants`` so that a slug naming no tenant inserts
+        nothing, rather than writing an orphan row against a plausible-looking UUID.
 
         Raises:
-            UnknownTenantError: no such tenant, or the version number was taken by a
-                concurrent write. Both mean "this did not happen"; the caller's
-                transaction is rolled back either way.
+            ConfigVersionConflictError: a concurrent change took this version number.
+                Nothing was written; the caller may reload and retry.
+            UnknownTenantError: no such tenant. Deliberately a different type from the
+                conflict above: they are opposite facts to the operator reading the page,
+                and reporting a lost race as "no such tenant" sends a second editor to psql
+                during an incident.
         """
         tenant = tenant_uuid(tenant_slug)
         next_version = func.coalesce(
@@ -217,7 +228,7 @@ class PostgresConfigVersionStore:
             with session_scope(self._sessions) as session:
                 row = session.execute(statement).one_or_none()
         except IntegrityError as error:
-            raise UnknownTenantError(
+            raise ConfigVersionConflictError(
                 f"another change to tenant '{tenant_slug}' took this version number; "
                 "nothing was written — reload the config and try again"
             ) from error
