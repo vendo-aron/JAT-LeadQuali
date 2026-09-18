@@ -14,7 +14,7 @@ a secret it cannot read. One direction alone passes a template that over-grants.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -42,6 +42,13 @@ SECRET_SOURCES = {
     "DatabaseSecretArn": "DatabaseMasterUserSecretArn",
     "AnthropicApiKeySecretArn": None,
 }
+
+
+#: Every Lambda in the application stack that reads a secret: ingest, worker, migrations
+#: and — since #37 — the retention purge. A guard that the loops below selected something,
+#: and a prompt to look when a function is added: the question "what may this one decrypt?"
+#: has to be answered before it ships, not after.
+SECRET_READING_FUNCTIONS: Final[int] = 4
 
 
 @pytest.fixture(scope="module")
@@ -245,7 +252,9 @@ def test_each_function_can_read_exactly_the_secrets_it_names(
             f"{logical_id} is granted {sorted(granted)} and uses {sorted(referenced)}"
         )
         checked += 1
-    assert checked == 3, "expected the ingest, worker and migration functions"
+    assert checked == SECRET_READING_FUNCTIONS, (
+        "expected the ingest, worker, migration and retention functions"
+    )
 
 
 def test_the_worker_cannot_read_the_ingest_credentials(application: dict[str, Any]) -> None:
@@ -318,7 +327,7 @@ def test_a_function_with_the_database_secret_gets_the_parts_to_assemble_a_url(
         for variable in ("DATABASE_HOST", "DATABASE_PORT", "DATABASE_NAME"):
             assert variable in env, f"{logical_id} cannot assemble a URL without {variable}"
         checked += 1
-    assert checked == 3, "all three functions talk to Postgres"
+    assert checked == SECRET_READING_FUNCTIONS, "every one of them talks to Postgres"
 
 
 def test_the_cache_ttl_is_configurable_and_bounded(application: dict[str, Any]) -> None:

@@ -123,6 +123,17 @@ EVENT_ADMIN_CSRF_REJECTED: Final[str] = "admin.csrf_rejected"
 #: whatever raised it (a driver quoting the bytes it could not decode, say).
 EVENT_ADMIN_PAGE_FAILED: Final[str] = "admin.page_failed"
 
+#: The retention job finished a tenant's purge and changed something (#37). Counts only:
+#: how many payloads were tombstoned, how many reasoning texts had an address taken out,
+#: how many leads went past tier 2 entirely. A silent run emits nothing, so a line here
+#: always means customer data was deleted — which is what makes it worth alerting on.
+EVENT_RETENTION_PURGED: Final[str] = "retention.purged"
+
+#: A deletion request was carried out (#37). The subject appears as ``contact_email_hash``
+#: and never as an address: this line is the log half of the audit trail, the
+#: ``erasure_log`` row is the durable half, and both are places invariant 5 governs.
+EVENT_RETENTION_ERASED: Final[str] = "retention.erased"
+
 
 class SuppressionCause(StrEnum):
     """Why a lead was never contacted. The two answers are not interchangeable.
@@ -557,6 +568,84 @@ def _metering_fields(metering: CallMetering | None) -> dict[str, str | int | Dec
     }
 
 
+def log_retention_purged(
+    logger: logging.Logger,
+    *,
+    tenant_id: str,
+    payloads_redacted: int,
+    reasoning_redacted: int,
+    leads_purged: int,
+) -> None:
+    """The retention job deleted something for one tenant (#37).
+
+    Counts and a tenant, and nothing else — not a lead id, not a cutoff date that could be
+    joined back to one, and certainly not a payload. The line exists so that "when did this
+    lead's payload go?" has an answer in the log group as well as in the tombstone, and so
+    that a run which suddenly deletes ten times its usual volume is visible.
+
+    A run that changed nothing does not emit this. A daily no-op line would train everybody
+    to ignore the event, and the interesting fact about retention is always that it *did*
+    something.
+
+    Args:
+        logger: Where the line goes.
+        tenant_id: Whose data was purged.
+        payloads_redacted: ``leads.raw_payload`` values replaced by a tombstone (tier 1).
+        reasoning_redacted: ``assessments.reasoning`` rows that had an address taken out.
+        leads_purged: Lead rows deleted outright, past tier 2, children cascaded.
+    """
+    log_event(
+        logger,
+        EVENT_RETENTION_PURGED,
+        tenant_id=tenant_id,
+        payloads_redacted=payloads_redacted,
+        reasoning_redacted=reasoning_redacted,
+        leads_purged=leads_purged,
+    )
+
+
+def log_retention_erased(
+    logger: logging.Logger,
+    *,
+    tenant_id: str,
+    subject_hash: str,
+    leads_deleted: int,
+    rows_deleted: int,
+    matched_by_payload_scan: int,
+    requested_by: str,
+) -> None:
+    """A deletion request was carried out (#37).
+
+    The subject is the **hash**, under the field name ``contact_email_hash`` so that this
+    line joins to the lead's own records — which is the point of an erasure log entry that
+    outlives the rows it is about. The address is not a parameter of this function, which
+    is the enforcement: a caller cannot log what it cannot pass.
+
+    ``requested_by`` is a ticket reference or an operator handle recorded so the audit
+    answers "on whose authority?". It is the same class of value as ``feedback.rater`` and
+    is not the subject's own identity.
+
+    Args:
+        logger: Where the line goes.
+        tenant_id: Whose copy of the person's data was erased.
+        subject_hash: SHA-256 of the normalised address.
+        leads_deleted: Lead rows removed.
+        rows_deleted: Every row removed, cascaded children included.
+        matched_by_payload_scan: Leads the hash missed and the payload scan caught.
+        requested_by: Who asked, and how it was verified.
+    """
+    log_event(
+        logger,
+        EVENT_RETENTION_ERASED,
+        tenant_id=tenant_id,
+        contact_email_hash=subject_hash,
+        leads_deleted=leads_deleted,
+        rows_deleted=rows_deleted,
+        matched_by_payload_scan=matched_by_payload_scan,
+        requested_by=requested_by,
+    )
+
+
 __all__ = [
     "EVENT_ADMIN_CONFIG_CHANGED",
     "EVENT_ADMIN_CSRF_REJECTED",
@@ -572,6 +661,8 @@ __all__ = [
     "EVENT_LEAD_ROUTED",
     "EVENT_LEAD_SUPPRESSED",
     "EVENT_QUOTA_CROSSED",
+    "EVENT_RETENTION_ERASED",
+    "EVENT_RETENTION_PURGED",
     "SuppressionCause",
     "log_admin_config_changed",
     "log_admin_lead_promoted",
@@ -584,5 +675,7 @@ __all__ = [
     "log_lead_routed",
     "log_lead_suppressed",
     "log_quota_crossed",
+    "log_retention_erased",
+    "log_retention_purged",
     "suppression_cause",
 ]

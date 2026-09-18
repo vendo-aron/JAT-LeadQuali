@@ -18,7 +18,7 @@ from alembic import command
 from alembic.config import Config
 
 from leadquali.config import Settings, get_settings
-from leadquali.observability.logs import configure_logging
+from leadquali.observability.logs import configure_logging, log_event
 
 configure_logging()
 
@@ -44,7 +44,7 @@ def upgrade_to_head(settings: Settings | None = None) -> None:
 
 def lambda_handler(event: dict[str, Any], context: object) -> dict[str, str]:
     """Entrypoint named by `infra/template.yaml`. Idempotent: a no-op when up to date."""
-    LOGGER.info("migrate.start", extra={"event": "migrate.start"})
+    log_event(LOGGER, "migrate.start")
     upgrade_to_head()
-    LOGGER.info("migrate.done", extra={"event": "migrate.done"})
+    log_event(LOGGER, "migrate.done")
     return {"status": "ok"}

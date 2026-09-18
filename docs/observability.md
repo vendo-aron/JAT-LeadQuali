@@ -57,6 +57,42 @@ One JSON object per line. Nothing is nested except `exception`.
 | `http.ingest` | `api.main` | `disposition`, `status`, `latency_ms` |
 | `ingest.rejected` | `api.main` | `reason`, `claimed_tenant`, `client`, `status` |
 | `ingest.rate_limited` | `api.main` | `retry_after_seconds` |
+| `admin.login_failed` | `api.admin` | `username` (a staff handle), `gated` |
+| `admin.session_rejected` | `api.admin` | `reason` |
+| `admin.csrf_rejected` | `api.admin` | — (deliberately: the benign cause is a page left open) |
+| `admin.config_changed` | `api.admin` | `changed_by`, `config_version`, `fields_changed`, `reverted_from` |
+| `admin.rerun_completed` | `api.admin` | `leads`, `tier_changes`, `cost_usd`, `billable` (always false) |
+| `admin.lead_promoted` | `api.admin` | `lead_id`, `case_id`, `promoted_by` |
+| `admin.page_failed` | `api.admin` | `error` (the exception's class, never its message) |
+| `retention.purged` | `app.retention` | `payloads_redacted`, `reasoning_redacted`, `leads_purged` |
+| `retention.erased` | `app.retention` | `contact_email_hash`, `leads_deleted`, `rows_deleted`, `matched_by_payload_scan`, `requested_by` |
+| `retention.run` | `api.retention` | `tenants`, `total_*` per class of record |
+| `queue.undecodable_message` | `api.worker` | `message_id` |
+| `queue.qualify_failed` | `api.worker` | `message_id`, `exception` |
+| `ratelimit.limits_unavailable` | `api.ratelimit` | `tenant_id` |
+| `keyhash.unreadable_stored_hash` | `adapters.keyhash_argon2` | `key_id` |
+| `ingest.tenant_without_signing_secret` | `adapters.store_tenants` | `key_id` |
+| `ingest.signing_secret_unavailable` | `adapters.store_tenants` | `key_id`, `secret_arn` |
+| `ingest.last_used_not_recorded` | `adapters.store_tenants` | `key_id` |
+| `secrets.refresh_failed` | `adapters.secrets_manager` | `secret_arn` |
+| `secrets.tenant_hmac_created` | `adapters.secrets_manager` | `tenant_id` |
+| `secrets.tenant_hmac_exists` | `adapters.secrets_manager` | `secret_name` |
+| `secrets.tenant_hmac_rotated` | `adapters.secrets_manager` | `secret_arn` |
+| `migrate.start` | `api.migrate` | — |
+| `migrate.done` | `api.migrate` | — |
+
+This table is **enumerated from the source** by `tests/unit/test_pii_log_sweep.py`, which
+walks the AST of every module under `src/leadquali` and fails when an event is emitted and
+missing here, or named here and emitted by nothing. It is a published contract — #29 writes
+alarms against these names and a saved Logs Insights query filters on them — so it is kept
+true by a test rather than by anybody remembering.
+
+**Every event in this table is emitted with `log_event`.** #37 converted the last ten call
+sites that used `logger.warning(msg, extra={"event": …})` instead: that spelling looks
+equivalent and is not. The JSON formatter reads its structured payload off one attribute
+that only `log_event` sets, so those records reached CloudWatch with **no `event` field at
+all** — their event name survived only as the message text, and `filter event = "…"` matched
+nothing. The sweep now enumerates both spellings, so the mistake cannot come back silently.
 
 ### PII
 

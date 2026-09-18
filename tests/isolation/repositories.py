@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.metering_postgres import PostgresMeteringStore
+from leadquali.adapters.retention_postgres import PostgresRetentionStore
 from leadquali.adapters.store_postgres import (
     PostgresFeedbackStore,
     PostgresLeadStore,
@@ -48,6 +49,7 @@ from leadquali.app.assessment_result import AssessmentFailed
 from leadquali.app.feedback import Verdict
 from leadquali.app.metering import BillingPeriod
 from leadquali.app.ports import RoutingOutcome
+from leadquali.app.retention import ErasureRequest, payload_tombstone
 from leadquali.app.tenants import TenantStatus
 from leadquali.domain.models import Action, EscalationReason
 from leadquali.domain.routing import system_failure
@@ -56,6 +58,8 @@ from tests.sqlcapture import CannedResult
 
 __all__ = [
     "ALLOWLIST",
+    "ASSESSMENT_A",
+    "ASSESSMENT_B",
     "DAY",
     "FLEET_METHODS",
     "KEY_ID_A",
@@ -101,6 +105,11 @@ TENANT_B_UUID: Final[uuid.UUID] = tenant_uuid(TENANT_B)
 #: and really belongs to somebody else.
 LEAD_A: Final[str] = "3a5c9e10-0b47-4d2f-9c61-7e8a04b5d213"
 LEAD_B: Final[str] = "c1d2e3f4-0506-4708-890a-b1c2d3e4f506"
+
+#: One assessment each, with fixed ids so a cross-tenant write can name a row that really
+#: belongs to somebody else. Only #37's reasoning redaction addresses an assessment by id.
+ASSESSMENT_A: Final[str] = "9f2c1d40-5a63-4b18-8e7f-0c4d2a6b9e11"
+ASSESSMENT_B: Final[str] = "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908"
 
 SUBMISSION_A: Final[str] = "submission-alpha-0001"
 SUBMISSION_B: Final[str] = "submission-zenith-0001"
@@ -260,6 +269,7 @@ REPOSITORIES: Final[tuple[Repository, ...]] = (
     Repository(PostgresTenantConfigSource, PostgresTenantConfigSource),
     Repository(PostgresTenantAdminStore, PostgresTenantAdminStore),
     Repository(PostgresMeteringStore, PostgresMeteringStore),
+    Repository(PostgresRetentionStore, PostgresRetentionStore),
     Repository(PostgresIngestCredentials, _ingest_credentials),
 )
 
@@ -294,6 +304,10 @@ ALLOWLIST: Final[Mapping[type, Mapping[str, str]]] = {
         "from_url": "constructor",
         "from_env": "constructor",
     },
+    PostgresRetentionStore: {
+        "from_url": "constructor",
+        "from_env": "constructor",
+    },
     PostgresIngestCredentials: {},
 }
 
@@ -316,6 +330,16 @@ FLEET_METHODS: Final[Mapping[type, frozenset[str]]] = {
             "fleet_tenants_with_quota",
         }
     ),
+    PostgresRetentionStore: frozenset(
+        {
+            # The scheduled purge's worklist: every tenant and the two retention windows
+            # on its row. A job that deletes customer data has to know who to run for, and
+            # one that took a tenant would simply never run for the tenant somebody forgot
+            # to list — which is the failure mode the naming rule exists to make visible.
+            # It returns the per-tenant breakdown, never a count and never a total.
+            "fleet_retention_policies",
+        }
+    ),
 }
 
 
@@ -331,6 +355,21 @@ _SUBMISSION = LeadSubmission(
     message="This submission exists only to be written under the wrong tenant.",
     extra={},
 )
+
+
+#: The instant every retention recipe counts back from, and the two cutoffs derived from
+#: it. Far enough in the past that both tiers have something to find in the integration
+#: fixture, and fixed so the compiled SQL is comparable run to run.
+RETENTION_CUTOFF: Final[dt.datetime] = NOW - dt.timedelta(days=90)
+RETENTION_LEAD_CUTOFF: Final[dt.datetime] = NOW - dt.timedelta(days=730)
+
+#: The tombstone a tier-1 redaction writes. Built by the application's own function rather
+#: than typed out, so a change to the marker's shape reaches this sweep too.
+RETENTION_TOMBSTONE: Final[dict[str, Any]] = payload_tombstone(redacted_at=NOW)
+
+#: A subject hash for the erasure recipes. Not derived from either tenant's fixture
+#: address: the point of these calls is that they find nothing under the wrong tenant.
+SUBJECT_HASH: Final[str] = "0" * 64
 
 
 #: Method name to the arguments it is called with and what a cross-tenant call must do.
@@ -504,6 +543,100 @@ RECIPES: Final[Mapping[type, Mapping[str, ArgumentRecipe]]] = {
             arguments={"monthly_lead_quota": 10, "alert_fraction": Decimal("0.5")},
             expected=CrossTenant.WRITES_NOTHING,
             note="Writing B's plan must not move A's, which is money.",
+        ),
+    },
+    PostgresRetentionStore: {
+        "retention_policy": ArgumentRecipe(
+            expected=CrossTenant.RETURNS_OWN,
+            note="A retention window is a contractual term; reading another's is a leak.",
+        ),
+        "set_retention_policy": ArgumentRecipe(
+            arguments={"raw_retention_days": 30, "assessment_retention_days": 365},
+            expected=CrossTenant.WRITES_NOTHING,
+            note=(
+                "Shortening B's window must not shorten A's. This is the one write in the "
+                "system that can bring forward the destruction of a customer's data."
+            ),
+        ),
+        "count_expired": ArgumentRecipe(
+            arguments={
+                "payload_cutoff": RETENTION_CUTOFF,
+                "lead_cutoff": RETENTION_LEAD_CUTOFF,
+            },
+            expected=CrossTenant.RETURNS_OWN,
+            note="A dry run that counted the fleet would tell an operator to expect the "
+            "wrong number and then delete a different set of rows.",
+        ),
+        "redact_expired_payloads": ArgumentRecipe(
+            arguments={
+                "cutoff": RETENTION_CUTOFF,
+                "tombstone": RETENTION_TOMBSTONE,
+                "batch_size": 10,
+            },
+            expected=CrossTenant.WRITES_NOTHING,
+            note=(
+                "The destructive one. A missing tenant filter here does not raise, does "
+                "not fail and does not look wrong: it tombstones every expired lead in "
+                "the fleet, and the rows it overwrote are gone."
+            ),
+        ),
+        "reasoning_for_leads": ArgumentRecipe(
+            arguments={"lead_ids": [LEAD_A]},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note="A's lead id, read as B. The model's prose about A's lead is A's.",
+        ),
+        "replace_reasoning": ArgumentRecipe(
+            arguments={"replacements": {ASSESSMENT_A: "redacted by the sweep"}},
+            expected=CrossTenant.WRITES_NOTHING,
+            note=(
+                "A's assessment id, written as B. One statement per row, so the sweep "
+                "reads each one and each one names the tenant."
+            ),
+        ),
+        "purge_expired_leads": ArgumentRecipe(
+            arguments={"cutoff": RETENTION_LEAD_CUTOFF, "batch_size": 10},
+            expected=CrossTenant.WRITES_NOTHING,
+            note="The only DELETE in the codebase that runs on a schedule.",
+        ),
+        "leads_for_subject": ArgumentRecipe(
+            arguments={"subject_hash": SUBJECT_HASH},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note=(
+                "The same person can be a lead of two customers, and each controller may "
+                "only erase their own copy. Unscoped, one customer's deletion request "
+                "would destroy another customer's data."
+            ),
+        ),
+        "leads_mentioning": ArgumentRecipe(
+            arguments={"needle": "probe@isolation.invalid"},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note="The slow second net. It reads payloads, so it is the worst one to leave "
+            "unfiltered: a substring match across the fleet returns other customers' rows.",
+        ),
+        "count_lead_children": ArgumentRecipe(
+            arguments={"lead_ids": [LEAD_A]},
+            expected=CrossTenant.RETURNS_OWN,
+            note="A's lead id counted as B. Four sub-selects, and every one is scoped.",
+        ),
+        "erase": ArgumentRecipe(
+            arguments={
+                "request": ErasureRequest(
+                    subject_hash=SUBJECT_HASH,
+                    lead_ids=(LEAD_A,),
+                    matched_by_hash=1,
+                    matched_by_payload_scan=0,
+                    requested_by="isolation-sweep",
+                    completed_at=NOW,
+                )
+            },
+            expected=CrossTenant.WRITES_NOTHING,
+            results=(CannedResult(row=(0, 0, 0, 0)), CannedResult(row=())),
+            note=(
+                "Handed A's lead id while acting as B: the counts, the delete and the "
+                "audit row are all filtered on B, so nothing of A's is read or removed "
+                "and the erasure_log row is filed under B. Two canned results so the "
+                "sweep sees all three statements."
+            ),
         ),
     },
     PostgresIngestCredentials: {

@@ -26,8 +26,10 @@ Schema decisions worth knowing about:
 * The ``tenants`` foreign key is ``ON DELETE RESTRICT``, the ``leads`` one ``ON DELETE
   CASCADE``. Deleting a lead is a scoped act and taking its assessment, routing and
   feedback rows with it is correct; deleting a *tenant* would otherwise destroy the entire
-  invariant-3 audit trail as a side effect of one mistyped ``WHERE``. Erasure is deliberate:
-  #37's purge routine deletes the tenant's leads first, then the tenant.
+  invariant-3 audit trail as a side effect of one mistyped ``WHERE``. #37's retention job
+  and its erasure path both delete **leads** and rely on that cascade; neither has a code
+  path that removes a tenant row, and ``RESTRICT`` is what keeps that true by accident as
+  well as on purpose.
 * An assessment records a **failure** as faithfully as a success. ``status`` says which,
   and a CHECK constraint keeps the two shapes from being mixed up. Invariant 3 makes an API
   error, a refusal, a timeout and a parse error first-class outcomes, so the schema has to
@@ -66,16 +68,20 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 __all__ = [
     "ASSESSMENT_STATUSES",
+    "DEFAULT_ASSESSMENT_RETENTION_DAYS",
     "DEFAULT_QUOTA_ALERT_FRACTION",
     "DEFAULT_RATE_LIMIT_BURST",
     "DEFAULT_RATE_LIMIT_PER_MINUTE",
+    "DEFAULT_RAW_RETENTION_DAYS",
     "ESCALATION_REASONS",
     "LEAD_STATUSES",
+    "PERSONAL_DATA_COLUMNS",
     "ROUTING_ACTIONS",
     "TENANT_SLUG_SQL_PATTERN",
     "TENANT_STATUSES",
     "Assessment",
     "Base",
+    "ErasureLog",
     "Feedback",
     "GoldenPromotion",
     "Lead",
@@ -156,6 +162,53 @@ DEFAULT_QUOTA_ALERT_FRACTION: str = "0.80"
 Mirrors ``leadquali.app.metering.DEFAULT_QUOTA_ALERT_FRACTION``; ``tests/unit/test_db_schema.py``
 pins the two together. A fraction rather than a count so that it survives a plan change:
 raising a customer's quota should not silently move their alert to 95% of the new one."""
+
+
+#: Every column in this schema that may hold personal data, and why it is allowed to.
+#:
+#: **One place.** Invariant 5 is a claim about *what is stored where*, and #37's retention
+#: job, ``docs/data-retention-policy.md`` and the DPA's description of what we process are
+#: all statements about this mapping. Adding a column that can hold personal data is one
+#: entry here with a sentence next to it; ``tests/unit/test_db_schema.py`` fails until the
+#: schema's full column inventory agrees, and ``tests/unit/test_retention.py`` fails until
+#: ``leadquali.app.retention.COLUMN_DISPOSITION`` says what retention does about it.
+#:
+#: Two classes are in here and they are not the same thing. ``leads.raw_payload`` is a
+#: **verbatim copy** of what a stranger typed. The other three are free text written
+#: *about* a lead — by the model, by a sales rep, by a member of staff — which routinely
+#: quotes or names the submitter and therefore cannot be called anonymous, however it was
+#: produced. #13 found exactly that in the model's ``reasoning`` and fixed it in the CLI
+#: report; the same fact is what #37's redaction pass exists for.
+PERSONAL_DATA_COLUMNS: dict[tuple[str, str], str] = {
+    ("leads", "raw_payload"): (
+        "the submission itself: name, address, phone and whatever the person typed. The "
+        "only verbatim copy of a lead's own data anywhere in the schema."
+    ),
+    ("assessments", "reasoning"): (
+        "the model's prose about the lead, which routinely quotes it back."
+    ),
+    ("feedback", "notes"): (
+        "a sales rep's free text about a lead, which can name the person they spoke to."
+    ),
+    ("golden_promotions", "note"): (
+        "a staff rationale for promoting one lead into the eval set; free text about a "
+        "named individual's enquiry."
+    ),
+}
+
+DEFAULT_RAW_RETENTION_DAYS: int = 90
+"""How long ``leads.raw_payload`` is kept, in days, when a tenant has not chosen otherwise.
+
+Mirrors ``leadquali.app.retention.DEFAULT_RAW_RETENTION_DAYS``;
+``tests/unit/test_db_schema.py`` pins the two together. On the row rather than in a config
+file because a retention window is a contractual term: it is negotiated per customer, it
+has to be answerable from the database during an audit, and a deploy must not be able to
+change one silently."""
+
+DEFAULT_ASSESSMENT_RETENTION_DAYS: int = 730
+"""How long the whole ``leads`` row and its children are kept, in days, by default.
+
+Two years. Mirrors ``leadquali.app.retention.DEFAULT_ASSESSMENT_RETENTION_DAYS``."""
 
 
 def _sql_in(column: str, values: tuple[str, ...]) -> str:
@@ -261,6 +314,18 @@ class Tenant(Base):
     quota_alert_fraction: Mapped[decimal.Decimal] = mapped_column(
         Numeric(3, 2), nullable=False, server_default=text(DEFAULT_QUOTA_ALERT_FRACTION)
     )
+    # The two retention windows (#37), in days. Tier 1 is how long the personal data in
+    # `leads.raw_payload` is kept; tier 2 is how long the lead row and everything hanging
+    # off it is kept. Both are NOT NULL with a server default rather than nullable
+    # "unset means the default": a retention window a reviewer has to look up in code is
+    # one nobody can audit, and `SELECT slug, raw_retention_days FROM tenants` is the
+    # question an auditor actually asks. See docs/data-retention-policy.md.
+    raw_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text(str(DEFAULT_RAW_RETENTION_DAYS))
+    )
+    assessment_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text(str(DEFAULT_ASSESSMENT_RETENTION_DAYS))
+    )
     created_at: Mapped[dt.datetime] = _created_at()
     # Touched by every admin write. "When did this tenant's rubric last change?" is the
     # first question after a routing surprise, and without this column the only answer is
@@ -289,6 +354,20 @@ class Tenant(Base):
         CheckConstraint(
             "quota_alert_fraction > 0 AND quota_alert_fraction <= 1",
             name="quota_alert_fraction_is_a_fraction",
+        ),
+        # A window of zero days is not a policy, it is an outage: every lead would be
+        # redacted by the next run of the purge, including the one being qualified.
+        CheckConstraint(
+            "raw_retention_days > 0 AND assessment_retention_days > 0",
+            name="retention_windows_are_positive",
+        ),
+        # The tier split only means anything in one direction. Keeping the payload longer
+        # than the record it belongs to would have the purge delete the lead — payload and
+        # all — while the payload's own window still had months to run, which is not what
+        # anybody who set those two numbers meant.
+        CheckConstraint(
+            "raw_retention_days <= assessment_retention_days",
+            name="raw_retention_within_assessment_retention",
         ),
     )
 
@@ -398,6 +477,12 @@ class Lead(Base):
         # Per-tenant recent-leads listing: WHERE tenant_id = ? ORDER BY received_at DESC.
         # The unique constraint above cannot serve it — its second column is not a date.
         Index("ix_leads_tenant_id_received_at", "tenant_id", "received_at"),
+        # The deletion-request lookup (#37). Without it, "what do you hold about this
+        # person?" is a scan of everything the tenant has ever received, and the reason
+        # the hash column exists at all — answering that question without reading JSONB —
+        # is true in principle and not in practice. The column is nullable and the index
+        # simply does not carry the NULLs.
+        Index("ix_leads_tenant_id_contact_email_hash", "tenant_id", "contact_email_hash"),
         CheckConstraint("submission_id <> ''", name="submission_id_not_blank"),
         CheckConstraint(_sql_in("status", LEAD_STATUSES), name="status_known"),
     )
@@ -813,4 +898,100 @@ class GoldenPromotion(Base):
         # here would then be refused at the point it was appended to the file — after the
         # operator had been told it worked.
         CheckConstraint("length(note) >= 20", name="note_is_a_rationale"),
+    )
+
+
+class ErasureLog(Base):
+    """One carried-out deletion request (#37). The proof half of "and prove it".
+
+    A deletion request is a contractual obligation the moment a DPA is signed, and an
+    erasure nobody can evidence is worth nothing in the conversation where it matters. The
+    receipt handed to the requester and this row are the same facts; the receipt can be
+    lost or edited, and this cannot.
+
+    **The subject is a hash.** ``subject_hash`` is SHA-256 of the normalised address — the
+    same value ``leads.contact_email_hash`` held before the rows went — because a table
+    whose entire purpose is recording that somebody's personal data was deleted must not
+    become the last place their address is stored. A controller checking this row
+    recomputes the hash from the address they already have.
+
+    **The tenant reference is ``RESTRICT``, unlike every other table hanging off
+    ``tenants``.** ``tenant_api_keys`` and ``tenant_config_versions`` cascade because they
+    are configuration and are meaningless without the customer. This is evidence about a
+    third party's rights, and it has to survive the customer's account being closed — which
+    is exactly when somebody asks whether the erasure really happened. There is no code
+    path anywhere that deletes a tenant; this constraint is what makes that a property of
+    the database rather than of everybody remembering.
+
+    The counts are per table rather than one total, because "we deleted 14 rows" is not an
+    answer and "1 lead, 3 assessments, 3 routing events, 1 feedback" is. They are recorded
+    even when they are all zero: "we checked on this date and held nothing about this
+    person" is the correct answer to a controller whose subject the retention job already
+    removed, and it is only evidence if it was written down at the time.
+    """
+
+    __tablename__ = "erasure_log"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="RESTRICT", name="fk_erasure_log_tenant_id_tenants"),
+        nullable=False,
+    )
+    # 64 lowercase hex characters. Shape-checked below as well as typed, because this is
+    # the column that proves which subject the row is about and a truncated or
+    # differently-cased digest would silently fail to match.
+    subject_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    leads_deleted: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    assessments_deleted: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    routing_events_deleted: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    feedback_deleted: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    golden_promotions_deleted: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    # How many leads the indexed `contact_email_hash` lookup found, and how many only the
+    # slow payload scan found. The second number is the one worth reading: anything above
+    # zero means this tenant's form collects an address in a field nobody modelled, which
+    # is a conversation to have with them rather than a number to file.
+    matched_by_hash: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    matched_by_payload_scan: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    # Who asked and how it was verified: a ticket reference or an operator handle, never
+    # the subject's own identity. It answers "on whose authority was this data destroyed?",
+    # which is the question asked when the erasure turns out to have been a mistake.
+    requested_by: Mapped[str] = mapped_column(Text, nullable=False)
+    completed_at: Mapped[dt.datetime] = _created_at()
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        # "What have we erased for this customer, most recent first" is the only query this
+        # table is read by, and it is the one an audit asks for.
+        Index("ix_erasure_log_tenant_id_completed_at", "tenant_id", "completed_at"),
+        # Finding every erasure for one subject across tenants: the same person can be a
+        # lead of two customers and can ask both.
+        Index("ix_erasure_log_subject_hash", "subject_hash"),
+        CheckConstraint("subject_hash ~ '^[0-9a-f]{64}$'", name="subject_hash_is_a_sha256"),
+        CheckConstraint("requested_by <> ''", name="requested_by_not_blank"),
+        CheckConstraint(
+            "leads_deleted >= 0 AND assessments_deleted >= 0 AND routing_events_deleted >= 0 "
+            "AND feedback_deleted >= 0 AND golden_promotions_deleted >= 0 "
+            "AND matched_by_hash >= 0 AND matched_by_payload_scan >= 0",
+            name="counts_are_not_negative",
+        ),
+        # The two nets have to account for the leads that were deleted. Written as `<=`
+        # rather than `=` on purpose: a row claiming it deleted more leads than it found is
+        # an arithmetic bug and must be refused, while the other direction is reachable
+        # without one — a concurrent purge can remove a row between the lookup and the
+        # delete. Refusing that would abort an erasure that had otherwise succeeded, which
+        # is a worse outcome than an audit row saying one of the four matches was already
+        # gone.
+        CheckConstraint(
+            "leads_deleted <= matched_by_hash + matched_by_payload_scan",
+            name="matches_account_for_the_leads_deleted",
+        ),
     )

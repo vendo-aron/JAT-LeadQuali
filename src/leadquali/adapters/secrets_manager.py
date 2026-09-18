@@ -65,6 +65,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from leadquali.config import Settings, get_settings
+from leadquali.observability.logs import log_event
 
 LOGGER: Final = logging.getLogger(__name__)
 
@@ -199,9 +200,11 @@ class SecretsManagerResolver:
             if cached is None:
                 # Cold start with nothing to fall back on. There is no safe answer.
                 raise
-            LOGGER.warning(
+            log_event(
+                LOGGER,
                 "secrets.refresh_failed",
-                extra={"event": "secrets.refresh_failed", "secret_arn": secret_arn},
+                level=logging.WARNING,
+                secret_arn=secret_arn,
             )
             self._cache[secret_arn] = _CacheEntry(
                 value=cached.value,
@@ -418,10 +421,7 @@ class TenantSecretsProvisioner:
         arn = response.get("ARN")
         if not isinstance(arn, str):
             raise SecretProvisioningError(f"create_secret for {name} returned no ARN")
-        LOGGER.info(
-            "secrets.tenant_hmac_created",
-            extra={"event": "secrets.tenant_hmac_created", "tenant_id": slug},
-        )
+        log_event(LOGGER, "secrets.tenant_hmac_created", tenant_id=slug)
         return arn
 
     def rotate_tenant_hmac_secret(self, secret_arn: str) -> None:
@@ -446,9 +446,8 @@ class TenantSecretsProvisioner:
             raise SecretProvisioningError(
                 f"cannot rotate secret {secret_arn}: {type(error).__name__}"
             ) from None
-        LOGGER.warning(
-            "secrets.tenant_hmac_rotated",
-            extra={"event": "secrets.tenant_hmac_rotated", "secret_arn": secret_arn},
+        log_event(
+            LOGGER, "secrets.tenant_hmac_rotated", level=logging.WARNING, secret_arn=secret_arn
         )
 
     def _existing_arn(self, name: str) -> str:
@@ -462,10 +461,7 @@ class TenantSecretsProvisioner:
         arn = described.get("ARN")
         if not isinstance(arn, str):
             raise SecretProvisioningError(f"describe_secret for {name} returned no ARN")
-        LOGGER.info(
-            "secrets.tenant_hmac_exists",
-            extra={"event": "secrets.tenant_hmac_exists", "secret_name": name},
-        )
+        log_event(LOGGER, "secrets.tenant_hmac_exists", secret_name=name)
         return arn
 
     def __repr__(self) -> str:

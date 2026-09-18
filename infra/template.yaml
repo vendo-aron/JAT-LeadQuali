@@ -142,6 +142,16 @@ Parameters:
     Default: 30
     MinValue: 1
     Description: How long a one-click feedback link stays valid.
+  RetentionSchedule:
+    Type: String
+    Default: "cron(30 2 * * ? *)"
+    Description: >
+      When the retention purge runs, as an EventBridge schedule expression. 02:30 UTC
+      daily by default: quiet for every timezone we serve, and before the database's
+      03:10 backup window so a night's deletions are inside the snapshot that follows.
+      A parameter rather than a literal because moving it is an operational decision, and
+      because a stage that is being load-tested may want it off (set it to a date far in
+      the future rather than deleting the resource).
   VpcSubnetIds:
     Type: CommaDelimitedList
     Default: ""
@@ -396,6 +406,64 @@ Resources:
         - !Ref DecryptSecretsPolicy
         - VPCAccessPolicy: {}
 
+  # The retention job (#37). EventBridge fires it once a day; it redacts every expired
+  # lead payload and deletes every lead past its tenant's assessment window. See
+  # docs/data-retention-policy.md.
+  #
+  # Three properties of this block are deliberate.
+  #
+  # ReservedConcurrentExecutions is 1. Two concurrent runs would not corrupt anything —
+  # every batch takes its rows FOR UPDATE SKIP LOCKED, so they would divide the work — but
+  # they would double the connection budget for a job that is never in a hurry, and "how
+  # many of these can be running?" should have a one-word answer for the only function in
+  # the system that deletes customer data.
+  #
+  # The 900 s timeout is the Lambda maximum, and it is the right number rather than a
+  # generous one: the job is batched and idempotent, so a run that is cut off mid-way has
+  # deleted the most overdue data and the next night's run picks up exactly where it
+  # stopped. Nothing is left half-done that a retry would not finish.
+  #
+  # RetentionSchedule is a parameter so the hour can be moved without a template change
+  # — 02:30 UTC by default, before the 03:10 backup window, so a night's deletions are in
+  # the snapshot that follows rather than being taken and then backed up from the previous
+  # day for the next seven.
+  RetentionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "leadquali-${Stage}-retention"
+      CodeUri: ../
+      Handler: leadquali.api.retention.lambda_handler
+      MemorySize: 512
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      VpcConfig: !If
+        - InVpc
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          DATABASE_SECRET_ARN: !Ref DatabaseSecretArn
+          DATABASE_HOST: !Ref DatabaseHost
+          DATABASE_PORT: !Ref DatabasePort
+          DATABASE_NAME: !Ref DatabaseName
+          SECRETS_CACHE_TTL_SECONDS: !Ref SecretsCacheTtlSeconds
+      Policies:
+        # One secret. Retention needs the database and nothing else: not the Anthropic key,
+        # not SES, not the feedback signing key. The narrowest policy of any function here,
+        # and it is attached to the one that can do the most damage.
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref DatabaseSecretArn
+        - !Ref DecryptSecretsPolicy
+        - VPCAccessPolicy: {}
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref RetentionSchedule
+            Description: !Sub "leadquali-${Stage}: daily data retention purge (#37)"
+            Enabled: true
+
   LeadApi:
     Type: AWS::Serverless::Api
     Properties:
@@ -430,3 +498,8 @@ Outputs:
   MigrationFunctionName:
     Description: Invoke once per deploy, before traffic, to run alembic upgrade head.
     Value: !Ref MigrationFunction
+  RetentionFunctionName:
+    Description: >
+      The daily retention purge (#37). Invoke by hand only to catch up after an outage;
+      the by-hand path with a person watching is `python -m leadquali.retentionctl`.
+    Value: !Ref RetentionFunction

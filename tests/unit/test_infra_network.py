@@ -20,7 +20,7 @@ comparison against a remembered number.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -39,6 +39,14 @@ from tests.unit.cfn import (
 CONNECTIONS_PER_CONTAINER = 1
 
 DATABASE_PORT = 5432
+
+
+#: How many Lambda functions in the application stack connect to Postgres: ingest, worker,
+#: migrations and — since #37 — the retention purge. Not a detail: every one of them draws
+#: from the connection budget #27's arithmetic is built on, so a new one is a deliberate
+#: change to that budget and has to be counted here on purpose. The tests below use it as a
+#: guard that their loop selected something, not as a claim about which functions exist.
+POSTGRES_FUNCTIONS: Final[int] = 4
 
 
 @pytest.fixture(scope="module")
@@ -419,9 +427,9 @@ def test_every_function_that_touches_postgres_has_a_concurrency_cap(
         assert "ReservedConcurrentExecutions" in properties, (
             f"{logical_id} connects to Postgres with no cap on how many of it exist"
         )
-    assert checked == 3, (
-        "no function matched: the marker this loop selects on has been renamed, and the "
-        "test is passing by examining nothing"
+    assert checked == POSTGRES_FUNCTIONS, (
+        "no function matched, or a new one appeared: the marker this loop selects on may "
+        "have been renamed, and the test would then be passing by examining nothing"
     )
 
 
@@ -447,7 +455,7 @@ def test_every_function_that_touches_postgres_is_in_the_vpc(
         assert vpc is not None, f"{logical_id} reads Postgres from outside the VPC"
         assert vpc["Fn::If"][0] == "InVpc"
         assert vpc["Fn::If"][1]["SubnetIds"] == {"Fn::Ref": "VpcSubnetIds"}
-    assert checked == 3, "no function matched; see the note in the test above"
+    assert checked == POSTGRES_FUNCTIONS, "no function matched; see the note above"
 
 
 def test_migrations_run_one_at_a_time(application: dict[str, Any]) -> None:
