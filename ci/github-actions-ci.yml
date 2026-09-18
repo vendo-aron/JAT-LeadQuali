@@ -65,10 +65,19 @@ jobs:
       - name: Type check (mypy strict)
         run: mypy
 
-      # Paths exclude tests/evals, which makes billable Anthropic calls and gets its own
-      # manually dispatched workflow. The marker filter is the belt to that braces: even
-      # if a `live_api` or `integration` test is added under tests/unit or tests/contract,
-      # it cannot spend money or reach a database from here. This job is given no
-      # ANTHROPIC_API_KEY and no AWS credentials, so such a test would fail, not skip.
+      # No path arguments, deliberately. `testpaths = ["tests"]` in pyproject.toml is the
+      # single definition of what the suite is, so this runs exactly what a contributor
+      # runs locally and a new top-level test directory is covered the day it appears.
+      #
+      # Naming directories here instead is how a whole suite goes quiet: this step used to
+      # read `pytest tests/unit tests/contract`, which silently excluded tests/isolation —
+      # the tenant-isolation suite that exists to be shown to a customer's security
+      # reviewer. Nothing failed; the tests simply never ran. `tests/isolation`'s own
+      # test_suite_is_collected.py now scans this file and fails if the narrowing returns.
+      #
+      # The marker filter is what keeps the job free: the billable eval tests are
+      # `live_api` and the database ones are `integration`, so neither can run here. This
+      # job is given no ANTHROPIC_API_KEY and no AWS credentials, so such a test would
+      # fail rather than skip.
       - name: Test (pytest, offline suite only)
-        run: pytest tests/unit tests/contract -m "not live_api and not integration"
+        run: pytest -m "not live_api and not integration"
