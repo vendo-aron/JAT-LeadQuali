@@ -71,15 +71,24 @@ by hand, and returns a `RuntimeError` naming the missing variable in one that do
 That file belongs to #26–#28 and is being edited in parallel, so the change was left out
 rather than merged blind. It is four lines of YAML and a policy statement.
 
-### Generating a credential
+### Generating both
 
-```python
-from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
-print(Argon2KeyHasher().hash_secret("the password you chose"))
+```bash
+# 32 bytes of signing material for ADMIN_SESSION_SECRET
+python -m leadquali.adminctl secret
+
+# a staff credential; the password is read without echoing and asked for twice
+python -m leadquali.adminctl hash ada
+{"ada": "$argon2id$v=19$m=19456,t=2,p=1$..."}
 ```
 
-Put the result in the map against the username. The password itself is never stored, never
-transmitted anywhere but the login form, and cannot be recovered from the hash.
+`hash` with no username prints just the encoding, for adding to a map that already has
+entries. The password is never an argument — it would be in your shell history and in
+`ps` — is never written to a file, and cannot be recovered from the hash.
+
+There is deliberately no command that *writes* either value anywhere. Putting it into
+Secrets Manager or a `.env` is your step, with your own credentials, which is why
+`adminctl` needs no AWS access at all.
 
 **Rotating `ADMIN_SESSION_SECRET` signs every staff member out immediately.** That is the
 intended emergency response to a suspected cookie theft, and it takes effect within
@@ -102,6 +111,22 @@ policy and is worth knowing before you try it on `http://localhost`.
 **Absolute expiry, twelve hours, no sliding renewal.** A sliding session is one a stolen
 cookie keeps alive forever as long as the thief keeps using it, which is exactly the case
 the expiry exists for. The cost is that a long day ends with a second login.
+
+**Signing out clears the browser's copy, and nothing else.** The sign-out button in the
+header posts to `/admin/logout`, which expires the cookie with every flag it was set with.
+But the token is a *signed bearer credential with no server-side record*: there is no
+session table to delete a row from, so a copy already taken off the machine keeps working
+until its twelve hours are up. That is the trade the stateless design makes, and it has one
+consequence worth knowing before you need it:
+
+> **If you suspect a session cookie has been stolen, rotate `ADMIN_SESSION_SECRET`.** That
+> invalidates every outstanding session immediately — including yours and everybody else's,
+> which is the point — and takes effect within `SECRETS_CACHE_TTL_SECONDS`. Clicking sign
+> out does not help; the thief has their own copy.
+
+The alternative — a revocation list, or server-side sessions — was not built. It would mean
+a read on every request to a tool a handful of people open a few times a week, to shorten a
+window the absolute expiry already bounds at twelve hours.
 
 ### The login
 
@@ -159,6 +184,16 @@ The bound that does not depend on process count is a layer in front. Put the adm
 SSO or an identity-aware proxy, and keep the controls here as the second factor — a proxy
 misconfiguration should not be the only thing between the internet and every tenant's
 routing rules.
+
+**The gate cuts both ways, and the second edge is a denial of service against a named
+account.** The counter's window restarts on *every* failure, not on the first, so ten wrong
+guesses every few minutes keeps one username locked out indefinitely. That is deliberate —
+the alternative, a window that expires regardless of continued attacks, gives an attacker a
+free ten guesses per window forever — but it means anybody who knows a staff username can
+keep that person out. Two things make it survivable: the lockout is per process, so other
+containers still serve that user, and rotating nothing is required to recover — the attacker
+merely has to stop. If it is ever used in anger, the answer is the proxy in front, which
+refuses the traffic before it reaches a counter at all.
 
 ---
 
@@ -220,6 +255,16 @@ log event carrying `cost_usd` and `billable: false`. Total it with a CloudWatch 
 filter if it ever becomes material.
 
 A tenant with no history gets a page saying so, not an empty table.
+
+**You cannot yet choose *which* leads.** The batch is the most recent 25 assessed leads for
+the tenant, and there is no selection column. The plan asked for "pick a set of historical
+leads" and this is the part of it that is not built: the cap and the confirmation are
+enforced properly, but "re-run these twenty, the ones sales complained about" is not
+expressible. The workaround is the feedback review, which *does* filter — find the shape you
+care about there, note the pattern, and read the re-run's output against it. A selection
+column feeding a set of lead ids into `RerunService.plan` is the obvious next change; the
+service already takes an arbitrary sequence of candidates, so it is a change to the page and
+to one query rather than to the batch machinery.
 
 ---
 

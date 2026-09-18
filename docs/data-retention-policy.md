@@ -27,6 +27,11 @@ deciding it should.
 | `assessments.reasoning` | The model's prose about the lead. It routinely quotes the lead back. | Addresses redacted at the end of tier 1; the row goes at **tier 2** |
 | `feedback.notes` | A sales rep's free text about the lead. Can name the person they spoke to. | **Tier 2** |
 | `golden_promotions.note` | A staff rationale for promoting one lead into the eval set. | **Tier 2** |
+| `stripe_events.payload` | A verified Stripe webhook body, stored verbatim (#35). An invoice object carries the billing contact's name, email and postal address. | **Not a tier — see [Billing records](#billing-records-a-different-subject-and-the-opposite-constraint)** |
+
+The last row is a different kind of record from the four above it and must not be read as a
+fifth lead column: its data subject is the **customer's own billing contact**, not somebody
+who filled in a form.
 
 Two columns are **pseudonyms** rather than personal data in the ordinary sense, and they are
 treated separately below: `leads.contact_email_hash` and `erasure_log.subject_hash`.
@@ -223,23 +228,57 @@ python -m leadquali.retentionctl purge --apply
 
 ---
 
-## Billing records are a separate question, and this document does not answer it yet
+## Billing records: a different subject, and the opposite constraint
 
-Issue #35 adds Stripe billing, and with it a second class of personal data with a different
-subject and a different lawful basis: the **customer's billing contact** — a named person at
-the company that pays us, not an inbound lead. Invoices and payment records are financial
-records, and in most jurisdictions they carry a **statutory minimum** retention measured in
-years, which is the opposite shape of constraint from the policy maximum above.
+`stripe_events.payload` (#35) holds a verified Stripe webhook body, stored verbatim because
+a payload pruned to the fields this build models is missing the ones an incident will want.
+A Stripe invoice object carries the billing contact's name, email address and postal
+address, so the column is personal data and is declared as such in
+`db_schema.PERSONAL_DATA_COLUMNS`.
 
-That work is not on this branch. **Nothing in this document describes it**, the purge job
-does not touch it, and the windows above do not apply to it. When #35 lands, this section is
-replaced by a tier of its own, and the paragraph in
-[`docs/deletion-requests.md`](deletion-requests.md) about a requester who is a billing
-contact is the one that has to be right first.
+**It is not purged by the retention job, and that is a decision rather than an omission.**
+`app.retention.COLUMN_DISPOSITION` says so in the code, and this is why:
 
-**A lawyer must set the number.** Do not copy 90 or 730 into it.
+- **The data subject is different.** Every other column above is about an inbound lead,
+  whose controller is our customer. This one is about our *own* customer's
+  accounts-payable person. We are the controller of it, not a processor.
+- **The lawful basis is different**, and so is the shape of the constraint. An invoice
+  record is a financial record. In most jurisdictions a company is *required* to keep them
+  for a period measured in years — a statutory **minimum**, where everything else in this
+  document is a policy **maximum**. Applying the 90-day lead window to it would destroy
+  evidence we are obliged to hold.
+- **It is therefore very likely out of scope for an erasure request**, on the usual
+  analysis that the processing is necessary for compliance with a legal obligation. See
+  [`docs/deletion-requests.md`](deletion-requests.md).
 
----
+**What is true today:** `stripe_events` rows are retained indefinitely. No code path deletes
+them, `retentionctl` does not touch them, and the tenant foreign key is `ON DELETE SET NULL`
+so that closing a customer's account does not destroy their billing history either.
+
+**What a lawyer must decide**, and it is item 10 on
+[`docs/dpa-draft.md`](dpa-draft.md)'s list:
+
+1. the **statutory minimum period** for our invoice records, in the jurisdiction we invoice
+   from;
+2. whether we should delete them once that period has elapsed, or keep them — "indefinitely"
+   is the current behaviour and is not automatically the right answer, because a minimum is
+   not a licence;
+3. whether an erasure request from a billing contact reaches this column at all.
+
+**Do not copy 90 or 730 into this.** When the period is set, it becomes a third window, a
+`PurgedRecords` member and a step in the purge — the structure is already there and is held
+together by a test that fails if a column that can hold personal data has no written
+disposition.
+
+> #35's [`docs/billing-integration.md`](billing-integration.md) says the retention job "must
+> cover `stripe_events.payload` as it covers `leads.raw_payload`". That was written before
+> anybody had worked out that the two constraints point in opposite directions. This section
+> is the answer, and that line has been corrected to point here.
+
+**What Stripe itself receives** is in
+[`docs/billing-integration.md`](billing-integration.md) and is not restated here. The one
+sentence worth repeating anywhere a customer can read it: **Stripe never receives lead
+data.**
 
 ## Verifying this
 

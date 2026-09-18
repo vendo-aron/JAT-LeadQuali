@@ -129,13 +129,14 @@ next, and because the separation is structural rather than a matter of care.
 **Where:** Stripe's own infrastructure. **[LEGAL]** Stripe's regions, its DPA and its
 transfer terms must be referenced properly.
 
-> Billing is issue #35 and is not on this branch at the time of writing. When it lands,
-> [`docs/billing-integration.md`](billing-integration.md) is the authority on what Stripe
-> actually receives, and **this section must be checked against it rather than restating it
-> from here**. In particular, the verified Stripe webhook payloads we store contain the
-> billing contact's details, which is a second class of personal data with its own retention
-> answer — see §8 and
-> [`docs/data-retention-policy.md`](data-retention-policy.md).
+[`docs/billing-integration.md`](billing-integration.md) is the authority on what Stripe
+actually receives and is not restated here. Two facts from it bear on this document. First,
+**Stripe never receives lead data** — that is structural, not a matter of care. Second, we
+store the verified Stripe webhook bodies **verbatim** in `stripe_events.payload`, and an
+invoice object carries the billing contact's name, email and postal address. That is a
+second class of personal data, about a different subject, with the opposite retention
+constraint from everything in §5 — see §8 and
+[`docs/data-retention-policy.md`](data-retention-policy.md).
 
 ### Changes to the list
 
@@ -250,9 +251,15 @@ asked.
 Separate from everything above, and often forgotten in a processor DPA.
 
 We hold the Customer's account contact — name and email — as a **controller** in our own
-right, for the purposes of running the commercial relationship. When billing is live (issue
-#35), we also hold the billing contact and their payment details, and Stripe processes them
-on our behalf.
+right, for the purposes of running the commercial relationship. We also hold the billing
+contact's name, email and postal address inside the verified Stripe webhook bodies stored
+verbatim in `stripe_events.payload`, and Stripe holds their payment details as our
+processor.
+
+`stripe_events.payload` is **retained indefinitely today**, and nothing deletes it: no
+retention job touches it, and the tenant reference is `ON DELETE SET NULL` so that closing an
+account does not destroy the billing history. That is the current behaviour and it is stated
+here so that nobody has to infer it.
 
 **[LEGAL]** This is the clause that needs the most care, and it is not really a DPA clause at
 all:
@@ -265,6 +272,9 @@ all:
   lawful basis** for keeping the records against a request. Until they do, a deletion request
   from a billing contact must not be actioned — see the corresponding section of
   [`docs/deletion-requests.md`](deletion-requests.md).
+- A minimum is not a licence. Once the period is settled, somebody has to decide whether we
+  **delete these rows when it elapses** or keep them for ever. "Indefinitely" is what the
+  code does today because no period has been set, not because it was chosen.
 - This should probably be a **privacy notice** rather than a clause in a processor DPA, and
   the two documents should not contradict each other.
 
@@ -333,10 +343,15 @@ Collected, in the order they appear. Nothing here is an engineering question.
 8. **§6** — whether the absence of rectification and restriction is defensible.
 9. **§7** — whether promotion of a lead into the evaluation set needs the Customer's explicit
    opt-in.
-10. **§8** — the statutory retention period for our own invoice records, the jurisdiction, and
-    the lawful basis for refusing a billing contact's deletion request. **This is the one that
-    will be asked first once billing is live, and it is the one an engineer must not answer.**
-11. **§9** — the breach-notification commitment.
+10. **§8** — the statutory retention period for `stripe_events.payload` and our other invoice
+    records, the jurisdiction, and whether we delete them once it elapses. **This is the one
+    an engineer must not answer**, and it is why that column is the one piece of personal
+    data in the schema that no retention job touches.
+11. **§8** — whether a **billing contact's erasure request reaches `stripe_events.payload` at
+    all**, given that the same rows are the evidence of a transaction. The interim operating
+    answer in [`docs/deletion-requests.md`](deletion-requests.md) is "no, and escalate";
+    that needs confirming, not assuming.
+12. **§9** — the breach-notification commitment.
 
 Plus two facts that are not legal questions but must be filled in before this document
 leaves the building: the **AWS deployment region** (§3) and the **security contact**

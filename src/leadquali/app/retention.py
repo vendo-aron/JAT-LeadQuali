@@ -19,6 +19,12 @@ against and what a billing dispute is settled from.
 **Tier 3 — aggregates** (``usage_daily``, CloudWatch metrics). Counts and sums per tenant
 per day. Not personal data, kept indefinitely, and never touched by anything here.
 
+**Not a tier at all — billing records** (``stripe_events.payload``, #35). Personal data
+about a different subject: the *customer's own billing contact*, not an inbound lead. It is
+a financial record, so the constraint on it is a statutory minimum rather than a policy
+maximum, and nothing in this module touches it. :data:`COLUMN_DISPOSITION` says so, and the
+period is a decision for a lawyer rather than a default in this file.
+
 Tier 1 expiring without tier 2 expiring is the entire point. A lead whose payload has gone
 still has its score, its tier and its routing history, so last quarter's conversion
 analysis survives the person's data being deleted.
@@ -281,6 +287,15 @@ COLUMN_DISPOSITION: Final[Mapping[tuple[str, str], str]] = {
         "not redacted, for the same reason as feedback.notes: a staff rationale about one "
         "lead, deleted with the lead at tier 2. The golden-set line rendered from it is "
         "pseudonymised separately by #22's strip_pii before anything is committed"
+    ),
+    ("stripe_events", "payload"): (
+        "**not touched by this job, deliberately.** It is a financial record about the "
+        "customer's own billing contact rather than an inbound lead, so it carries a "
+        "statutory *minimum* retention measured in years instead of a policy maximum "
+        "measured in days, and applying the lead tiers to it would destroy evidence we are "
+        "required to keep. The period, and whether an erasure request reaches it at all, "
+        "are on docs/dpa-draft.md's list of decisions a lawyer must make; until one does, "
+        "it is retained indefinitely and no code path deletes it"
     ),
 }
 

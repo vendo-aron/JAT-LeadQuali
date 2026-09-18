@@ -60,11 +60,13 @@ import pytest
 # every sweep below would pass against an empty buffer.
 from leadquali.adapters.queue_inprocess import InProcessLeadQueue
 from leadquali.api.admin import LOGIN_PATH
+from leadquali.api.billing_jobs import drain_events, report_usage
 from leadquali.api.retention import lambda_handler
 from leadquali.api.worker import handle as handle_batch
 from leadquali.app.ingest import IngestRequest, QueuedLead
 from leadquali.app.metering import BillingPeriod, MeteringService, TenantQuota
 from leadquali.app.retention import RetentionService
+from leadquali.app.tenants import TenantStatus
 from leadquali.observability import EMAIL_REDACTION
 from tests.fakes import (
     FakeClock,
@@ -74,6 +76,7 @@ from tests.fakes import (
     InMemoryRetentionStore,
     RecordingNotifier,
     StaticRevenue,
+    stripe_event,
 )
 from tests.logcapture import LogCapture, capture_json_logs
 from tests.sqlcapture import CannedResult, SqlCapture
@@ -84,6 +87,7 @@ from tests.sqlcapture import CannedResult, SqlCapture
 # configure_logging reason as the block above.
 from tests.unit import test_api_admin as admin
 from tests.unit import test_api_ingest as ingest
+from tests.unit import test_api_webhooks as webhooks
 from tests.unit import test_observability_pipeline as pipeline
 
 SOURCE_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "src" / "leadquali"
@@ -727,6 +731,225 @@ def _last_used_scenario() -> Planted:
     return Planted(secrets=(LEAD_EMAIL,))
 
 
+# ------------------------------------------------------------------------ billing (#35)
+
+#: The **customer's billing contact** — a different data subject from every lead above, and
+#: the reason billing needs its own planted identity. A real Stripe invoice object carries
+#: these three fields, and `stripe_events.payload` stores the body verbatim on purpose, so
+#: they genuinely are in the frame of every handler below.
+BILLING_NAME: Final[str] = "Grace Brewster Hopper"
+BILLING_EMAIL: Final[str] = "grace.hopper+billing@analytical-engines-quali.co.uk"
+BILLING_ADDRESS: Final[str] = "12 Marylebone High Street, London W1U 4PB"
+
+BILLING_SECRETS: Final[tuple[str, ...]] = (BILLING_NAME, BILLING_EMAIL, BILLING_ADDRESS)
+
+
+def _invoice_event(event_id: str, event_type: str, **overrides: Any) -> dict[str, Any]:
+    """A Stripe event whose object carries the billing contact, the way a real one does.
+
+    Built on top of #35's own ``stripe_event`` rather than beside it, so the shape this
+    sweep exercises is the shape its tests exercise. The three contact fields are added
+    because they are what makes the sweep mean anything: ``stripe_events.payload`` is one of
+    the only two verbatim copies of somebody's data in the whole schema, and the question is
+    whether any billing log line carries it.
+    """
+    event = stripe_event(event_id, event_type, **overrides)
+    event["data"]["object"].update(
+        {
+            "customer_name": BILLING_NAME,
+            "customer_email": BILLING_EMAIL,
+            "customer_address": {"line1": BILLING_ADDRESS},
+        }
+    )
+    return event
+
+
+def _billing_harness(**kwargs: Any) -> Any:
+    """#35's own webhook-route harness: the real service over in-memory doubles."""
+    return webhooks.Harness(**kwargs)
+
+
+def _billing_service() -> tuple[Any, Any]:
+    """The billing service and its store, seeded with one linked tenant."""
+    harness = _billing_harness()
+    return harness.service, harness.store
+
+
+#: The closed day the usage scenarios bill for. Yesterday, because a day that is not over
+#: is never reported — which is #33's rule and is the reason a naive `today()` here would
+#: make three scenarios silently emit nothing.
+BILLED_DAY: Final[dt.date] = webhooks.NOW.date() - dt.timedelta(days=1)
+
+
+def _billable_harness() -> Any:
+    """A billing harness whose tenant has real billable usage on :data:`BILLED_DAY`.
+
+    Seeded through the metering store's own rollup rather than by writing a number, so the
+    quantity the meter event carries is the one #33's arithmetic produces.
+    """
+    harness = _billing_harness()
+    moment = dt.datetime.combine(BILLED_DAY, dt.time(12, 0), tzinfo=dt.UTC)
+    harness.metering_store.add_lead(tenant_id=webhooks.TENANT, received_at=moment)
+    harness.metering_store.add_assessment(
+        tenant_id=webhooks.TENANT, created_at=moment, input_tokens=512
+    )
+    harness.metering_store.rollup_day(tenant_id=webhooks.TENANT, day=BILLED_DAY)
+    return harness
+
+
+def _drain(service: Any, event: dict[str, Any]) -> None:
+    service.receive_event(event_id=str(event["id"]), event_type=str(event["type"]), payload=event)
+    service.process_pending()
+
+
+def _billing_scenario(kind: str) -> Planted:
+    """One billing event, driven through the real service with the contact in the payload."""
+    service, store = _billing_service()
+    customer = webhooks.CUSTOMER
+    match kind:
+        case "billing.webhook_received":
+            event = _invoice_event("evt_1", "invoice.payment_succeeded", customer=customer)
+            service.receive_event(event_id=event["id"], event_type=event["type"], payload=event)
+        case "billing.event_ignored":
+            _drain(service, _invoice_event("evt_1", "customer.created", customer=customer))
+        case "billing.event_unattributed":
+            # A Stripe account holds customers that are not our tenants. Nothing is wrong,
+            # and the line must still not quote the invoice it could not attribute.
+            _drain(service, _invoice_event("evt_1", "invoice.paid", customer="cus_stranger"))
+        case "billing.invoice_settled":
+            _drain(service, _invoice_event("evt_1", "invoice.paid", customer=customer))
+        case "billing.invoice_settled_without_subscription":
+            store.given_tenant(
+                webhooks.TENANT,
+                status=TenantStatus.SUSPENDED,
+                stripe_customer_id=customer,
+                stripe_subscription_id=None,
+            )
+            _drain(service, _invoice_event("evt_1", "invoice.paid", customer=customer))
+        case "billing.dunning_started":
+            _drain(service, _invoice_event("evt_1", "invoice.payment_failed", customer=customer))
+        case "billing.dunning_continues":
+            for index in (1, 2):
+                _drain(
+                    service,
+                    _invoice_event(f"evt_{index}", "invoice.payment_failed", customer=customer),
+                )
+        case "billing.tenant_activated":
+            store.given_tenant(
+                webhooks.TENANT,
+                status=TenantStatus.SUSPENDED,
+                stripe_customer_id=customer,
+                stripe_subscription_id="sub_acme",
+            )
+            _drain(
+                service,
+                _invoice_event(
+                    "evt_1",
+                    "customer.subscription.updated",
+                    customer=customer,
+                    subscription="sub_acme",
+                    status="active",
+                ),
+            )
+        case "billing.tenant_suspended":
+            _drain(
+                service,
+                _invoice_event(
+                    "evt_1",
+                    "customer.subscription.deleted",
+                    customer=customer,
+                    subscription="sub_acme",
+                    status="canceled",
+                ),
+            )
+        case "billing.subscription_status_unknown":
+            _drain(
+                service,
+                _invoice_event(
+                    "evt_1",
+                    "customer.subscription.updated",
+                    customer=customer,
+                    subscription="sub_acme",
+                    status="a_status_stripe_invented_after_this_was_written",
+                ),
+            )
+        case "billing.event_failed":
+            # The store raises with the invoice in its message: the realistic shape of a
+            # driver or serialiser failure, and the one path where the verbatim payload is
+            # one `repr` away from the log.
+            def explode(*, stripe_customer_id: str) -> Any:
+                raise RuntimeError(f"could not read row for {stripe_customer_id}: {BILLING_EMAIL}")
+
+            store.tenant_for_customer = explode  # a deliberately leaky double
+            _drain(service, _invoice_event("evt_1", "invoice.paid", customer=customer))
+        case "billing.customer_linked":
+            # The billing contact's name and address are *arguments* to this call, which is
+            # what makes it the most important billing line in this file.
+            store.given_tenant(webhooks.TENANT, stripe_customer_id=None)
+            service.link_customer(tenant_id=webhooks.TENANT, name=BILLING_NAME, email=BILLING_EMAIL)
+        case "billing.usage_reported":
+            _billable_harness().service.report_usage_for_day(
+                tenant_id=webhooks.TENANT, usage_date=BILLED_DAY
+            )
+        case "billing.usage_too_old":
+            service.report_usage_for_day(
+                tenant_id=webhooks.TENANT,
+                usage_date=webhooks.NOW.date() - dt.timedelta(days=365),
+            )
+        case "billing.usage_report_failed":
+            billable = _billable_harness()
+
+            def refuse(**kwargs: Any) -> Any:
+                raise RuntimeError(f"stripe rejected the meter event for {BILLING_EMAIL}")
+
+            # The processor raises with the contact in its message: an error string from a
+            # dependency is exactly where personal data arrives without anybody deciding to
+            # log one. Only the exception's *class* may reach the record.
+            billable.billing.report_usage = refuse  # a deliberately leaky double
+            billable.service.report_usage_for_all(usage_date=BILLED_DAY)
+        case "billing.dunning_sweep":
+            service.sweep_dunning()
+        case _:  # pragma: no cover
+            raise AssertionError(kind)
+    return Planted(secrets=BILLING_SECRETS)
+
+
+def _billing_job_scenario(kind: str) -> Planted:
+    """The three scheduled billing jobs' own summary lines."""
+    harness = _billable_harness()
+    event = _invoice_event("evt_1", "invoice.paid", customer=webhooks.CUSTOMER)
+    harness.service.receive_event(event_id=event["id"], event_type=event["type"], payload=event)
+    if kind == "billing.drain":
+        drain_events(harness.service)
+    else:
+        report_usage(harness.service, usage_date=BILLED_DAY)
+    return Planted(secrets=BILLING_SECRETS)
+
+
+def _billing_route_scenario(kind: str) -> Planted:
+    """The public billing endpoints: the Stripe webhook, and a tenant's portal request."""
+    match kind:
+        case "billing.webhook_rejected":
+            harness = _billing_harness()
+            body = json.dumps(
+                _invoice_event("evt_1", "invoice.paid", customer=webhooks.CUSTOMER)
+            ).encode()
+            # A forged signature over a real body: the rejection must say why without
+            # quoting the body it refused to trust.
+            harness.post_webhook(body, secret="whsec_not_the_configured_one")
+        case "billing.portal_opened":
+            _billing_harness().post_portal()
+        case "billing.portal_rejected":
+            _billing_harness().post_portal(tenant="nobody-at-all")
+        case "billing.portal_unavailable":
+            harness = _billing_harness()
+            harness.store.given_tenant(webhooks.TENANT, stripe_customer_id=None)
+            harness.post_portal()
+        case _:  # pragma: no cover
+            raise AssertionError(kind)
+    return Planted(secrets=BILLING_SECRETS)
+
+
 #: Every event that carries fields, and how to make the real code emit it with a lead in
 #: scope. A discovered event missing from here fails the accounting test by name.
 SCENARIOS: Final[Mapping[str, Scenario]] = {
@@ -745,6 +968,9 @@ SCENARIOS: Final[Mapping[str, Scenario]] = {
     "admin.config_changed": lambda: _admin_scenario("admin.config_changed"),
     "admin.lead_promoted": lambda: _admin_scenario("admin.lead_promoted"),
     "admin.page_failed": lambda: _admin_scenario("admin.page_failed"),
+    # Fieldless until #36's review fixes added `method`; the AST check moved it here, which
+    # is the mechanism working rather than a nuisance.
+    "admin.csrf_rejected": lambda: _admin_scenario("admin.csrf_rejected"),
     "admin.rerun_completed": _rerun_scenario,
     "retention.purged": lambda: _retention_scenario("purged"),
     "retention.erased": lambda: _retention_scenario("erased"),
@@ -764,6 +990,34 @@ SCENARIOS: Final[Mapping[str, Scenario]] = {
     "secrets.tenant_hmac_exists": lambda: _secrets_scenario("secrets.tenant_hmac_exists"),
     "secrets.tenant_hmac_rotated": lambda: _secrets_scenario("secrets.tenant_hmac_rotated"),
     "secrets.refresh_failed": _secrets_refresh_scenario,
+    # #35's billing surface. The planted identity here is the *customer's billing contact*
+    # rather than a lead, because that is whose data `stripe_events.payload` holds.
+    "billing.webhook_received": lambda: _billing_scenario("billing.webhook_received"),
+    "billing.event_ignored": lambda: _billing_scenario("billing.event_ignored"),
+    "billing.event_unattributed": lambda: _billing_scenario("billing.event_unattributed"),
+    "billing.event_failed": lambda: _billing_scenario("billing.event_failed"),
+    "billing.invoice_settled": lambda: _billing_scenario("billing.invoice_settled"),
+    "billing.invoice_settled_without_subscription": lambda: _billing_scenario(
+        "billing.invoice_settled_without_subscription"
+    ),
+    "billing.dunning_started": lambda: _billing_scenario("billing.dunning_started"),
+    "billing.dunning_continues": lambda: _billing_scenario("billing.dunning_continues"),
+    "billing.dunning_sweep": lambda: _billing_scenario("billing.dunning_sweep"),
+    "billing.tenant_activated": lambda: _billing_scenario("billing.tenant_activated"),
+    "billing.tenant_suspended": lambda: _billing_scenario("billing.tenant_suspended"),
+    "billing.subscription_status_unknown": lambda: _billing_scenario(
+        "billing.subscription_status_unknown"
+    ),
+    "billing.customer_linked": lambda: _billing_scenario("billing.customer_linked"),
+    "billing.usage_reported": lambda: _billing_scenario("billing.usage_reported"),
+    "billing.usage_too_old": lambda: _billing_scenario("billing.usage_too_old"),
+    "billing.usage_report_failed": lambda: _billing_scenario("billing.usage_report_failed"),
+    "billing.drain": lambda: _billing_job_scenario("billing.drain"),
+    "billing.usage_run": lambda: _billing_job_scenario("billing.usage_run"),
+    "billing.webhook_rejected": lambda: _billing_route_scenario("billing.webhook_rejected"),
+    "billing.portal_opened": lambda: _billing_route_scenario("billing.portal_opened"),
+    "billing.portal_rejected": lambda: _billing_route_scenario("billing.portal_rejected"),
+    "billing.portal_unavailable": lambda: _billing_route_scenario("billing.portal_unavailable"),
 }
 
 
@@ -773,11 +1027,6 @@ SCENARIOS: Final[Mapping[str, Scenario]] = {
 #: :func:`test_a_fieldless_event_really_carries_no_fields`, so adding a field to one of
 #: these fails the suite and asks for a scenario instead.
 FIELDLESS_EVENTS: Final[Mapping[str, str]] = {
-    "admin.csrf_rejected": (
-        "one line, no fields: a state-changing post arrived without this session's token "
-        "and wrote nothing. Deliberately says nothing about who or what — the benign cause "
-        "is a page left open past a logout."
-    ),
     "migrate.start": "the migration Lambda's bookends. No tenant is in scope at all.",
     "migrate.done": "the same.",
 }

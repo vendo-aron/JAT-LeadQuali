@@ -148,15 +148,19 @@ links (a feedback link is a signed bearer capability for one verdict on one lead
 
 ### Secrets
 
-Nothing is a literal and nothing is a plaintext parameter. Four secrets, three origins, all
-documented in [`docs/runbooks/secrets-and-rotation.md`](runbooks/secrets-and-rotation.md)
-with the rotation procedure for each. Database credentials are generated **and rotated** by
+Nothing is a literal and nothing is a plaintext parameter. Every secret is a Secrets Manager
+ARN passed as a parameter and fetched at runtime: the database credentials, the per-tenant
+ingest signing secrets, the feedback-link signing key, the Anthropic API key and — since #35
+— the Stripe API key and the Stripe webhook signing secret. Origins and rotation procedures
+are in [`docs/runbooks/secrets-and-rotation.md`](runbooks/secrets-and-rotation.md). Database credentials are generated **and rotated** by
 RDS itself; the application never stores a database URL, it assembles one from the RDS-managed
 secret and the endpoint.
 
 Each Lambda can read only the secrets it names. The worker cannot read the ingest credential
 map; the migration function can read the database secret and nothing else; the retention
-function likewise. `tests/unit/test_infra_secrets.py` checks that in **both** directions — a
+function likewise; the billing functions hold neither the ingest credential map nor the
+model key, and the function that serves a customer's web form holds no Stripe secret at all
+— which is why billing is separate functions rather than another route on the ingest one. `tests/unit/test_infra_secrets.py` checks that in **both** directions — a
 grant without a matching environment variable is over-privilege nobody notices, and a
 variable without a grant is an `AccessDenied` on the first cold start.
 
@@ -178,7 +182,7 @@ This is enforced by tests, not by a paragraph:
   log event the source emits** by walking the AST of every module, and fails when one is not
   covered: each event is either driven through its real code path with a lead's data in scope
   and swept, or declared to carry no fields at all — and that declaration is checked against
-  the AST, so adding a field to such an event fails the suite. **33 events, all covered.** A
+  the AST, so adding a field to such an event fails the suite. **55 events, all covered.** A
   new event cannot quietly opt out.
 - `tests/isolation/test_log_isolation.py` proves one tenant's identifiers never appear in
   another tenant's trace output.
@@ -199,6 +203,12 @@ row) and returns a fixed error page that echoes neither the record nor the reque
 
 **What redaction cannot do** is in [`docs/data-retention-policy.md`](data-retention-policy.md)
 and is the honest limit: an address is a pattern and a person's name is not.
+
+The sweep covers the billing surface too. `stripe_events.payload` is stored verbatim and an
+invoice object carries the billing contact's name, email and postal address, so every one of
+the 22 billing events is driven with those three strings planted in the payload and the
+output searched for them. A log line that quoted an invoice would be the same disclosure as
+one that quoted a lead.
 
 ---
 
@@ -245,7 +255,9 @@ Not a security question, and it is asked on the same form.
 
 The full list with what each one processes is in [`docs/dpa-draft.md`](dpa-draft.md). In
 brief: **AWS** (hosting and all lead data), **Anthropic** (the lead's free text, sent for
-assessment), **Stripe** (billing contact and payment data, never lead data).
+assessment), **Stripe** (billing contact and payment data, **never lead data** —
+[`docs/billing-integration.md`](billing-integration.md) is the authority on exactly what it
+receives).
 
 **Anthropic does not train on API data by default.** The citation is in the DPA draft; do not
 assert it from memory in a customer conversation, quote the term.

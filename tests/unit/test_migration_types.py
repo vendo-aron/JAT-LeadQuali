@@ -286,4 +286,4 @@ def test_the_retention_revision_chains_off_the_previous_head() -> None:
     module = load_migration(RETENTION_MIGRATION)
 
     assert module.revision == "c4a8f0e35b71"
-    assert module.down_revision == "b6d2e94f7a13"
+    assert module.down_revision == "b7e14c9d82a3"

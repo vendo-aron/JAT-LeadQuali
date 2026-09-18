@@ -75,6 +75,16 @@ DATABASE_SSLMODE: Final[str] = "require"
 #: Default Postgres port, so a deployment only has to state the interesting parts.
 DEFAULT_DATABASE_PORT: Final[int] = 5432
 
+#: The ``event_name`` of the Stripe meter billable leads are reported to, by default.
+#: Mirrored by ``docs/billing-integration.md`` and by #34's runbook, which creates it.
+DEFAULT_STRIPE_METER_EVENT_NAME: Final[str] = "leadquali_billable_leads"
+
+#: The Stripe API version every call is pinned to. This is the version the installed SDK
+#: (15.6.1) is generated against — ``stripe._api_version._ApiVersion.CURRENT`` — so the
+#: pin agrees with the types the library will actually hand us. Bumping the SDK means
+#: reading Stripe's changelog and bumping this deliberately, which is the point of a pin.
+DEFAULT_STRIPE_API_VERSION: Final[str] = "2026-08-26.dahlia"
+
 
 class SecretResolver(Protocol):
     """What :class:`Settings` needs from a secret store.
@@ -323,6 +333,77 @@ class Settings(BaseSettings):
         description="How long a feedback link stays usable, in days.",
     )
 
+    # ------------------------------------------------------------------------- Stripe
+    #
+    # Three kinds of value, and they are deliberately not interchangeable. The API key and
+    # the webhook signing secret are *secrets* and follow the same ARN-wins rule as every
+    # other secret above. The price id and the meter name are *identifiers*: they are not
+    # secret, they differ between test mode and live mode, and they must come from
+    # configuration rather than a literal so that changing a plan is not a deploy
+    # (invariant 1, applied to billing). The return url is configuration for the same
+    # reason it is not taken from the request; see leadquali.api.webhooks.
+    stripe_api_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Stripe secret API key (sk_test_... or sk_live_...). Required by the billing "
+            "jobs and the portal endpoint; the webhook endpoint does not need it, because "
+            "signature verification is standard-library only."
+        ),
+    )
+    stripe_api_key_secret_arn: str | None = Field(
+        default=None,
+        description=(
+            "Secrets Manager ARN holding the Stripe API key. Created by hand per #34's "
+            "runbook, never by CloudFormation, because the value comes from the Stripe "
+            "dashboard."
+        ),
+    )
+    stripe_webhook_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "The whsec_ signing secret of the Stripe webhook endpoint. Every delivery is "
+            "verified against it before anything is parsed; there is no unsigned mode."
+        ),
+    )
+    stripe_webhook_secret_arn: str | None = Field(
+        default=None,
+        description="Secrets Manager ARN holding the whsec_ webhook signing secret.",
+    )
+    stripe_price_id: str | None = Field(
+        default=None,
+        description=(
+            "The recurring price new subscriptions are created against (price_...). "
+            "Differs between test and live mode and between plans, so it is configuration "
+            "and never a literal."
+        ),
+    )
+    stripe_meter_event_name: str = Field(
+        default=DEFAULT_STRIPE_METER_EVENT_NAME,
+        min_length=1,
+        description=(
+            "event_name of the Stripe meter that aggregates billable leads. Must match "
+            "the meter created by #34's runbook: a mismatch is not an error Stripe "
+            "reports, it is usage that aggregates into nothing."
+        ),
+    )
+    stripe_api_version: str = Field(
+        default=DEFAULT_STRIPE_API_VERSION,
+        min_length=1,
+        description=(
+            "The Stripe API version every call is pinned to. Pinned rather than floating: "
+            "a version that changes underneath a running deployment changes the shape of "
+            "the webhooks we parse and the fields we read."
+        ),
+    )
+    stripe_portal_return_url: str | None = Field(
+        default=None,
+        description=(
+            "Where the Stripe billing portal sends a tenant back to. Configuration rather "
+            "than a value read off the portal request, so that an authenticated caller "
+            "cannot turn the endpoint into a redirector to a page of its choosing."
+        ),
+    )
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _upper_log_level(cls, value: object) -> object:
@@ -457,8 +538,73 @@ class Settings(BaseSettings):
                 "or set FEEDBACK_TOKEN_SECRET_ARN."
             ),
         )
-        self._reject_reused_ingest_secret(secret)
+        self._reject_reused_ingest_secret(secret, name="the feedback token secret")
         return secret
+
+    def require_stripe_api_key(self) -> str:
+        """Return the Stripe API key, or raise if it was never configured.
+
+        Only the billing jobs and the portal endpoint need it. The webhook endpoint
+        deliberately does not: its signature check is standard-library only, so a
+        misconfigured API key can never be the reason a webhook is rejected.
+        """
+        return self._secret(
+            secret_arn=self.stripe_api_key_secret_arn,
+            literal=self.stripe_api_key,
+            unset=(
+                "STRIPE_API_KEY is not set. Export it in the environment (or add it to "
+                ".env for local development), or set STRIPE_API_KEY_SECRET_ARN to a "
+                "Secrets Manager ARN; see docs/billing-integration.md."
+            ),
+        )
+
+    def require_stripe_webhook_secret(self) -> str:
+        """Return the validated ``whsec_`` webhook signing secret.
+
+        There is deliberately no "accept unsigned webhooks when no secret is set"
+        fallback: that would be a public endpoint that changes billing state on request.
+
+        Raises:
+            RuntimeError: the secret is unset.
+            StripeWebhookSecretError: it is set and is not a webhook signing secret — most
+                often the API key pasted into the wrong setting, which would otherwise
+                reject every real delivery while Stripe retried for three days.
+        """
+        from leadquali.api.stripe_signing import load_webhook_secret
+
+        return load_webhook_secret(
+            self._secret(
+                secret_arn=self.stripe_webhook_secret_arn,
+                literal=self.stripe_webhook_secret,
+                unset=(
+                    "STRIPE_WEBHOOK_SECRET is not set. The Stripe webhook endpoint refuses "
+                    "to run without it; export the endpoint's whsec_ value, or set "
+                    "STRIPE_WEBHOOK_SECRET_ARN."
+                ),
+            )
+        )
+
+    def require_stripe_price_id(self) -> str:
+        """Return the recurring price new subscriptions use, or raise.
+
+        No default and no guess: a guessed price id is either a 400 from Stripe or, much
+        worse, a real price from another plan that a customer is then charged.
+        """
+        if self.stripe_price_id is None or not self.stripe_price_id.strip():
+            raise RuntimeError(
+                "STRIPE_PRICE_ID is not set. Export the recurring price id from #34's "
+                "runbook (docs/runbooks/stripe-setup.md)."
+            )
+        return self.stripe_price_id
+
+    def require_stripe_portal_return_url(self) -> str:
+        """Return where the billing portal sends a tenant back to, or raise."""
+        if self.stripe_portal_return_url is None or not self.stripe_portal_return_url.strip():
+            raise RuntimeError(
+                "STRIPE_PORTAL_RETURN_URL is not set. Export the page a tenant should "
+                "land on after managing their billing, e.g. https://acme.example/billing."
+            )
+        return self.stripe_portal_return_url
 
     def require_admin_session_secret(self) -> str:
         """Return the admin session signing secret, or raise if it was never configured.
@@ -467,8 +613,17 @@ class Settings(BaseSettings):
         would appear to work — until the second Lambda container served a request and
         signed everybody out, or until a deploy did — and the failure would look like a
         flaky login rather than like a missing setting.
+
+        Raises:
+            RuntimeError: the secret is unset, or it is the same value as one of the ingest
+                signing secrets or as the feedback token secret. This is the third distinct
+                secret and the most powerful of the three: an ingest signing secret is
+                *given to a customer's website*, the feedback secret authorises writes to
+                the training data, and this one mints a staff session — which can rewrite
+                every tenant's rubric. Reusing an ingest secret as this one would hand a
+                customer the ability to forge an admin cookie.
         """
-        return self._secret(
+        secret = self._secret(
             secret_arn=self.admin_session_secret_arn,
             literal=self.admin_session_secret,
             unset=(
@@ -477,6 +632,9 @@ class Settings(BaseSettings):
                 "material, or set ADMIN_SESSION_SECRET_ARN."
             ),
         )
+        self._reject_reused_ingest_secret(secret, name="the admin session secret")
+        self._reject_reused_feedback_secret(secret)
+        return secret
 
     def require_admin_credentials(self) -> str:
         """Return the staff credential JSON, or raise if it was never configured.
@@ -557,21 +715,58 @@ class Settings(BaseSettings):
             password=password,
         )
 
-    def _reject_reused_ingest_secret(self, feedback_secret: str) -> None:
-        """Raise if ``feedback_secret`` is also one tenant's ingest signing secret.
+    def _reject_reused_ingest_secret(self, candidate: str, *, name: str) -> None:
+        """Raise if ``candidate`` is also one tenant's ingest signing secret.
 
         Only runs where both are configured — the worker holds the feedback secret and no
         ingest credentials at all, and demanding them would mean giving the worker read
         access to a secret it has no business reading.
+
+        Args:
+            candidate: The secret being validated.
+            name: How to describe it in the error, so an operator is told which of the
+                three secrets to regenerate.
         """
         for tenant_id, signing_secret in self._ingest_signing_secrets():
-            if hmac.compare_digest(feedback_secret.encode(), signing_secret.encode()):
+            if hmac.compare_digest(candidate.encode(), signing_secret.encode()):
                 raise RuntimeError(
-                    f"the feedback token secret is the same value as tenant "
-                    f"'{tenant_id}''s ingest signing secret. They authorise opposite "
-                    "things and must be distinct (#60): generate fresh material for "
-                    "FEEDBACK_TOKEN_SECRET."
+                    f"{name} is the same value as tenant '{tenant_id}''s ingest signing "
+                    "secret. An ingest signing secret is given to a customer's website; "
+                    "these authorise opposite things and must be distinct (#60). "
+                    "Generate fresh material."
                 )
+
+    def _reject_reused_feedback_secret(self, candidate: str) -> None:
+        """Raise if ``candidate`` is also the feedback token secret.
+
+        The admin session secret mints a staff session, which can rewrite every tenant's
+        rubric; the feedback secret authorises a verdict on one lead. Sharing them means a
+        forged feedback link and a forged admin cookie are the same forgery.
+
+        Resolved through :meth:`_secret` so that an ARN-configured feedback secret is
+        compared by *value*, not by ARN — two ARNs holding the same string is exactly the
+        mistake a copy-paste makes. Any failure to resolve it is swallowed: a deployment
+        where only the admin secret is configured is legitimate (the admin Lambda has no
+        business reading the feedback secret), and turning "I could not check" into a
+        startup failure would break it.
+        """
+        if not (self.feedback_token_secret_arn or self.feedback_token_secret):
+            return
+        try:
+            feedback_secret = self._secret(
+                secret_arn=self.feedback_token_secret_arn,
+                literal=self.feedback_token_secret,
+                unset="",
+            )
+        except Exception:  # pragma: no cover - an unreadable secret is not this check's business
+            return
+        if hmac.compare_digest(candidate.encode(), feedback_secret.encode()):
+            raise RuntimeError(
+                "the admin session secret is the same value as FEEDBACK_TOKEN_SECRET. "
+                "One mints a staff session that can rewrite every tenant's rubric and the "
+                "other authorises a verdict on one lead; they must be distinct. Generate "
+                "fresh material for ADMIN_SESSION_SECRET."
+            )
 
     def _ingest_signing_secrets(self) -> Iterator[tuple[str, str]]:
         """Yield ``(tenant_id, signing_secret)`` for each configured ingest credential.

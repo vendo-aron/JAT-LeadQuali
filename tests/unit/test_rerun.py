@@ -10,25 +10,34 @@ would also leave the real notifier empty, and would prove nothing at all.
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import inspect
+import textwrap
 from decimal import Decimal
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
+from leadquali.app import rerun as rerun_module
 from leadquali.app.admin_views import RerunCandidate
 from leadquali.app.assessment_result import AssessmentFailed, AssessmentSucceeded, CallMetering
+from leadquali.app.qualify import QualificationPipeline
 from leadquali.app.rerun import (
     RERUN_BATCH_CAP,
+    NullLeadStore,
+    NullNotifier,
     RerunNotConfirmedError,
     RerunService,
 )
 from leadquali.domain.models import (
+    Action,
     DimensionScores,
     EscalationReason,
     ExtractedFacts,
     LeadAssessment,
+    RoutingDecision,
     Tier,
 )
 from leadquali.domain.tenant_config import TenantConfig
@@ -140,10 +149,21 @@ def test_a_rerun_takes_no_store_and_no_notifier() -> None:
     assert {"assessor", "enricher", "clock"} <= parameters
 
 
-def test_the_real_notifier_and_store_are_never_reached() -> None:
-    """Built alongside the re-run and handed to nothing. Both stay empty."""
-    real_store = InMemoryLeadStore()
-    real_notifier = RecordingNotifier()
+def test_the_rerun_reaches_dispatch_and_persistence_and_neither_happens() -> None:
+    """The counters, which are the only honest statement this test can make.
+
+    An earlier version of this also built an :class:`~tests.fakes.InMemoryLeadStore` and a
+    :class:`~tests.fakes.RecordingNotifier`, handed them to nothing, and asserted they were
+    empty. Those assertions were true before the run and would have stayed true if the
+    service had sent a thousand emails — they asserted that two local variables had not
+    been mutated by code that could not see them. They are gone.
+
+    What is left is real: the pipeline reached the dispatch step and the two persistence
+    steps for every lead, and the collaborators that reached them are the ones that do
+    nothing. A re-run that fell over early would show zeroes here. See
+    :func:`test_the_null_collaborators_are_the_only_ones_the_pipeline_can_reach` for the
+    part that proves the real ones are unreachable.
+    """
     runner = service()
     plan = runner.plan(
         tenant_slug=SLUG, candidates=[candidate(1), candidate(2)], cost_per_lead_usd=None
@@ -151,29 +171,143 @@ def test_the_real_notifier_and_store_are_never_reached() -> None:
 
     report = runner.run(plan=plan, config=config(), confirmed=True)
 
-    assert real_store.leads == {}
-    assert real_store.assessments == []
-    assert real_store.routing_events == []
-    assert real_notifier.dispatches == []
-    # ... and the pipeline really did get as far as the writes it is not doing, so the
-    # emptiness above is a substitution rather than a run that stopped early.
     assert report.writes_suppressed == 4, "two assessments and two routing events"
     assert report.dispatches_suppressed == 2
+    assert len(report.comparisons) == 2
 
 
-def test_a_suppressed_lead_still_records_no_routing_event() -> None:
-    """The suppression branch writes too, and it must be swallowed just the same."""
+def test_the_null_collaborators_are_the_only_ones_the_pipeline_can_reach() -> None:
+    """The emptiness assertion, made where it can actually observe something.
+
+    :class:`~leadquali.app.rerun.NullNotifier` and :class:`~leadquali.app.rerun.NullLeadStore`
+    are constructed *inside* ``run``, so a test cannot hold a reference to them. It can
+    hold the pipeline: this patches
+    :class:`~leadquali.app.qualify.QualificationPipeline` to record the collaborators it is
+    built with, then asserts they are the null ones and nothing else.
+
+    That closes the mutation the counters alone do not: making ``NullNotifier.dispatch``
+    really send while still incrementing its counter left the old assertions green.
+    """
+    built: list[dict[str, object]] = []
+    real_notifier = RecordingNotifier()
+    real_store = InMemoryLeadStore()
+
+    class RecordingPipeline(QualificationPipeline):
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(dict(kwargs))
+            super().__init__(**kwargs)
+
     runner = service()
     plan = runner.plan(tenant_slug=SLUG, candidates=[candidate(1)], cost_per_lead_usd=None)
 
-    report = runner.run(
-        plan=plan,
-        config=config(thresholds={"hot": 99.0, "warm": 98.0, "cold": 97.0}),
-        confirmed=True,
+    with patch.object(rerun_module, "QualificationPipeline", RecordingPipeline):
+        runner.run(plan=plan, config=config(), confirmed=True)
+
+    assert len(built) == 1, "the re-run built more than one pipeline"
+    assert isinstance(built[0]["notifier"], NullNotifier)
+    assert isinstance(built[0]["store"], NullLeadStore)
+    # mypy calls the identity check below non-overlapping, which is the point made twice:
+    # the pipeline cannot be holding a production collaborator, and the type checker can
+    # see that from the types alone. So the runtime assertion is on the doubles staying
+    # untouched instead.
+    assert real_notifier.dispatches == []
+    assert real_store.assessments == []
+    assert real_store.leads == {}
+
+
+#: Everything the null collaborators are allowed to call. A value type and ``super()``,
+#: and that is the whole list — see
+#: :func:`test_the_null_collaborators_cannot_do_anything_at_all`.
+_INERT_CALLS = frozenset({"StoredLead", "super"})
+
+#: The methods that stand where a write or a send would be.
+_INERT_METHODS = [
+    (NullNotifier, "dispatch"),
+    (NullLeadStore, "upsert_lead"),
+    (NullLeadStore, "already_routed"),
+    (NullLeadStore, "record_assessment"),
+    (NullLeadStore, "record_routing_event"),
+]
+
+
+@pytest.mark.parametrize(("owner", "method"), _INERT_METHODS, ids=lambda v: str(v))
+def test_the_null_collaborators_cannot_do_anything_at_all(owner: type, method: str) -> None:
+    """ "Nothing is written and nothing is sent", asserted on what the code *can* do.
+
+    The counters and the type checks above are both necessary and neither is sufficient:
+    making ``NullNotifier.dispatch`` really send **while still incrementing its counter**
+    satisfies both, and a run of this file stayed green while the mutant wrote the lead's
+    address to a file on disk.
+
+    What actually holds is that these bodies are inert — no import, no call on any object
+    but ``self``, and no call to anything outside :data:`_INERT_CALLS`. A method that
+    cannot call out cannot send an email or write a row, whatever its counter says. The
+    assertion is structural because the property is: §5 asked for a re-run that has no way
+    to reach the outside, not one that happened not to.
+    """
+    source = textwrap.dedent(inspect.getsource(getattr(owner, method)))
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        assert not isinstance(node, ast.Import | ast.ImportFrom), (
+            f"{owner.__name__}.{method} imports something; an inert method has nothing to import"
+        )
+        if isinstance(node, ast.Call):
+            target = node.func
+            if isinstance(target, ast.Attribute):
+                root = target.value
+                assert isinstance(root, ast.Name) and root.id == "self", (
+                    f"{owner.__name__}.{method} calls {ast.unparse(target)}, which is not self"
+                )
+                continue
+            assert isinstance(target, ast.Name) and target.id in _INERT_CALLS, (
+                f"{owner.__name__}.{method} calls {ast.unparse(target)}; an inert method may "
+                f"only call {sorted(_INERT_CALLS)}"
+            )
+
+
+def test_the_inertness_check_is_looking_at_real_code() -> None:
+    """Guards the test above against passing because it parsed an empty body."""
+    for owner, method in _INERT_METHODS:
+        source = inspect.getsource(getattr(owner, method))
+        assert "def " in source
+        assert len(source.splitlines()) > 3
+
+
+def test_the_null_notifier_reports_no_delivery() -> None:
+    """A provider message id is the receipt that a send happened. There is never one."""
+    notifier = NullNotifier()
+
+    receipt = notifier.dispatch(
+        tenant_id=SLUG,
+        lead_id="lead-0001",
+        destination="hot@example.com",
+        submission=candidate(1).submission,
+        decision=RoutingDecision(
+            tier=Tier.HOT, total_score=88.0, action=Action.EMAIL_SALES, note="n"
+        ),
+        assessment=None,
     )
 
-    assert report.comparisons[0].new_tier is Tier.DISQUALIFIED
-    assert report.writes_suppressed == 2
+    assert receipt is None
+    assert notifier.dispatches_suppressed == 1
+
+
+def test_the_null_store_never_deduplicates_a_rerun() -> None:
+    """Every lead looks new and none looks routed, so the pipeline runs its whole path."""
+    store = NullLeadStore()
+
+    stored = store.upsert_lead(
+        tenant_id=SLUG,
+        submission_id="lead-0001",
+        submission=candidate(1).submission,
+        source="admin_rerun",
+        received_at=NOW,
+    )
+
+    assert stored.lead_id == "lead-0001"
+    assert stored.is_new is True
+    assert store.already_routed(tenant_id=SLUG, lead_id="lead-0001") is False
 
 
 # ----------------------------------------------------------------------- confirmation

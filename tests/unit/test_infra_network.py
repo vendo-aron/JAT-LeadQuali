@@ -41,14 +41,6 @@ CONNECTIONS_PER_CONTAINER = 1
 DATABASE_PORT = 5432
 
 
-#: How many Lambda functions in the application stack connect to Postgres: ingest, worker,
-#: migrations and — since #37 — the retention purge. Not a detail: every one of them draws
-#: from the connection budget #27's arithmetic is built on, so a new one is a deliberate
-#: change to that budget and has to be counted here on purpose. The tests below use it as a
-#: guard that their loop selected something, not as a claim about which functions exist.
-POSTGRES_FUNCTIONS: Final[int] = 4
-
-
 @pytest.fixture(scope="module")
 def network() -> dict[str, Any]:
     return load_template(NETWORK_TEMPLATE_PATH)
@@ -406,6 +398,15 @@ def test_the_connection_budget_is_not_oversubscribed(
         )
 
 
+#: How many functions in the application template hold ``DATABASE_SECRET_ARN``, and so
+#: hold a Postgres connection: ingest, the worker, migrations, #35's four billing functions
+#: and #37's retention purge. A literal rather than a length, so that adding a function
+#: without thinking about the connection budget fails here — which is the entire point of
+#: the two tests below. Every one of them draws on the budget #27's arithmetic is built on,
+#: so raising this number is a deliberate change to that budget rather than bookkeeping.
+POSTGRES_FUNCTIONS: Final[int] = 8
+
+
 def test_every_function_that_touches_postgres_has_a_concurrency_cap(
     application: dict[str, Any],
 ) -> None:
@@ -428,8 +429,9 @@ def test_every_function_that_touches_postgres_has_a_concurrency_cap(
             f"{logical_id} connects to Postgres with no cap on how many of it exist"
         )
     assert checked == POSTGRES_FUNCTIONS, (
-        "no function matched, or a new one appeared: the marker this loop selects on may "
-        "have been renamed, and the test would then be passing by examining nothing"
+        "no function matched, or a function was added without updating the count: the "
+        "marker this loop selects on may have been renamed, and the test would then be "
+        "passing by examining nothing"
     )
 
 
@@ -455,7 +457,7 @@ def test_every_function_that_touches_postgres_is_in_the_vpc(
         assert vpc is not None, f"{logical_id} reads Postgres from outside the VPC"
         assert vpc["Fn::If"][0] == "InVpc"
         assert vpc["Fn::If"][1]["SubnetIds"] == {"Fn::Ref": "VpcSubnetIds"}
-    assert checked == POSTGRES_FUNCTIONS, "no function matched; see the note above"
+    assert checked == POSTGRES_FUNCTIONS, "see the note in the test above"
 
 
 def test_migrations_run_one_at_a_time(application: dict[str, Any]) -> None:

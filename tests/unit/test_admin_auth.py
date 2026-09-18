@@ -66,6 +66,71 @@ def test_editing_the_subject_invalidates_the_signature() -> None:
     assert isinstance(verify_session(secret=SECRET, token=forged, now=NOW), SessionRejected)
 
 
+def reforge(token: str, *, replace: bytes, with_: bytes) -> str:
+    """Edit the payload of a session token, keeping its original signature."""
+    payload, _, signature = token.partition(".")
+    decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    assert replace in decoded, "the field being edited is not in the payload"
+    edited = base64.urlsafe_b64encode(decoded.replace(replace, with_)).decode().rstrip("=")
+    return f"{edited}.{signature}"
+
+
+def test_editing_the_expiry_invalidates_the_signature() -> None:
+    """Absolute expiry is the one property the whole session design rests on.
+
+    Narrowing ``_sign`` to cover only ``sub`` left the entire suite green, and a legitimate
+    cookie with ``exp`` rewritten ten years out then verified: a twelve-hour session became
+    a permanent credential, silently. Nothing asserted the signature covered the claim it
+    was protecting.
+    """
+    token = mint_session(secret=SECRET, subject="ada", now=NOW)
+    ten_years = int((NOW + timedelta(days=3650)).timestamp())
+    forged = reforge(
+        token,
+        replace=str(int((NOW + SESSION_TTL).timestamp())).encode(),
+        with_=str(ten_years).encode(),
+    )
+
+    rejected = verify_session(secret=SECRET, token=forged, now=NOW + timedelta(days=30))
+
+    assert isinstance(rejected, SessionRejected)
+    assert rejected.failure is SessionFailure.BAD_SIGNATURE
+
+
+def test_editing_the_issue_time_invalidates_the_signature() -> None:
+    """``iat`` is what the not-yet-valid check reads; an editable one makes it meaningless."""
+    token = mint_session(secret=SECRET, subject="ada", now=NOW)
+    forged = reforge(
+        token,
+        replace=str(int(NOW.timestamp())).encode(),
+        with_=str(int((NOW - timedelta(days=1)).timestamp())).encode(),
+    )
+
+    rejected = verify_session(secret=SECRET, token=forged, now=NOW)
+
+    assert isinstance(rejected, SessionRejected)
+    assert rejected.failure is SessionFailure.BAD_SIGNATURE
+
+
+def test_the_signature_covers_every_field_the_payload_carries() -> None:
+    """Stated once, exhaustively, so a field added later is covered by this test too.
+
+    Flipping any byte of the encoded payload must be a signature failure — which is what
+    "the signature covers the whole payload" means, and is stronger than naming the three
+    fields it happens to have today.
+    """
+    token = mint_session(secret=SECRET, subject="ada", now=NOW)
+    payload, _, signature = token.partition(".")
+    decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+
+    for index in range(len(decoded)):
+        flipped = bytearray(decoded)
+        flipped[index] ^= 0x01
+        edited = base64.urlsafe_b64encode(bytes(flipped)).decode().rstrip("=")
+        verified = verify_session(secret=SECRET, token=f"{edited}.{signature}", now=NOW)
+        assert isinstance(verified, SessionRejected), f"byte {index} is outside the signature"
+
+
 @pytest.mark.parametrize("token", ["", "nonsense", "a.b", "....", "YWJj.YWJj"])
 def test_a_malformed_token_is_a_rejection_and_never_an_exception(token: str) -> None:
     rejected = verify_session(secret=SECRET, token=token, now=NOW)

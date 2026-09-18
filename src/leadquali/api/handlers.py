@@ -26,4 +26,20 @@ from leadquali.api.main import app
 #: The ingest Lambda's entry point: ``leadquali.api.handlers.ingest_handler``.
 ingest_handler = Mangum(app, lifespan="off")
 
-__all__ = ["ingest_handler"]
+#: The billing Lambda's entry point: ``leadquali.api.handlers.billing_handler``.
+#:
+#: The **same** ASGI app, wrapped a second time, because API Gateway routes by path and
+#: only ``/webhooks/stripe`` and ``/billing/portal`` are pointed here. One app keeps "one
+#: deployment" true; two functions keep the *permissions* apart, which is the half that
+#: matters: the Stripe API key and the ``whsec_`` never reach the function that serves a
+#: customer's web form, an error-rate alarm on billing cannot be set off by a bot probing
+#: ``/leads``, and a bad billing deploy cannot take down the one surface where a failure
+#: loses a lead.
+#:
+#: Dependencies are built lazily per surface (see
+#: :func:`leadquali.api.webhooks._default_billing_deps`), so the ingest function never
+#: constructs a Stripe client and the billing function never constructs a lead queue —
+#: whichever of the two a given container happens to be.
+billing_handler = Mangum(app, lifespan="off")
+
+__all__ = ["billing_handler", "ingest_handler"]

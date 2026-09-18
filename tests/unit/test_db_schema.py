@@ -42,10 +42,12 @@ from leadquali.adapters.db_schema import (
     GoldenPromotion,
     Lead,
     RoutingEvent,
+    StripeEventRow,
     Tenant,
     TenantApiKey,
     TenantConfigVersion,
     UsageDaily,
+    UsageReportRecord,
 )
 from leadquali.app.metering import (
     DEFAULT_QUOTA_ALERT_FRACTION as METERING_DEFAULT_ALERT_FRACTION,
@@ -68,6 +70,8 @@ EXPECTED_TABLES = {
     "routing_events",
     "feedback",
     "usage_daily",
+    "stripe_events",
+    "usage_reports",
     "tenant_config_versions",
     "golden_promotions",
     "erasure_log",
@@ -98,7 +102,7 @@ CHILD_TABLES = ("assessments", "routing_events", "feedback", "golden_promotions"
 # check for "email" only catches a column whose author named it honestly; it would pass
 # `rater`, `contact_details` or `notes_from_crm` without a murmur. Pinning the inventory
 # means adding any column at all fails this test until someone has classified it, and the
-# `raw` bucket having exactly one member is the property #37's retention job depends on.
+# membership of the `raw` bucket is the property #37's retention job depends on.
 COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("tenants", "id"): "none",
     ("tenants", "slug"): "none",
@@ -116,6 +120,11 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     # customer's account, with nothing of any lead in them.
     ("tenants", "raw_retention_days"): "none",
     ("tenants", "assessment_retention_days"): "none",
+    # The Stripe link (#35). Opaque processor identifiers and a grace-period deadline:
+    # facts about the *account*, with nothing of any lead or any person in them.
+    ("tenants", "stripe_customer_id"): "none",
+    ("tenants", "stripe_subscription_id"): "none",
+    ("tenants", "dunning_until"): "none",
     ("tenants", "created_at"): "none",
     ("tenants", "updated_at"): "none",
     ("tenant_api_keys", "id"): "none",
@@ -211,6 +220,30 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     ("usage_daily", "cache_creation_tokens"): "none",
     ("usage_daily", "cost_usd"): "none",
     ("usage_daily", "computed_at"): "none",
+    ("stripe_events", "event_id"): "none",
+    ("stripe_events", "event_type"): "none",
+    # The second column in the schema that may hold personal data, and the only one
+    # added since #16. A Stripe event body is stored verbatim because it is the
+    # evidence of what Stripe actually said, and an invoice object carries the
+    # *billing contact's* name, email and address — a customer's accounts-payable
+    # person, not a lead, but personal data all the same. Classified honestly rather
+    # than pruned, because a payload filtered down to the fields this build models is
+    # missing exactly the fields an incident will want. #37's retention job must cover
+    # this column as it covers leads.raw_payload; docs/billing-integration.md says so.
+    ("stripe_events", "payload"): "raw",
+    ("stripe_events", "received_at"): "none",
+    ("stripe_events", "processed_at"): "none",
+    ("stripe_events", "status"): "none",
+    ("stripe_events", "attempts"): "none",
+    # An exception class and one short line, never a payload dump — enforced by
+    # MAX_ERROR_CHARS and by the service that writes it.
+    ("stripe_events", "last_error"): "none",
+    ("stripe_events", "tenant_id"): "none",
+    ("usage_reports", "tenant_id"): "none",
+    ("usage_reports", "usage_date"): "none",
+    ("usage_reports", "reported_at"): "none",
+    ("usage_reports", "external_id"): "none",
+    ("usage_reports", "quantity"): "none",
     # tenant_config_versions (#36) is the rubric's edit history. A rubric is policy about
     # a *customer*, written by staff — the ICP prose, the weights, the thresholds and the
     # sales inboxes leads are routed to. Nothing a lead submitted reaches it, which is why
@@ -309,6 +342,8 @@ def test_model_classes_map_to_the_expected_table_names() -> None:
         (Feedback, "feedback"),
         (TenantApiKey, "tenant_api_keys"),
         (UsageDaily, "usage_daily"),
+        (StripeEventRow, "stripe_events"),
+        (UsageReportRecord, "usage_reports"),
         (TenantConfigVersion, "tenant_config_versions"),
         (GoldenPromotion, "golden_promotions"),
     ):
@@ -316,6 +351,18 @@ def test_model_classes_map_to_the_expected_table_names() -> None:
         # The class and the metadata entry are one object, so a repository written against
         # either sees the same columns.
         assert model.__table__ is _table(table_name)
+
+
+#: The one table whose ``tenant_id`` is nullable, and the only exception to invariant 4.
+#:
+#: A Stripe webhook arrives before we know who it is about: the event names a Stripe
+#: *customer*, and resolving that to one of our tenants is a database read the verifying
+#: route deliberately does not do (it verifies, inserts and returns 200). Refusing to store
+#: an event we cannot attribute would mean discarding the only record that it arrived. So
+#: the column is filled in by the handler once the customer resolves, and every *read* that
+#: is about a tenant filters on it. Named here, in one constant, so that a second table
+#: quietly joining it is a diff somebody has to justify.
+TENANT_ID_NULLABLE_TABLES = {"stripe_events"}
 
 
 @pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES))
@@ -327,7 +374,23 @@ def test_every_table_carries_a_tenant_id(table_name: str) -> None:
         assert "id" in table.c
         return
     column = table.c["tenant_id"]
+    if table_name in TENANT_ID_NULLABLE_TABLES:
+        assert column.nullable, f"{table_name} is listed as the invariant-4 exception"
+        return
     assert not column.nullable, f"{table_name}.tenant_id must be NOT NULL"
+
+
+def test_the_invariant_four_exception_is_exactly_one_table() -> None:
+    """Stated on its own so that widening it is a deliberate, reviewable act.
+
+    An unexplained exception to an invariant is how the invariant dies. This one is
+    explained in three places — here, in ``StripeEventRow``'s docstring and in the
+    migration — and it costs nothing to keep true.
+    """
+    nullable = {
+        name for name in EXPECTED_TABLES - {"tenants"} if _table(name).c["tenant_id"].nullable
+    }
+    assert nullable == TENANT_ID_NULLABLE_TABLES
 
 
 def test_leads_is_the_only_direct_reference_to_tenants() -> None:
@@ -439,17 +502,24 @@ def test_the_columns_that_may_hold_personal_data_are_the_ones_the_schema_declare
     assert all(reason.strip() for reason in PERSONAL_DATA_COLUMNS.values())
 
 
-def test_the_lead_payload_is_the_only_verbatim_copy_of_a_submission() -> None:
-    """What ``contact_email_hash`` is *for*, and what #37's tier split relies on.
+def test_there_are_exactly_two_verbatim_copies_and_they_are_of_different_people() -> None:
+    """``raw`` means "kept exactly as somebody outside this company sent it", and there are two.
 
-    Exactly one column is a copy of what the submitter typed, so tombstoning that one
-    column removes the personal data while every score, tier and routing event survives.
-    The ``derived`` columns are a different claim and are handled differently; see
-    :data:`~leadquali.app.retention.COLUMN_DISPOSITION`.
+    They are not the same kind of record and #37 must not treat them as one.
+    ``leads.raw_payload`` is an **inbound lead's** own submission, held for our customer,
+    who is its controller: a policy *maximum*, 90 days, purged by the retention job.
+    ``stripe_events.payload`` (#35) is a verified webhook body whose subject is the
+    **customer's own billing contact**, and it is a financial record — which normally
+    carries a statutory *minimum* measured in years and is normally out of scope for an
+    erasure request, because it is the evidence of a transaction.
+
+    So the assertion worth making is not "there is one" — it is that there are two, that a
+    third cannot appear unnoticed, and that each one's retention answer is written down in
+    :data:`~leadquali.app.retention.COLUMN_DISPOSITION` rather than assumed from the other.
     """
     verbatim = {key for key, policy in COLUMN_PII_POLICY.items() if policy == "raw"}
 
-    assert verbatim == {("leads", "raw_payload")}
+    assert verbatim == {("leads", "raw_payload"), ("stripe_events", "payload")}
 
 
 def test_the_rater_is_an_opaque_subject_id_not_a_contact() -> None:
@@ -617,7 +687,7 @@ def test_timestamps_are_timezone_aware_with_a_server_default(
 #: second row for one tenant-day is a bug rather than a new fact, and the composite key is
 #: also the conflict target the idempotent upsert needs. A surrogate ``id`` would let two
 #: rows for one day coexist while every billing read summed both.
-NATURAL_KEY_TABLES = {"usage_daily"}
+NATURAL_KEY_TABLES = {"usage_daily", "usage_reports", "stripe_events"}
 
 
 @pytest.mark.parametrize("table_name", sorted(EXPECTED_TABLES - NATURAL_KEY_TABLES))
@@ -631,6 +701,24 @@ def test_the_usage_rollup_is_keyed_by_the_tenant_and_the_day() -> None:
     """The exception to the rule above, and the reason a re-run cannot double count."""
     primary_key = [column.name for column in _table("usage_daily").primary_key.columns]
     assert primary_key == ["tenant_id", "usage_date"]
+
+
+def test_a_usage_report_is_keyed_by_the_tenant_and_the_day_too() -> None:
+    """The same natural key doing a different job (#35). Here it is not a cache of a SUM,
+    it is the thing that makes reporting a day twice impossible — and double-reporting
+    overbills a customer, which the issue says is worse than under-reporting."""
+    primary_key = [column.name for column in _table("usage_reports").primary_key.columns]
+    assert primary_key == ["tenant_id", "usage_date"]
+
+
+def test_a_stripe_event_is_keyed_by_stripes_own_event_id() -> None:
+    """Webhook idempotency, in the schema rather than in a handler. Stripe retries a
+    delivery it did not see a 200 for, and the retry carries the same ``evt_...``; with
+    this as the primary key the route's insert can be ``ON CONFLICT DO NOTHING`` and a
+    retry is a no-op whatever state the first copy is in."""
+    primary_key = [column.name for column in _table("stripe_events").primary_key.columns]
+    assert primary_key == ["event_id"]
+    assert _table("stripe_events").c["event_id"].server_default is None
 
 
 def test_the_usage_rollup_counts_tokens_in_bigints() -> None:

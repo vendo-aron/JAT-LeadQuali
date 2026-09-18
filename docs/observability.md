@@ -78,6 +78,28 @@ One JSON object per line. Nothing is nested except `exception`.
 | `secrets.tenant_hmac_created` | `adapters.secrets_manager` | `tenant_id` |
 | `secrets.tenant_hmac_exists` | `adapters.secrets_manager` | `secret_name` |
 | `secrets.tenant_hmac_rotated` | `adapters.secrets_manager` | `secret_arn` |
+| `billing.customer_linked` | `app.billing` | `stripe_customer_id`, `tenant_id` |
+| `billing.drain` | `api.billing_jobs` | `attempted`, `failed`, `processed`, `retrying` |
+| `billing.dunning_continues` | `app.billing` | `dunning_until`, `event_id`, `tenant_id` |
+| `billing.dunning_started` | `app.billing` | `dunning_until`, `event_id`, `grace_days`, `tenant_id` |
+| `billing.dunning_sweep` | `app.billing` | `suspended` |
+| `billing.event_failed` | `app.billing` | `attempts`, `error`, `event_id`, `event_type`, `status` |
+| `billing.event_ignored` | `app.billing` | `event_id`, `event_type` |
+| `billing.event_unattributed` | `app.billing` | `event_id`, `event_type`, `reason` |
+| `billing.invoice_settled` | `app.billing` | `event_id`, `tenant_id` |
+| `billing.invoice_settled_without_subscription` | `app.billing` | `event_id`, `tenant_id` |
+| `billing.portal_opened` | `api.webhooks` | `tenant_id` |
+| `billing.portal_rejected` | `api.webhooks` | `reason`, `status` |
+| `billing.portal_unavailable` | `api.webhooks` | `tenant_id` |
+| `billing.subscription_status_unknown` | `app.billing` | `event_id`, `status`, `tenant_id` |
+| `billing.tenant_activated` | `app.billing` | `reason`, `tenant_id` |
+| `billing.tenant_suspended` | `app.billing` | `reason`, `tenant_id` |
+| `billing.usage_report_failed` | `app.billing` | `error`, `tenant_id`, `usage_date` |
+| `billing.usage_reported` | `app.billing` | `external_id`, `quantity`, `tenant_id`, `usage_date` |
+| `billing.usage_run` | `api.billing_jobs` | `tenants`, `usage_date`, per-outcome counts |
+| `billing.usage_too_old` | `app.billing` | `max_age_days`, `tenant_id`, `usage_date` |
+| `billing.webhook_received` | `app.billing` | `event_id`, `event_type`, `stored` |
+| `billing.webhook_rejected` | `api.webhooks` | `client`, `reason`, `status` |
 | `migrate.start` | `api.migrate` | — |
 | `migrate.done` | `api.migrate` | — |
 

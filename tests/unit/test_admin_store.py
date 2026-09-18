@@ -21,17 +21,29 @@ import ast
 import datetime as dt
 import inspect
 import textwrap
+import uuid
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
+from sqlalchemy import insert
+from sqlalchemy.orm import Session, sessionmaker
 
 from leadquali.adapters import store_admin
-from leadquali.adapters.store_admin import PostgresAdminQueryStore, PostgresConfigVersionStore
+from leadquali.adapters.store_admin import (
+    PostgresAdminQueryStore,
+    PostgresConfigVersionStore,
+    PostgresGoldenPromotionStore,
+    tenant_uuid,
+)
 from leadquali.app.admin_views import LeadFilter, LeadRow
 from leadquali.app.feedback import Verdict
+from leadquali.app.tenants import UnknownTenantError
 from leadquali.domain.models import Tier
 from tests.fakes import AdminLead, InMemoryAdminQueryStore
+from tests.sqlite_schema import shadow_metadata, sqlite_sessions
 
 NOW = dt.datetime(2026, 9, 16, 9, 0, tzinfo=dt.UTC)
 SLUG = "acme"
@@ -239,24 +251,6 @@ def test_the_browser_fetches_one_row_more_than_the_page_rather_than_counting() -
     assert "func.count" not in source
 
 
-@pytest.mark.parametrize(
-    "method",
-    [
-        "browse_leads",
-        "lead_detail",
-        "feedback_review",
-        "tier_mix",
-        "feedback_agreement",
-        "rerun_candidates",
-    ],
-)
-def test_every_admin_query_names_its_tenant(method: str) -> None:
-    """Invariant 4: ``tenant_id`` on every table *and* in every statement."""
-    source = source_of(getattr(PostgresAdminQueryStore, method))
-
-    assert "tenant_uuid(tenant_slug)" in source or "tenant_uuid(criteria.tenant_slug)" in source
-
-
 def test_the_admin_stores_join_the_ambient_transaction() -> None:
     """``session_scope`` is what lets the config write and its audit row be one commit.
 
@@ -284,3 +278,274 @@ def test_the_version_number_is_allocated_from_the_table_and_not_from_python() ->
 
     assert "func.max" in source or "MAX(" in source.upper()
     assert "INSERT" in source.upper() or "insert(" in source
+
+
+# ------------------------------------------- the SQL, actually executed (real engine, no Docker)
+
+
+@pytest.fixture
+def sessions() -> Iterator[sessionmaker[Session]]:
+    """The shipping schema on in-memory SQLite. See ``tests/sqlite_schema.py``."""
+    with sqlite_sessions() as factory:
+        yield factory
+
+
+def seed_tenant(sessions: sessionmaker[Session], slug: str, *, count: int = 2) -> list[uuid.UUID]:
+    """One tenant's leads, each with an assessment and a rep's verdict on it.
+
+    Two tenants are always seeded by the tests below, because a tenant predicate is only
+    observable when there is somebody else's row available to leak.
+    """
+    tables = shadow_metadata().tables
+    tenant = tenant_uuid(slug)
+    lead_ids: list[uuid.UUID] = []
+    with sessions.begin() as session:
+        session.execute(
+            insert(tables["tenants"]).values(
+                id=tenant,
+                slug=slug,
+                name=slug,
+                status="active",
+                icp_config={},
+                rate_limit_per_minute=60,
+                rate_limit_burst=10,
+                quota_alert_fraction=Decimal("0.80"),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        for index in range(count):
+            lead_id = uuid.uuid4()
+            lead_ids.append(lead_id)
+            session.execute(
+                insert(tables["leads"]).values(
+                    id=lead_id,
+                    tenant_id=tenant,
+                    submission_id=f"{slug}-{index}",
+                    raw_payload={"email": f"{slug}{index}@example.invalid", "message": "hello"},
+                    source="web_form",
+                    status="received",
+                    contact_email_hash="h" * 64,
+                    received_at=NOW,
+                    created_at=NOW,
+                )
+            )
+            session.execute(
+                insert(tables["assessments"]).values(
+                    id=uuid.uuid4(),
+                    tenant_id=tenant,
+                    lead_id=lead_id,
+                    created_at=NOW - dt.timedelta(minutes=index),
+                    status="ok",
+                    tier="hot",
+                    total_score=Decimal("82.00"),
+                    dimension_scores={"icp_fit": 28},
+                    extracted={"industry": slug, "company_name": slug.title()},
+                    reasoning="strong fit",
+                    confidence=Decimal("0.900"),
+                    missing_information=[],
+                    model_id="m",
+                    prompt_version="v1",
+                    input_tokens=1,
+                    output_tokens=1,
+                    cache_read_tokens=0,
+                    cache_creation_tokens=0,
+                    cost_usd=Decimal("0.018"),
+                    latency_ms=1,
+                )
+            )
+            session.execute(
+                insert(tables["feedback"]).values(
+                    id=uuid.uuid4(),
+                    tenant_id=tenant,
+                    lead_id=lead_id,
+                    rater="rep-1",
+                    verdict="bad",
+                    notes=None,
+                    created_at=NOW,
+                )
+            )
+    return lead_ids
+
+
+@pytest.fixture
+def two_tenants(
+    sessions: sessionmaker[Session],
+) -> tuple[PostgresAdminQueryStore, list[uuid.UUID], list[uuid.UUID]]:
+    """``acme``'s leads and somebody else's, in one database, with the real store over it."""
+    mine = seed_tenant(sessions, SLUG)
+    theirs = seed_tenant(sessions, "someone-else")
+    return PostgresAdminQueryStore(sessions), mine, theirs
+
+
+Seeded = tuple[PostgresAdminQueryStore, list[uuid.UUID], list[uuid.UUID]]
+
+
+def test_the_harness_really_runs_the_statements(two_tenants: Seeded) -> None:
+    """Guards the three tests below against passing because nothing was seeded."""
+    store, mine, theirs = two_tenants
+
+    assert len(mine) == 2
+    assert not set(mine) & set(theirs)
+    assert store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=10).rows, (
+        "the browser returned nothing at all, so a tenant check below proves nothing"
+    )
+
+
+def test_the_browser_returns_only_this_tenants_rows(two_tenants: Seeded) -> None:
+    """Invariant 4, executed rather than read.
+
+    The previous version of this test grepped ``browse_leads`` for ``tenant_uuid(...)``,
+    which survives deleting the predicate that *uses* it — a mutation that deleted exactly
+    that left all 2184 unit tests green. Seeding a second tenant is what makes the leak
+    observable.
+    """
+    store, mine, theirs = two_tenants
+
+    rows = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=50).rows
+
+    assert {row.lead_id for row in rows} == {str(found) for found in mine}
+    assert not {row.lead_id for row in rows} & {str(found) for found in theirs}
+
+
+def test_lead_detail_will_not_serve_another_tenants_lead(two_tenants: Seeded) -> None:
+    """Asking for somebody else's lead id under your own tenant is "no such lead"."""
+    store, mine, theirs = two_tenants
+
+    assert store.lead_detail(tenant_slug=SLUG, lead_id=str(mine[0])) is not None
+    assert store.lead_detail(tenant_slug=SLUG, lead_id=str(theirs[0])) is None
+    assert store.lead_detail(tenant_slug="someone-else", lead_id=str(mine[0])) is None
+
+
+def test_the_feedback_review_returns_only_this_tenants_disagreements(
+    two_tenants: Seeded,
+) -> None:
+    store, mine, theirs = two_tenants
+
+    rows = store.feedback_review(
+        tenant_slug=SLUG,
+        tier=Tier.HOT,
+        verdict=Verdict.BAD,
+        start=(NOW - dt.timedelta(days=30)).date(),
+        end=NOW.date(),
+        limit=50,
+    )
+
+    assert {row.lead_id for row in rows} == {str(found) for found in mine}
+    assert not {row.lead_id for row in rows} & {str(found) for found in theirs}
+    assert {row.industry for row in rows} == {SLUG}
+
+
+def test_the_remaining_reads_are_tenant_scoped_too(two_tenants: Seeded) -> None:
+    """``tier_mix`` and ``rerun_candidates``; ``feedback_agreement`` needs ``date_trunc``
+    and is covered in the integration suite instead."""
+    store, mine, _ = two_tenants
+
+    assert sum(
+        row.count
+        for row in store.tier_mix(
+            tenant_slug=SLUG, start=(NOW - dt.timedelta(days=30)).date(), end=NOW.date()
+        )
+    ) == len(mine)
+    candidates = store.rerun_candidates(tenant_slug=SLUG, limit=50)
+    assert {candidate.lead_id for candidate in candidates} == {str(found) for found in mine}
+
+
+def test_the_keyset_cursor_pages_the_real_statement_exactly_once(
+    sessions: sessionmaker[Session],
+) -> None:
+    """The row-value predicate, executed. SQLite has supported row values since 3.15."""
+    seeded = seed_tenant(sessions, SLUG, count=7)
+    store = PostgresAdminQueryStore(sessions)
+
+    seen: list[str] = []
+    cursor = None
+    while True:
+        page = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=cursor, limit=3)
+        seen.extend(row.lead_id for row in page.rows)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert sorted(seen) == sorted(str(found) for found in seeded)
+    assert len(seen) == len(set(seen)), "a row came back twice"
+
+
+def test_promoting_one_lead_twice_inserts_one_row(sessions: sessionmaker[Session]) -> None:
+    """§4's idempotency requirement, against a database rather than against a fake.
+
+    Deleting ``.on_conflict_do_nothing(...)`` from ``record`` left the whole suite green,
+    because the only test that ran the statement needed Docker. Here the second call raises
+    without it.
+    """
+    lead_id = str(seed_tenant(sessions, SLUG, count=1)[0])
+    store = PostgresGoldenPromotionStore(sessions)
+    arguments: dict[str, Any] = {
+        "tenant_slug": SLUG,
+        "lead_id": lead_id,
+        "case_id": "real_acme_00000001",
+        "promoted_by": "icp_owner",
+        "note": "warm is honest: the contact has no budget authority at all",
+        "promoted_at": NOW,
+    }
+
+    first, created_first = store.record(expected_tier=Tier.WARM, **arguments)
+    second, created_second = store.record(expected_tier=Tier.HOT, **arguments)
+
+    assert created_first is True
+    assert created_second is False
+    assert first == second
+    assert second.expected_tier is Tier.WARM, "the first, reviewed label must not be replaced"
+    assert len(store.list_promotions(tenant_slug=SLUG)) == 1
+
+
+def test_a_promotion_is_scoped_to_its_tenant(sessions: sessionmaker[Session]) -> None:
+    mine = str(seed_tenant(sessions, SLUG, count=1)[0])
+    theirs = str(seed_tenant(sessions, "someone-else", count=1)[0])
+    store = PostgresGoldenPromotionStore(sessions)
+    store.record(
+        tenant_slug=SLUG,
+        lead_id=mine,
+        case_id="c1",
+        expected_tier=Tier.WARM,
+        promoted_by="icp_owner",
+        note="a rationale long enough for the golden set",
+        promoted_at=NOW,
+    )
+
+    assert store.promoted_lead_ids(tenant_slug=SLUG, lead_ids=[mine, theirs]) == frozenset({mine})
+    assert store.promoted_lead_ids(tenant_slug="someone-else", lead_ids=[mine]) == frozenset()
+    assert store.list_promotions(tenant_slug="someone-else") == []
+
+
+def test_the_config_version_store_allocates_from_the_table(
+    sessions: sessionmaker[Session],
+) -> None:
+    """``MAX(version) + 1`` inside the insert, executed — and scoped to one tenant."""
+    seed_tenant(sessions, SLUG, count=0)
+    seed_tenant(sessions, "someone-else", count=0)
+    store = PostgresConfigVersionStore(sessions)
+
+    for slug in (SLUG, "someone-else"):
+        first = store.append(
+            tenant_slug=slug, config={"a": 1}, changed_by="ada", changed_at=NOW, note=None
+        )
+        second = store.append(
+            tenant_slug=slug, config={"a": 2}, changed_by="ada", changed_at=NOW, note=None
+        )
+        assert (first.version, second.version) == (1, 2), f"{slug} did not start at 1"
+
+    assert [version.version for version in store.list_versions(tenant_slug=SLUG)] == [2, 1]
+    assert store.get_version(tenant_slug=SLUG, version=1).config == {"a": 1}
+
+
+def test_appending_a_version_for_a_tenant_that_does_not_exist_writes_nothing(
+    sessions: sessionmaker[Session],
+) -> None:
+    """The ``SELECT ... FROM tenants`` the insert is sourced from is what refuses it."""
+    store = PostgresConfigVersionStore(sessions)
+
+    with pytest.raises(UnknownTenantError):
+        store.append(tenant_slug="nobody", config={}, changed_by="ada", changed_at=NOW, note=None)
+
+    assert store.list_versions(tenant_slug="nobody") == []

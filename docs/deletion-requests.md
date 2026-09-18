@@ -240,25 +240,43 @@ Someone at a **customer company** — the person named on the invoices — asks 
 their data. This is a different subject with a different lawful basis, and the answer is very
 likely **not** the same.
 
-What is true today, on this branch: we hold their name and email in `tenants` (as the account
-contact) and in whatever CRM or mailbox the commercial relationship lives in. Deleting that
-would mean closing the account, which is a commercial act, not a data-subject request.
+What we hold about them:
 
-What changes with issue #35 (Stripe billing, not on this branch): Stripe becomes a
-sub-processor holding the billing contact and payment data, and we store the verified Stripe
-webhook payloads. **Those are financial records.** In most jurisdictions a company is
-*required* to keep invoice records for a period measured in years, which normally overrides a
-deletion request for that data — the usual analysis is that the processing is necessary for
-compliance with a legal obligation, so the right to erasure does not apply to it.
+- their name and email on the `tenants` row, as the account contact;
+- **`stripe_events.payload`** — every verified Stripe webhook body, stored verbatim. A Stripe
+  invoice object carries the billing contact's name, email and postal address, so this is the
+  substantial one;
+- whatever Stripe itself holds as the processor of their payment data, which is theirs to
+  answer about and is described in [`docs/billing-integration.md`](billing-integration.md).
 
-**Do not delete a billing record on request without asking a lawyer.** The safe interim
-answer to such a requester is: we will remove them from marketing and operational contact
-immediately; the invoice records naming them are retained because we are required to retain
-them; and we will confirm the exact basis and period in writing. Then escalate.
+**`retentionctl find` and `retentionctl erase` do not look at any of this.** They search
+`leads` and delete leads; they have no code path that reaches `stripe_events` or `tenants`.
+Running them for a billing contact will correctly report "no data held" **about that person
+as a lead**, which is a true statement about a different question and must not be sent as if
+it answered theirs.
+
+**Do not delete a billing record on request.** `stripe_events.payload` is a financial record.
+The usual analysis is that keeping it is necessary for compliance with a legal obligation, so
+the right to erasure does not reach it — and a statutory minimum retention period, measured
+in years, normally *requires* us to keep it. See
+[`docs/data-retention-policy.md`](data-retention-policy.md).
+
+The safe interim answer, which does not need a lawyer to send:
+
+> We have removed you from marketing and operational contact. The invoice records naming you
+> are retained because we are required to retain them; we will confirm the exact legal basis
+> and the retention period in writing.
+
+Then escalate. Do not improvise the basis or the period in the reply.
 
 > **For legal review, and it is the most important item in this document:** the statutory
-> retention period for our invoice records in the jurisdiction we invoice from, and the
-> wording of the answer above.
+> retention period for our invoice records in the jurisdiction we invoice from, and whether
+> an erasure request reaches `stripe_events.payload` at all. Items 10 and 11 on
+> [`docs/dpa-draft.md`](dpa-draft.md)'s list.
+
+Deleting the `tenants` row itself is **closing the account**, which is a commercial act and
+not a data-subject request. Nothing in this codebase deletes a tenant row, and the database
+refuses it while any lead, usage report or erasure record still references it.
 
 ---
 

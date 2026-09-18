@@ -14,15 +14,17 @@ to the wrong router fails this file instead of shipping open.
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
+import re
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from leadquali.api.admin import LOGIN_PATH, AdminDeps
+from leadquali.api.admin import ADMIN_PREFIX, LOGIN_PATH, AdminDeps
 from leadquali.api.main import create_app
 from leadquali.app.admin_auth import (
     CSRF_FIELD,
@@ -32,13 +34,14 @@ from leadquali.app.admin_auth import (
     csrf_token,
     mint_session,
 )
-from leadquali.app.config_versions import ConfigEditor
+from leadquali.app.config_versions import ConfigEditor, ConfigVersionConflictError
 from leadquali.app.feedback import Verdict
 from leadquali.app.golden_promotion import GoldenPromotionService
 from leadquali.app.metering import MeteringService
 from leadquali.app.rerun import RerunService
 from leadquali.app.tenants import TenantService
 from leadquali.domain.models import Tier
+from leadquali.observability import EVENT_ADMIN_LOGIN_FAILED, MAX_LOGGED_USERNAME_CHARS
 from tests.fakes import (
     AdminLead,
     FakeClock,
@@ -299,6 +302,72 @@ def test_a_failed_login_says_only_that_it_failed(harness: Harness) -> None:
     assert unknown.text == wrong.text
 
 
+def test_logging_out_expires_the_cookie_with_every_flag_it_was_set_with(
+    harness: Harness,
+) -> None:
+    """``Secure`` above all: RFC 6265bis §4.1.3 says a browser MUST ignore a ``__Host-``
+    cookie that arrives without it, so a deletion missing it is dropped on the floor by
+    exactly the browsers the prefix was chosen for — and the session survives the logout.
+
+    Starlette's ``delete_cookie`` defaults to ``secure=False``, which is how that shipped.
+    """
+    response = harness.client().post("/admin/logout", data=harness.form(), follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == LOGIN_PATH
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"{SESSION_COOKIE}=")
+    assert "Secure" in cookie, "a __Host- cookie without Secure is ignored, so this deletes nothing"
+    assert "HttpOnly" in cookie
+    assert "SameSite=lax" in cookie
+    assert "Path=/" in cookie
+    assert "Max-Age=0" in cookie
+
+
+def test_the_logout_cookie_matches_the_login_cookie_attribute_for_attribute(
+    harness: Harness,
+) -> None:
+    """A cookie is only replaced by one whose name, path and domain match."""
+
+    def attributes(header: str) -> set[str]:
+        return {part.strip().split("=")[0].lower() for part in header.split(";")[1:]}
+
+    login = harness.client(signed_in=False).post(
+        LOGIN_PATH, data={"username": STAFF, "password": PASSWORD}, follow_redirects=False
+    )
+    logout = harness.client().post("/admin/logout", data=harness.form(), follow_redirects=False)
+
+    shared = {"path", "secure", "httponly", "samesite"}
+    assert shared <= attributes(login.headers["set-cookie"])
+    assert shared <= attributes(logout.headers["set-cookie"])
+
+
+def test_every_guarded_page_offers_a_way_to_sign_out(harness: Harness) -> None:
+    """The route existed and nothing reached it: ``grep logout templates/`` was empty."""
+    for path in ("/admin/", f"/admin/leads?tenant={SLUG}", f"/admin/tenants/{SLUG}"):
+        body = harness.client().get(path).text
+        assert f'action="{ADMIN_PREFIX}/logout"' in body, f"{path} has no sign-out"
+        assert "Sign out" in body
+
+
+def test_the_sign_out_form_carries_a_usable_token(harness: Harness) -> None:
+    """Rendering a button that posts a token the server then refuses is worse than none."""
+    body = harness.client().get("/admin/").text
+    token = body.split(f'name="{CSRF_FIELD}" value="')[1].split('"')[0]
+
+    response = harness.client().post(
+        "/admin/logout", data={CSRF_FIELD: token}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+
+
+def test_the_login_page_offers_no_sign_out(harness: Harness) -> None:
+    body = harness.client(signed_in=False).get(LOGIN_PATH).text
+
+    assert "Sign out" not in body
+
+
 def test_a_failed_login_sets_no_cookie(harness: Harness) -> None:
     response = harness.client(signed_in=False).post(
         LOGIN_PATH, data={"username": STAFF, "password": "x"}
@@ -310,22 +379,73 @@ def test_a_failed_login_sets_no_cookie(harness: Harness) -> None:
 # ------------------------------------------------------------------------------- CSRF
 
 
-POSTS_THAT_WRITE = [
-    ("/admin/tenants/acme/config/apply", {"config": "{}"}),
-    ("/admin/tenants/acme/config/revert", {"version": "1"}),
-    ("/admin/review/promote", {"tenant": SLUG, "lead_id": "lead-0001"}),
-    ("/admin/tenants/acme/rerun", {"config": "{}", "confirm": "yes"}),
-    ("/admin/logout", {}),
-]
+def state_changing_admin_routes(app: Any) -> list[tuple[str, str]]:
+    """Every admin route whose method is not a safe read, **enumerated from the app**.
+
+    Hand-maintained before, and that was the defect: a `POST .../config/quickset` added to
+    the guarded router rewrote a tenant's rubric with no token at all while the whole suite
+    stayed green, because the list did not name it and the *authentication* enumeration was
+    satisfied — the new route was on the right router. Deriving the list is what makes a
+    route added tomorrow appear in this test whether or not anybody remembers.
+
+    The login POST is excluded: it is on the public router and there is no session yet to
+    bind a token to. `docs/admin.md` covers the residual login-CSRF risk.
+    """
+    return sorted(
+        (path, method)
+        for path, method in admin_routes(app)
+        if method not in {"GET", "HEAD", "OPTIONS"} and path != LOGIN_PATH
+    )
 
 
-@pytest.mark.parametrize(("path", "fields"), POSTS_THAT_WRITE, ids=lambda value: str(value))
-def test_a_state_changing_post_without_a_csrf_token_is_refused(
-    path: str, fields: dict[str, str], harness: Harness
+def test_there_are_state_changing_routes_to_check(harness: Harness) -> None:
+    """An empty enumeration would make every test below vacuously true."""
+    found = state_changing_admin_routes(harness.app)
+
+    assert len(found) >= 5
+    assert ("/admin/tenants/{slug}/config/apply", "POST") in found
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    state_changing_admin_routes(Harness().app),
+    ids=lambda value: str(value),
+)
+def test_every_state_changing_route_refuses_a_post_without_a_csrf_token(
+    path: str, method: str, harness: Harness
 ) -> None:
-    response = harness.client().post(path, data=fields, follow_redirects=False)
+    """Enumerated, so a new write route is covered by existing here rather than by listing.
 
-    assert response.status_code == 403
+    The body is deliberately empty. The check runs on the router before any handler body,
+    so what a given route would have done with the fields is beside the point — it never
+    gets them.
+    """
+    response = harness.client().request(method, fill(path), data={}, follow_redirects=False)
+
+    assert response.status_code == 403, f"{method} {path} accepted a request with no token"
+
+
+def test_the_guarded_router_carries_both_checks_as_dependencies(harness: Harness) -> None:
+    """Structural, beside the enumeration: CSRF is declared where authentication is.
+
+    The enumeration above catches a route that skips the check. This catches the other
+    direction — somebody removing the dependency and re-adding per-handler calls, which
+    would leave the enumeration passing for exactly as long as nobody adds a route.
+    """
+    routers = [
+        getattr(route, "original_router")  # noqa: B009 - FastAPI's own inclusion internals
+        for route in harness.app.routes
+        if type(route).__name__ == "_IncludedRouter"
+    ]
+    guarded = [
+        router
+        for router in routers
+        if any(getattr(entry, "path", "") == "/admin/leads" for entry in router.routes)
+    ]
+
+    assert len(guarded) == 1, "the guarded router is not where it was expected"
+    names = {dependency.dependency.__name__ for dependency in guarded[0].dependencies}
+    assert names == {"session_of", "csrf_of"}
 
 
 def test_a_csrf_token_from_another_session_is_refused(harness: Harness) -> None:
@@ -452,6 +572,46 @@ def test_reverting_restores_the_earlier_config_and_appends(harness: Harness) -> 
     assert [version.version for version in harness.versions.versions(SLUG)] == [1, 2, 3]
 
 
+def test_a_lost_save_race_is_a_conflict_and_not_a_missing_tenant(harness: Harness) -> None:
+    """Two people editing during an incident. The loser must be told what happened.
+
+    The store reported the race by raising ``UnknownTenantError`` — the same type a
+    genuinely missing tenant raises — so the handler missed it and the page said *there is
+    no such tenant*, 404. The reasonable next move from there is psql, which is the thing
+    this screen exists to prevent.
+    """
+
+    class Conflicting(InMemoryConfigVersionStore):
+        def append(self, **kwargs: Any) -> Any:
+            raise ConfigVersionConflictError(
+                "another change to tenant 'acme' took this version number; nothing was "
+                "written — reload the config and try again"
+            )
+
+    harness.deps.config_editor._versions = Conflicting()
+
+    response = harness.client().post(
+        f"/admin/tenants/{SLUG}/config/apply",
+        data=harness.form(config=json.dumps(config_document(min_confidence=0.75)), note="mine"),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 409, "a lost race is not a 404 and not a 500"
+    assert "no such tenant" not in response.text
+    assert "reload the config" in response.text
+    # And the operator's edit is handed back rather than lost to a retype.
+    assert "0.75" in response.text
+    assert "mine" in response.text
+
+
+def test_a_genuinely_missing_tenant_is_still_a_404(harness: Harness) -> None:
+    """The other half: the two must not have collapsed into one answer the other way."""
+    response = harness.client().get("/admin/tenants/nobody/config", follow_redirects=False)
+
+    assert response.status_code == 404
+    assert "no such tenant" in response.text
+
+
 def test_the_history_page_shows_who_changed_what(harness: Harness) -> None:
     harness.client().post(
         f"/admin/tenants/{SLUG}/config/apply",
@@ -480,6 +640,31 @@ def test_the_browser_refuses_an_inverted_date_range_with_a_message(harness: Harn
 
     assert response.status_code == 400
     assert "ends before it starts" in response.text
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1E+10000", "not a number"])
+def test_a_confidence_that_is_not_a_finite_number_is_ignored(value: str, harness: Harness) -> None:
+    """``Decimal`` accepts all of these from a query string.
+
+    ``NaN`` is the interesting one: it compares false against everything, so the page would
+    come back empty and correct-looking rather than erroring — an operator filtering leads
+    would conclude there were none. The others become a bind parameter the driver renders.
+    """
+    response = harness.client().get(f"/admin/leads?tenant={SLUG}&min_confidence={value}")
+
+    assert response.status_code == 200
+    assert "lead-0001" in response.text, "the filter was applied instead of ignored"
+
+
+def test_a_cursor_whose_row_id_is_not_a_uuid_is_ignored_rather_than_a_500(
+    harness: Harness,
+) -> None:
+    """Well-formed enough to decode, and then a ``ValueError`` one layer down."""
+    forged = base64.urlsafe_b64encode(b"2026-09-16T09:00:00+00:00|not-a-uuid").decode().rstrip("=")
+
+    response = harness.client().get(f"/admin/leads?tenant={SLUG}&cursor={forged}")
+
+    assert response.status_code == 200
 
 
 def test_a_nonsense_cursor_is_ignored_rather_than_a_500(harness: Harness) -> None:
@@ -695,3 +880,108 @@ def test_a_failing_page_says_nothing_about_the_request_either(harness: Harness) 
 
     assert "a secret internal detail" not in body
     assert "lead-0001" not in body
+
+
+# ------------------------------------------------------- invariant 5, over a whole path
+
+
+def test_no_admin_request_on_the_happy_path_logs_a_lead(harness: Harness) -> None:
+    """Invariant 5 proved per *path*, not per logging helper.
+
+    The helpers in ``observability/events.py`` are each tested to carry no payload, and
+    that is necessary and nowhere near sufficient: adding
+    ``LOGGER.info("promoted %s", detail.raw_payload)`` to the promote handler left all 2184
+    tests passing, because nothing exercised a whole request with a real payload behind it
+    and looked at what came out.
+
+    So this walks the path an operator actually walks — sign in, browse, open a lead,
+    promote it, preview a rubric and save it — with one request's worth of logging captured
+    around all of it, and asserts that no value from the payload appears anywhere in the
+    output. Not in a message, not in a field, not inside an escaped traceback.
+    """
+    with capture_json_logs() as logs:
+        client = harness.client(signed_in=False)
+        client.post(
+            LOGIN_PATH, data={"username": STAFF, "password": PASSWORD}, follow_redirects=False
+        )
+        signed_in = harness.client()
+        signed_in.get("/admin/")
+        signed_in.get(f"/admin/leads?tenant={SLUG}")
+        detail = signed_in.get(f"/admin/leads/lead-0001?tenant={SLUG}")
+        signed_in.get(f"/admin/review?tenant={SLUG}")
+        signed_in.post(
+            "/admin/review/promote",
+            data=harness.form(
+                tenant=SLUG, lead_id="lead-0001", expected_tier="warm", note=RATIONALE
+            ),
+            follow_redirects=False,
+        )
+        signed_in.get(f"/admin/promotions?tenant={SLUG}")
+        signed_in.post(
+            f"/admin/tenants/{SLUG}/config/preview",
+            data=harness.form(config=json.dumps(config_document(min_confidence=0.75))),
+        )
+        signed_in.post(
+            f"/admin/tenants/{SLUG}/config/apply",
+            data=harness.form(config=json.dumps(config_document(min_confidence=0.75))),
+            follow_redirects=False,
+        )
+        signed_in.get(f"/admin/tenants/{SLUG}")
+        signed_in.post("/admin/logout", data=harness.form(), follow_redirects=False)
+        captured = logs.text
+        records = logs.records()
+
+    # The page really did render the lead, so "it is not in the logs" is a statement about
+    # a path that carried it rather than one that never had it.
+    assert "Priya Raghunathan" in detail.text
+    assert captured, "nothing was logged at all, so this test proves nothing"
+    assert records, "the capture produced no parseable records"
+
+    for field, value in A_PAYLOAD.items():
+        assert value not in captured, f"the payload's {field} reached the logs"
+    assert not re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", captured), (
+        "something address-shaped reached the logs"
+    )
+
+
+def test_a_failed_login_logs_only_a_bounded_prefix_of_the_username(
+    harness: Harness,
+) -> None:
+    """The realistic incident: a staff member types their password into the username box.
+
+    One line out of place and a live credential is in CloudWatch for the retention period.
+    The field is bounded below any plausible password length, and a truncated value says so.
+    """
+    a_password = "correct horse battery staple"
+
+    with capture_json_logs() as logs:
+        harness.client(signed_in=False).post(
+            LOGIN_PATH, data={"username": a_password, "password": "x"}
+        )
+
+    assert a_password not in logs.text
+    record = logs.one(EVENT_ADMIN_LOGIN_FAILED)
+    assert len(record["username"]) <= MAX_LOGGED_USERNAME_CHARS
+    assert record["username_truncated"] is True
+    assert record["username"] == a_password[:MAX_LOGGED_USERNAME_CHARS]
+
+
+def test_an_ordinary_username_is_logged_whole_so_a_human_recognises_it(
+    harness: Harness,
+) -> None:
+    """The bound must not cost the field its purpose."""
+    with capture_json_logs() as logs:
+        harness.client(signed_in=False).post(
+            LOGIN_PATH, data={"username": STAFF, "password": "wrong"}
+        )
+
+    record = logs.one(EVENT_ADMIN_LOGIN_FAILED)
+    assert record["username"] == STAFF
+    assert record["username_truncated"] is False
+
+
+def test_the_username_bound_is_below_any_password_this_system_will_mint() -> None:
+    """Pinned, because the bound is only a defence while that stays true."""
+    from leadquali.adminctl import MIN_PASSWORD_CHARS
+
+    assert MAX_LOGGED_USERNAME_CHARS < MIN_PASSWORD_CHARS

@@ -30,6 +30,17 @@ SDK_OWNER = "adapters/llm_anthropic.py"
 #: algorithm. Changing the parameters, or the algorithm, is then one file's diff.
 KEY_HASHER_OWNER = "adapters/keyhash_argon2.py"
 
+#: The one module allowed to import ``stripe``, relative to the package root.
+#:
+#: The rule pays for itself twice here. Stripe has already changed its metered-billing API
+#: once — subscription-item usage records, then meter events, and the older path is simply
+#: gone from the installed SDK — so keeping every Stripe type in one file makes the next
+#: such change a diff rather than a refactor. And ``api/stripe_signing.py`` verifies webhook
+#: signatures with the standard library *on purpose*, so that no third-party code sits on
+#: the rejection path of a public endpoint; a ``stripe`` import creeping in there would
+#: quietly undo that.
+BILLING_OWNER = "adapters/billing_stripe.py"
+
 
 def imported_modules(path: Path) -> set[str]:
     """Every top-level module name imported by ``path``, from its AST."""
@@ -119,6 +130,43 @@ def test_the_credentials_module_stays_standard_library_only() -> None:
     assert imported <= {"__future__", "dataclasses", "datetime", "enum", "typing"}, (
         f"app/credentials.py imports {sorted(imported)}"
     )
+
+
+def test_only_the_billing_adapter_imports_stripe() -> None:
+    """``stripe`` belongs to ``adapters/billing_stripe.py`` and to nothing else."""
+    assert "stripe" in imported_modules(SRC / BILLING_OWNER), (
+        "the billing adapter is supposed to own the SDK"
+    )
+    for path in python_sources():
+        relative = path.relative_to(SRC).as_posix()
+        if relative == BILLING_OWNER:
+            continue
+        assert "stripe" not in imported_modules(path), (
+            f"{relative} imports stripe; the SDK belongs in {BILLING_OWNER} alone"
+        )
+
+
+def test_the_stripe_signing_module_stays_standard_library_only() -> None:
+    """The webhook endpoint is public and its rejection path must cost an HMAC and nothing
+    else. A third-party import here — the SDK, a HTTP client, a JSON library — would put
+    somebody else's code in front of an unauthenticated stranger, and it would undo the
+    reason the verification was reimplemented rather than delegated: the signature covers
+    the raw bytes and must be checked before anything parses them.
+
+    ``tests/contract/test_billing_stripe_contract.py`` is the other half of this: it proves
+    the reimplementation computes byte-for-byte what the SDK computes.
+    """
+    imported = imported_modules(SRC / "api" / "stripe_signing.py")
+    assert imported <= {
+        "__future__",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "hashlib",
+        "hmac",
+        "re",
+        "typing",
+    }, f"api/stripe_signing.py imports {sorted(imported)}"
 
 
 def test_the_signing_module_stays_standard_library_only() -> None:
