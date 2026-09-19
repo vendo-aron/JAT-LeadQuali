@@ -366,7 +366,7 @@ def test_the_browser_and_the_review_return_what_the_unit_tests_assume(
     store = PostgresAdminQueryStore(sessions)
 
     page = store.browse_leads(
-        criteria=LeadFilter(tenant_slug=SLUG, tier=Tier.HOT), cursor=None, limit=3
+        tenant_slug=SLUG, criteria=LeadFilter(tier=Tier.HOT), cursor=None, limit=3
     )
     assert len(page.rows) == 3
     assert page.next_cursor is not None
@@ -374,7 +374,7 @@ def test_the_browser_and_the_review_return_what_the_unit_tests_assume(
     assert page.rows[0].verdict is Verdict.BAD
 
     resumed = store.browse_leads(
-        criteria=LeadFilter(tenant_slug=SLUG, tier=Tier.HOT), cursor=page.next_cursor, limit=3
+        tenant_slug=SLUG, criteria=LeadFilter(tier=Tier.HOT), cursor=page.next_cursor, limit=3
     )
     assert len(resumed.rows) == 2
     assert not {row.lead_id for row in page.rows} & {row.lead_id for row in resumed.rows}

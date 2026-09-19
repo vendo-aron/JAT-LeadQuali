@@ -327,7 +327,12 @@ class PostgresAdminQueryStore:
     # ------------------------------------------------------------------------ browsing
 
     def browse_leads(
-        self, *, criteria: LeadFilter, cursor: PageCursor | None, limit: int
+        self,
+        *,
+        tenant_slug: str,
+        criteria: LeadFilter,
+        cursor: PageCursor | None,
+        limit: int,
     ) -> LeadPage:
         """One page of assessed leads, newest first, resuming strictly after ``cursor``.
 
@@ -336,7 +341,7 @@ class PostgresAdminQueryStore:
         ``limit + 1`` rows are fetched so that "is there another page?" costs one row
         rather than a ``COUNT(*)`` over the whole filtered set.
         """
-        tenant = tenant_uuid(criteria.tenant_slug)
+        tenant = tenant_uuid(tenant_slug)
         # The rep's verdict, if any, as a correlated scalar rather than a join: a lead can
         # have several raters, and joining would multiply the page's rows by them.
         verdict = (

@@ -148,9 +148,19 @@ class PageCursor:
 
 @dataclass(frozen=True, slots=True)
 class LeadFilter:
-    """What the browser is filtered to. Every field except the tenant is optional."""
+    """What the operator narrowed the browser to. Every field is optional.
 
-    tenant_slug: str
+    **The tenant is deliberately not here.** It used to be, and #32's isolation sweep is
+    what said otherwise: invariant 4 is "``tenant_id`` on every table and every repository
+    method", and a method whose tenant arrives inside a value object does not name its
+    tenant — the sweep could not see it, and neither could a reader of the signature. It is
+    also one fewer way to go wrong, because a filter object carrying a tenant can disagree
+    with the page that built it.
+
+    So the scope is a parameter of
+    :meth:`AdminQueryPort.browse_leads` and this type holds only what the operator chose.
+    """
+
     tier: Tier | None = None
     start: dt.date | None = None
     """Inclusive lower bound on the assessment date, UTC."""
@@ -410,9 +420,18 @@ class AdminQueryPort(Protocol):
     """
 
     def browse_leads(
-        self, *, criteria: LeadFilter, cursor: PageCursor | None, limit: int
+        self,
+        *,
+        tenant_slug: str,
+        criteria: LeadFilter,
+        cursor: PageCursor | None,
+        limit: int,
     ) -> LeadPage:
         """One page of assessed leads, newest first, resuming after ``cursor``.
+
+        ``tenant_slug`` is a parameter of its own rather than a field of ``criteria``, like
+        every other method on this port: invariant 4 asks each one to name its tenant, and
+        #32's sweep reads these signatures to decide what to check.
 
         Implementations fetch ``limit + 1`` rows and return the extra one as
         :attr:`LeadPage.next_cursor` rather than counting the whole result set.

@@ -1405,9 +1405,14 @@ class InMemoryAdminQueryStore:
     # ------------------------------------------------------------------------ browsing
 
     def browse_leads(
-        self, *, criteria: LeadFilter, cursor: PageCursor | None, limit: int
+        self,
+        *,
+        tenant_slug: str,
+        criteria: LeadFilter,
+        cursor: PageCursor | None,
+        limit: int,
     ) -> LeadPage:
-        matching = [lead for lead in self._ordered() if self._matches(lead, criteria)]
+        matching = [lead for lead in self._ordered() if self._matches(lead, tenant_slug, criteria)]
         if cursor is not None:
             matching = [
                 lead
@@ -1501,8 +1506,8 @@ class InMemoryAdminQueryStore:
         return sorted(self.leads, key=lambda lead: (lead.created_at, lead.row_id), reverse=True)
 
     @staticmethod
-    def _matches(lead: AdminLead, criteria: LeadFilter) -> bool:
-        if lead.tenant_slug != criteria.tenant_slug:
+    def _matches(lead: AdminLead, tenant_slug: str, criteria: LeadFilter) -> bool:
+        if lead.tenant_slug != tenant_slug:
             return False
         if criteria.tier is not None and lead.tier is not criteria.tier:
             return False
