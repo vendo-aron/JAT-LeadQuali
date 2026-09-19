@@ -16,6 +16,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from leadquali.adapters.secrets_manager import SecretResolutionError
 from leadquali.config import (
@@ -458,3 +459,71 @@ def test_the_default_ttl_bounds_rotation_pickup_to_minutes() -> None:
     "rotated in the console, picked up with no redeploy" is measured in minutes.
     """
     assert 60 <= DEFAULT_SECRETS_CACHE_TTL_SECONDS <= 900
+
+
+# ------------------------------------------------- the admin session secret (#36, F10)
+
+
+A_SHARED_SECRET = "x" * 48
+
+
+def test_the_admin_session_secret_may_not_be_a_tenants_ingest_signing_secret() -> None:
+    """The most powerful of the three secrets, and it had no reuse check at all.
+
+    An ingest signing secret is *handed to a customer's website*. Reusing one here would
+    let that customer mint an admin session cookie and rewrite every tenant's rubric.
+    ``require_feedback_token_secret`` has had this check since #60; this one did not.
+    """
+    settings = Settings(
+        admin_session_secret=SecretStr(A_SHARED_SECRET),
+        ingest_credentials=SecretStr(json.dumps({"acme": {"signing_secret": A_SHARED_SECRET}})),
+    )
+
+    with pytest.raises(RuntimeError, match="ingest signing secret"):
+        settings.require_admin_session_secret()
+
+
+def test_the_admin_session_secret_may_not_be_the_feedback_secret() -> None:
+    """One mints a staff session; the other authorises a verdict on one lead."""
+    settings = Settings(
+        admin_session_secret=SecretStr(A_SHARED_SECRET),
+        feedback_token_secret=SecretStr(A_SHARED_SECRET),
+    )
+
+    with pytest.raises(RuntimeError, match="FEEDBACK_TOKEN_SECRET"):
+        settings.require_admin_session_secret()
+
+
+def test_three_distinct_secrets_are_accepted() -> None:
+    settings = Settings(
+        admin_session_secret=SecretStr("a" * 48),
+        feedback_token_secret=SecretStr("b" * 48),
+        ingest_credentials=SecretStr(json.dumps({"acme": {"signing_secret": "c" * 48}})),
+    )
+
+    assert settings.require_admin_session_secret() == "a" * 48
+
+
+def test_an_admin_only_deployment_still_starts() -> None:
+    """The admin Lambda has no business reading the feedback secret, so a deployment that
+    configures one and not the other is legitimate and must not fail the check."""
+    settings = Settings(admin_session_secret=SecretStr(A_SHARED_SECRET))
+
+    assert settings.require_admin_session_secret() == A_SHARED_SECRET
+
+
+def test_the_error_names_which_secret_to_regenerate() -> None:
+    """Both messages go to somebody at a console with three secrets in front of them."""
+    reused_ingest = Settings(
+        admin_session_secret=SecretStr(A_SHARED_SECRET),
+        ingest_credentials=SecretStr(json.dumps({"acme": {"signing_secret": A_SHARED_SECRET}})),
+    )
+    reused_feedback = Settings(
+        feedback_token_secret=SecretStr(A_SHARED_SECRET),
+        ingest_credentials=SecretStr(json.dumps({"acme": {"signing_secret": A_SHARED_SECRET}})),
+    )
+
+    with pytest.raises(RuntimeError, match="the admin session secret"):
+        reused_ingest.require_admin_session_secret()
+    with pytest.raises(RuntimeError, match="the feedback token secret"):
+        reused_feedback.require_feedback_token_secret()

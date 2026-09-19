@@ -1,0 +1,80 @@
+{#
+  "Every lead scored hot last month that the rep marked bad, grouped by industry."
+
+  The query the storage design was made for, as a first-class view with its own URL.
+  Each row is one click from the golden set; a lead already promoted says so rather than
+  offering an action the store would refuse.
+#}
+{% extends "admin/base.html" %}
+{% block title %}Feedback review — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Where the rubric and the reps disagree</h1>
+<form class="filters" method="get" action="{{ admin_prefix }}/review">
+  <label>Tenant
+    <select name="tenant" required>
+      <option value="">choose…</option>
+      {% for tenant in tenants %}
+      <option value="{{ tenant.slug }}" {% if slug == tenant.slug %}selected{% endif %}>
+        {{ tenant.slug }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Scored
+    <select name="tier">
+      {% for name in ['hot', 'warm', 'cold', 'disqualified'] %}
+      <option value="{{ name }}" {% if tier.value == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select></label>
+  <label>Rep said
+    <select name="verdict">
+      {% for name in ['bad', 'good', 'unsure'] %}
+      <option value="{{ name }}" {% if verdict.value == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select></label>
+  <label>From <input type="date" name="from" value="{{ params.get('from', '') }}"></label>
+  <label>To <input type="date" name="to" value="{{ params.get('to', '') }}"></label>
+  <button type="submit">Show</button>
+</form>
+{% if slug is none %}
+<p class="muted">Choose a tenant. The default question is "scored hot, marked bad, last
+  30 days".</p>
+{% elif not groups %}
+<p class="muted">No disagreements of that shape in this window. That is good news.</p>
+{% else %}
+{% for group in groups %}
+<h2>{{ group.industry }} <span class="muted">({{ group.count }})</span></h2>
+<table>
+  <tr><th>Assessed</th><th>Company</th><th>Score</th><th>Confidence</th>
+      <th>Rep's note</th><th>Promote to the golden set</th></tr>
+  {% for row in group.rows %}
+  <tr>
+    <td><a href="{{ admin_prefix }}/leads/{{ row.lead_id }}?tenant={{ slug }}"
+        >{{ row.assessed_at.strftime('%Y-%m-%d') }}</a></td>
+    <td>{{ row.company or '' }}</td>
+    <td class="num">{{ row.total_score if row.total_score is not none else '—' }}</td>
+    <td class="num">{{ row.confidence if row.confidence is not none else '—' }}</td>
+    <td>{{ row.notes or '' }}</td>
+    <td>
+      {% if row.lead_id in promoted %}
+      <span class="muted">already promoted</span>
+      {% else %}
+      <form class="inline" method="post" action="{{ admin_prefix }}/review/promote">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf }}">
+        <input type="hidden" name="tenant" value="{{ slug }}">
+        <input type="hidden" name="lead_id" value="{{ row.lead_id }}">
+        <select name="expected_tier" aria-label="the tier a human says this should be">
+          {% for name in ['hot', 'warm', 'cold', 'disqualified'] %}
+          <option value="{{ name }}">{{ name }}</option>
+          {% endfor %}
+        </select>
+        <input name="note" size="34" minlength="20" required
+               placeholder="why this tier and not the adjacent one">
+        <button type="submit">Promote</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+{% endif %}
+{% endblock %}
