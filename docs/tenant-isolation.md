@@ -52,8 +52,8 @@ not asserted — see [The negative control](#the-negative-control).
 
 ### 1. Data isolation — every repository method
 
-`tests/isolation/test_repository_isolation.py` (84 tests, no database)
-`tests/isolation/test_repository_isolation_integration.py` (26 tests, PostgreSQL)
+`tests/isolation/test_repository_isolation.py` (140 tests, no database)
+`tests/isolation/test_repository_isolation_integration.py` (45 tests, PostgreSQL)
 
 Not a hand-written test per method. The sweep discovers the repository classes and their
 methods by introspection, and fails in four ways, none of which is a skip:
@@ -62,14 +62,15 @@ methods by introspection, and fails in four ways, none of which is a skip:
   fails a completeness check, which reads the `leadquali.adapters` package rather than
   trusting a hand-written list;
 - a **new public method that names no tenant** fails the enumeration test by name, unless it
-  is added to a short allowlist (constructors, and three deliberately fleet-wide operator
-  queries) with a written reason;
+  is added to a short allowlist (constructors, five deliberately fleet-wide operator
+  queries, the control plane's enumeration, and #35's five methods over the one table whose
+  `tenant_id` is nullable) with a written reason;
 - a **new tenant-scoped method with no argument recipe** fails the sweep with a message
   telling the author to write one — arguments are never synthesised from type hints, because
   a generic harness produces a test that passes because the call errored;
 - a method **whose statement stops constraining the tenant** fails the scoping check.
 
-For each of the 22 swept methods the test builds every statement the method would execute
+For each of the 41 swept methods the test builds every statement the method would execute
 and inspects the SQLAlchemy construct — not the rendered SQL. The rule is that **every**
 filterable clause of a statement (its `WHERE`, the `WHERE` of an `ON CONFLICT DO UPDATE`,
 the `WHERE` of the select feeding an `INSERT ... FROM SELECT`) must have a top-level `AND`
@@ -257,10 +258,10 @@ A decision rather than a test. See [the next section](#row-level-security-the-de
 
 ## The documented exceptions
 
-Five methods do not carry a tenant predicate: the three fleet-wide queries below, the
-control plane's enumeration, and the credential lookup. Each is enforced as an exception by
-the sweep — the tests fail if one of them quietly changes shape — rather than merely
-tolerated.
+Twelve methods do not carry a tenant predicate: five fleet-wide queries, the control
+plane's enumeration, the credential lookup, and the five billing methods over
+`stripe_events` described last. Each is enforced as an exception by the sweep — the tests
+fail if one of them quietly changes shape — rather than merely tolerated.
 
 **`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`.** Reconciling our
 usage against Anthropic's invoice, and allocating shared infrastructure cost, are questions
@@ -270,6 +271,16 @@ tenant, so it cannot be mistaken for a query somebody forgot to filter; and it r
 per-tenant *breakdown* rather than an anonymous total that could be printed anywhere. Every
 per-tenant report produced by `usagectl` — human and JSON — is rendered in the test suite and
 searched for the other tenant's slug and figures.
+
+**`fleet_billable_tenants`, `fleet_tenants_in_expired_dunning`** (#35). The daily billing
+run's worklist and the dunning sweep's, and the same three rules contain them. Both answer
+*who should this scheduled job iterate over?* — the set of tenants with a Stripe customer,
+and the set whose grace period has run out — rather than handing anybody another tenant's
+figures, and neither is reachable from a request path. They were originally called
+`billable_tenants` and `tenants_in_expired_dunning`; putting the billing store through the
+sweep is what renamed them, and the renaming is the point: at a call site those two spellings
+look exactly like queries somebody forgot to filter, and `fleet_` says out loud that the
+absence is deliberate.
 
 One fleet-derived number does reach a single tenant's report: `fleet_billable_leads` on the
 margin report, the denominator of the pro-rata infrastructure allocation, carried so that a
@@ -324,6 +335,55 @@ document listed it as a third exception on the grounds that it was provably safe
 review closed it, on the grounds that an exception is what a later reader copies.
 `tests/isolation/test_repository_isolation.py::test_the_last_used_write_is_tenant_scoped_like_every_other_write`
 holds it to that, and would have failed if the fix had not landed.
+
+**The five billing methods over `stripe_events`** (#35): `insert_event`,
+`pending_events`, `mark_event_attempt_failed`, `mark_event_processed` and
+`tenant_for_customer`. This is the one place in the schema where a `tenant_id` column is
+**nullable**, and it is the only exception to invariant 4 anywhere in this system.
+
+The reason is not convenience. A Stripe webhook names a *customer*, and which of our tenants
+that is can only be learned from a database read — one the verifying route deliberately does
+not make, because its whole contract is *verify the signature, insert, return 200 fast*.
+Doing more inline would mean a transient database problem turning into a 500, which Stripe
+reads as a failed delivery and retries, which is how an event gets half-applied twice.
+Refusing to store an event we cannot attribute would be worse still: it would throw away the
+only record that it arrived.
+
+So the event is stored unattributed, and a scheduled drain resolves the customer a minute
+later and writes the tenant onto the row. Four things bound the exception, and each is a
+test rather than a promise (`tests/isolation/test_billing_isolation.py`):
+
+1. **It covers only `stripe_events`.** Every exempt method is shown to touch that table and
+   no other. The allowlist is asserted as an *equality*, so widening it is a diff in two
+   files rather than one.
+2. **Pending means unattributed, structurally.** The only statement that writes `tenant_id`
+   is `mark_event_processed`, which sets `status = 'processed'` in the same `UPDATE`. A
+   pending row therefore *cannot* carry a tenant, which is why the drain's worklist has none
+   to filter on. A future method that attributed a row and left it pending fails the test
+   that states this.
+3. **The attribution write is addressed by Stripe's own primary key.** `mark_event_processed`
+   is the one exempt method that takes a `tenant_id`, and the argument is the value being
+   *written*, not a filter: the column is NULL until this statement sets it, so a `WHERE` on
+   the tenant would match zero rows and the attribution would silently not happen.
+4. **The lookup that resolves a customer can only return a slug.** `tenant_for_customer`
+   selects one column, so even unscoped it has no row of another tenant's to hand back.
+
+Everything on the *other* side of the line is swept normally. The seven methods that read or
+write a tenant-owned row — the `tenants` billing columns and the `usage_reports` ledger — are
+in the sweep with recipes, and `usage_reports` is in the integration half's snapshot, so a
+cross-tenant billing write is caught by the same machinery as a cross-tenant lead write. When
+the billing store was first put through the sweep the scoping rule objected to **none** of
+those seven statements; what it did object to was a *signature*. `record_usage_report` used
+to take a `UsageReport` value object, which carries the tenant as a field — so the method
+named no tenant, the enumeration would have waved it through as "takes no tenant", and the
+sweep could not have injected one. It now takes the row's columns. Invariant 4 says
+`tenant_id` on every table **and every repository method**, and a tenant that travels inside
+an argument does not satisfy the second half.
+
+`stripe_events` is deliberately *not* in the integration snapshot's `OWNED_TABLES`: a
+snapshot keyed on a tenant would watch the attributed rows and miss the unattributed ones,
+which are the majority and the interesting ones. The two statements that could write across
+that table are addressed by Stripe's own primary key and are covered by name instead.
 
 ---
 

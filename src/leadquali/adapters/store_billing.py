@@ -61,12 +61,7 @@ from leadquali.adapters.store_postgres import (
     session_factory_from_env,
     tenant_uuid,
 )
-from leadquali.app.billing import (
-    BillingTenant,
-    EventStatus,
-    StripeEvent,
-    UsageReport,
-)
+from leadquali.app.billing import BillingTenant, EventStatus, StripeEvent
 from leadquali.app.tenants import TenantStatus
 from leadquali.config import Settings
 
@@ -182,17 +177,25 @@ class PostgresBillingStore:
 
         A ``failed`` row is never returned: it is out of attempts and an operator has to
         look at it, and retrying it automatically would hide it rather than fix it.
+
+        **Every row this returns has ``tenant_id IS NULL``**, and that is a property of the
+        schema rather than a hope: the only statement that writes ``tenant_id`` is
+        :meth:`mark_event_processed`, which sets ``status = 'processed'`` in the same
+        ``UPDATE``. A pending row is therefore by construction an *unattributed* one, which
+        is why this read has no tenant to be scoped to — the deliberate invariant-4
+        exception documented in :mod:`leadquali.app.billing`. It is also why there is no
+        join to ``tenants`` here: one would resolve a slug for a column that is always
+        NULL. ``tests/isolation/test_repository_isolation.py`` pins both halves.
         """
         statement = (
-            select(*_EVENT_COLUMNS, Tenant.slug)
-            .outerjoin(Tenant, Tenant.id == StripeEventRow.tenant_id)
+            select(*_EVENT_COLUMNS)
             .where(StripeEventRow.status == EventStatus.PENDING.value)
             .order_by(StripeEventRow.received_at, StripeEventRow.event_id)
             .limit(limit)
         )
         with self._sessions.begin() as session:
             rows = session.execute(statement).all()
-        return [_event_from_row(row, tenant_slug=row.slug) for row in rows]
+        return [_event_from_row(row, tenant_slug=None) for row in rows]
 
     def mark_event_processed(
         self, *, event_id: str, processed_at: dt.datetime, tenant_id: str | None
@@ -267,8 +270,13 @@ class PostgresBillingStore:
             row = session.execute(statement).one_or_none()
         return None if row is None else _tenant_from_row(row)
 
-    def billable_tenants(self) -> Sequence[BillingTenant]:
+    def fleet_billable_tenants(self) -> Sequence[BillingTenant]:
         """Every tenant with a Stripe customer, oldest first.
+
+        ``fleet_`` by #33's convention: a query with no tenant predicate, named so that the
+        absence is visible at the call site rather than looking like a filter somebody
+        dropped. The daily billing run's worklist — who to iterate over, not anybody's
+        data — and on no request path.
 
         Not filtered by status. A suspended tenant's usage from before it was suspended is
         still owed, and a job that skipped them would write off exactly the customers who
@@ -304,8 +312,10 @@ class PostgresBillingStore:
         """Start, extend or clear a tenant's grace period."""
         self._update_tenant(tenant_id, {"dunning_until": until})
 
-    def tenants_in_expired_dunning(self, *, now: dt.datetime) -> Sequence[BillingTenant]:
-        """Active tenants whose grace period has run out.
+    def fleet_tenants_in_expired_dunning(self, *, now: dt.datetime) -> Sequence[BillingTenant]:
+        """Active tenants whose grace period has run out, across every tenant.
+
+        ``fleet_`` for the same reason as :meth:`fleet_billable_tenants`.
 
         Filtered on ``status = 'active'`` as well as on the deadline, so the sweep cannot
         re-suspend a tenant that is already suspended — which would be a second log line, a
@@ -326,21 +336,34 @@ class PostgresBillingStore:
 
     # --------------------------------------------------------------- the usage ledger
 
-    def record_usage_report(self, *, report: UsageReport, reported_at: dt.datetime) -> bool:
+    def record_usage_report(
+        self,
+        *,
+        tenant_id: str,
+        usage_date: dt.date,
+        quantity: int,
+        external_id: str,
+        reported_at: dt.datetime,
+    ) -> bool:
         """Record that a tenant-day has been reported, and say whether it was new.
 
         ``ON CONFLICT (tenant_id, usage_date) DO NOTHING``. ``False`` means the day was
         already recorded — by an overlapping run, by a retry, or by a second container —
         and the caller must send nothing further.
+
+        The columns are named individually rather than taken as a
+        :class:`~leadquali.app.billing.UsageReport` so that ``tenant_id`` is a parameter of
+        this method: invariant 4 asks every repository method to name its tenant, and one
+        whose tenant travels inside a value object does not.
         """
         statement = (
             insert(UsageReportRecord)
             .values(
-                tenant_id=tenant_uuid(report.tenant_id),
-                usage_date=report.usage_date,
+                tenant_id=tenant_uuid(tenant_id),
+                usage_date=usage_date,
                 reported_at=reported_at,
-                external_id=report.external_id,
-                quantity=report.quantity,
+                external_id=external_id,
+                quantity=quantity,
             )
             .on_conflict_do_nothing(index_elements=["tenant_id", "usage_date"])
             .returning(UsageReportRecord.usage_date)

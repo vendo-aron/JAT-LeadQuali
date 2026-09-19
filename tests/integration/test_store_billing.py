@@ -105,6 +105,24 @@ def store(
     yield PostgresBillingStore(sessions)
 
 
+def record(store: PostgresBillingStore, report: UsageReport) -> bool:
+    """Record one report, unpacked into the store's own parameters.
+
+    The store takes the row's columns rather than the value object, so that ``tenant_id``
+    is a named parameter of the method — which is what invariant 4 asks for and what lets
+    the isolation sweep inject a tenant at all. This unpacks it the way
+    ``BillingService._record`` does, in one place, so the tests below read as the behaviour
+    they are about rather than as four arguments each.
+    """
+    return store.record_usage_report(
+        tenant_id=report.tenant_id,
+        usage_date=report.usage_date,
+        quantity=report.quantity,
+        external_id=report.external_id,
+        reported_at=NOW,
+    )
+
+
 def event(event_id: str, *, received_at: datetime = NOW) -> StripeEvent:
     return StripeEvent(
         event_id=event_id,
@@ -227,8 +245,8 @@ def test_a_day_can_only_be_reported_once(store: PostgresBillingStore) -> None:
     """The property that stops a customer being billed twice, proved against the
     constraint that enforces it rather than against a dict."""
     report = UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3)
-    assert store.record_usage_report(report=report, reported_at=NOW) is True
-    assert store.record_usage_report(report=report, reported_at=NOW) is False
+    assert record(store, report) is True
+    assert record(store, report) is False
     assert store.usage_reported(tenant_id=TENANT_A, usage_date=DAY) is True
 
 
@@ -238,26 +256,15 @@ def test_a_second_run_with_a_different_quantity_still_records_nothing(
     """``DO NOTHING``, not ``DO UPDATE``. A recount that produced a different number must
     not silently overwrite what we already told Stripe — the two would then disagree and
     only the invoice would know."""
-    store.record_usage_report(
-        report=UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3), reported_at=NOW
-    )
-    store.record_usage_report(
-        report=UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=99), reported_at=NOW
-    )
+    record(store, UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3))
+    record(store, UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=99))
     with billing_engine.begin() as connection:
         assert connection.execute(select(UsageReportRecord.quantity)).scalar_one() == 3
 
 
 def test_one_tenants_report_does_not_block_anothers(store: PostgresBillingStore) -> None:
-    store.record_usage_report(
-        report=UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3), reported_at=NOW
-    )
-    assert (
-        store.record_usage_report(
-            report=UsageReport(tenant_id=TENANT_B, usage_date=DAY, quantity=5), reported_at=NOW
-        )
-        is True
-    )
+    record(store, UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3))
+    assert record(store, UsageReport(tenant_id=TENANT_B, usage_date=DAY, quantity=5)) is True
     assert store.usage_reported(tenant_id=TENANT_B, usage_date=DAY) is True
 
 
@@ -267,9 +274,7 @@ def test_a_tenant_with_usage_reports_cannot_be_deleted_by_accident(
     """``ON DELETE RESTRICT``, unlike the derived rollup beside it. #37's purge has to
     delete these deliberately, which is the point: this is a record of something we told a
     payment processor about a customer's money."""
-    store.record_usage_report(
-        report=UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3), reported_at=NOW
-    )
+    record(store, UsageReport(tenant_id=TENANT_A, usage_date=DAY, quantity=3))
     with pytest.raises(IntegrityError), billing_engine.begin() as connection:
         connection.execute(delete(Tenant).where(Tenant.slug == TENANT_A))
 
@@ -294,14 +299,14 @@ def test_two_tenants_cannot_share_one_subscription(store: PostgresBillingStore) 
 def test_any_number_of_tenants_may_have_no_customer(store: PostgresBillingStore) -> None:
     """Postgres treats NULLs as distinct, which is exactly what a nullable unique column
     has to mean here: "not on a plan" is not a collision."""
-    assert store.billable_tenants() == []
+    assert store.fleet_billable_tenants() == []
     assert store.tenant_for_customer(stripe_customer_id="cus_missing") is None
 
 
 def test_a_customer_resolves_back_to_its_tenant(store: PostgresBillingStore) -> None:
     store.link_customer(tenant_id=TENANT_A, stripe_customer_id="cus_a")
     assert store.tenant_for_customer(stripe_customer_id="cus_a") == TENANT_A
-    assert [tenant.tenant_id for tenant in store.billable_tenants()] == [TENANT_A]
+    assert [tenant.tenant_id for tenant in store.fleet_billable_tenants()] == [TENANT_A]
 
 
 def test_the_dunning_sweep_finds_only_expired_active_tenants(
@@ -312,10 +317,10 @@ def test_the_dunning_sweep_finds_only_expired_active_tenants(
     store.set_dunning_until(tenant_id=TENANT_A, until=NOW - timedelta(seconds=1))
     store.set_dunning_until(tenant_id=TENANT_B, until=NOW + timedelta(days=1))
 
-    assert [t.tenant_id for t in store.tenants_in_expired_dunning(now=NOW)] == [TENANT_A]
+    assert [t.tenant_id for t in store.fleet_tenants_in_expired_dunning(now=NOW)] == [TENANT_A]
 
     store.set_status(tenant_id=TENANT_A, status=TenantStatus.SUSPENDED)
-    assert store.tenants_in_expired_dunning(now=NOW) == []
+    assert store.fleet_tenants_in_expired_dunning(now=NOW) == []
 
 
 def test_the_billing_columns_round_trip(store: PostgresBillingStore) -> None:

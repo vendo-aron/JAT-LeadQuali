@@ -1089,7 +1089,7 @@ class InMemoryBillingStore:
     def billing_tenant(self, *, tenant_id: str) -> BillingTenant | None:
         return self.tenants.get(tenant_id)
 
-    def billable_tenants(self) -> Sequence[BillingTenant]:
+    def fleet_billable_tenants(self) -> Sequence[BillingTenant]:
         return [tenant for tenant in self.tenants.values() if tenant.stripe_customer_id]
 
     def link_customer(self, *, tenant_id: str, stripe_customer_id: str) -> None:
@@ -1112,18 +1112,35 @@ class InMemoryBillingStore:
     def set_dunning_until(self, *, tenant_id: str, until: datetime | None) -> None:
         self.tenants[tenant_id] = replace(self._row(tenant_id), dunning_until=until)
 
-    def tenants_in_expired_dunning(self, *, now: datetime) -> Sequence[BillingTenant]:
+    def fleet_tenants_in_expired_dunning(self, *, now: datetime) -> Sequence[BillingTenant]:
         return [
             tenant
             for tenant in self.tenants.values()
             if tenant.status is TenantStatus.ACTIVE and tenant.dunning(now=now).expired
         ]
 
-    def record_usage_report(self, *, report: UsageReport, reported_at: datetime) -> bool:
-        key = (report.tenant_id, report.usage_date)
+    def record_usage_report(
+        self,
+        *,
+        tenant_id: str,
+        usage_date: date,
+        quantity: int,
+        external_id: str,
+        reported_at: datetime,
+    ) -> bool:
+        key = (tenant_id, usage_date)
         if key in self.usage_reports:
             return False
-        self.usage_reports[key] = (report, reported_at)
+        self.usage_reports[key] = (
+            UsageReport(tenant_id=tenant_id, usage_date=usage_date, quantity=quantity),
+            reported_at,
+        )
+        # The derivation is a pure function of the tenant and the day, so a caller that
+        # passed an identifier built from a different pair is a bug the real table's UNIQUE
+        # constraint would catch late and loudly. Caught here immediately instead.
+        assert external_id == self.usage_reports[key][0].external_id, (
+            f"external_id {external_id!r} was not derived from ({tenant_id}, {usage_date})"
+        )
         return True
 
     def usage_reported(self, *, tenant_id: str, usage_date: date) -> bool:

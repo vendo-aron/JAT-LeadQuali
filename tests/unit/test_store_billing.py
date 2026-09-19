@@ -48,6 +48,24 @@ EVENT = StripeEvent(
 )
 
 
+def record(store: PostgresBillingStore, report: UsageReport) -> bool:
+    """Record one report, unpacked into the store's own parameters.
+
+    The store takes the row's columns rather than the value object, so that ``tenant_id``
+    is a named parameter of the method — which is what invariant 4 asks for and what lets
+    the isolation sweep inject a tenant at all. This unpacks it the way
+    ``BillingService._record`` does, in one place, so the tests below read as the behaviour
+    they are about rather than as four arguments each.
+    """
+    return store.record_usage_report(
+        tenant_id=report.tenant_id,
+        usage_date=report.usage_date,
+        quantity=report.quantity,
+        external_id=report.external_id,
+        reported_at=NOW,
+    )
+
+
 class CapturedStatementError(Exception):
     """Carries the statement a method built, instead of executing it."""
 
@@ -220,7 +238,7 @@ def test_the_usage_insert_does_nothing_on_a_conflicting_tenant_day(
     second run overwrite the row and look like a first — which is precisely the state the
     caller uses to decide whether to send anything to Stripe."""
     report = UsageReport(tenant_id=TENANT, usage_date=DAY, quantity=3)
-    sql = sql_for(lambda: store.record_usage_report(report=report, reported_at=NOW))
+    sql = sql_for(lambda: record(store, report))
     assert "insert into usage_reports" in sql
     assert "on conflict (tenant_id, usage_date) do nothing" in sql
     assert "do update" not in sql
@@ -231,9 +249,7 @@ def test_the_recorded_quantity_and_identifier_are_the_reports_own(
     store: PostgresBillingStore,
 ) -> None:
     report = UsageReport(tenant_id=TENANT, usage_date=DAY, quantity=42)
-    compiled = capture(lambda: store.record_usage_report(report=report, reported_at=NOW)).compile(
-        dialect=PG_DIALECT
-    )
+    compiled = capture(lambda: record(store, report)).compile(dialect=PG_DIALECT)
     assert compiled.params["quantity"] == 42
     assert compiled.params["external_id"] == report.external_id
 
@@ -266,8 +282,8 @@ def test_every_tenant_scoped_statement_filters_on_the_tenant(
         "set_status": lambda: store.set_status(tenant_id=TENANT, status=TenantStatus.SUSPENDED),
         "set_dunning_until": lambda: store.set_dunning_until(tenant_id=TENANT, until=NOW),
         "usage_reported": lambda: store.usage_reported(tenant_id=TENANT, usage_date=DAY),
-        "record_usage_report": lambda: store.record_usage_report(
-            report=UsageReport(tenant_id=TENANT, usage_date=DAY, quantity=1), reported_at=NOW
+        "record_usage_report": lambda: record(
+            store, UsageReport(tenant_id=TENANT, usage_date=DAY, quantity=1)
         ),
     }
     sql = sql_for(calls[name])
@@ -279,7 +295,7 @@ def test_the_billable_tenant_listing_is_not_filtered_by_status(
 ) -> None:
     """A suspended tenant's usage from *before* it was suspended is still owed. A listing
     that skipped them would write off exactly the customers who are not paying."""
-    sql = sql_for(store.billable_tenants)
+    sql = sql_for(store.fleet_billable_tenants)
     where = sql.split("where", 1)[1]
     assert "tenants.stripe_customer_id is not null" in where
     assert "tenants.status" not in where
@@ -288,7 +304,7 @@ def test_the_billable_tenant_listing_is_not_filtered_by_status(
 def test_the_dunning_sweep_only_looks_at_active_tenants(store: PostgresBillingStore) -> None:
     """Re-suspending a suspended tenant would be a second log line, a second metric and a
     second alert about one event."""
-    sql = sql_for(lambda: store.tenants_in_expired_dunning(now=NOW))
+    sql = sql_for(lambda: store.fleet_tenants_in_expired_dunning(now=NOW))
     assert "tenants.dunning_until is not null" in sql
     assert "tenants.dunning_until <= " in sql
     assert "tenants.status = " in sql
