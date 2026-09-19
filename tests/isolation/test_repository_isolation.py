@@ -432,37 +432,117 @@ def test_every_adapter_over_a_session_factory_is_swept() -> None:
     )
 
 
-def test_the_control_planes_enumeration_is_not_reachable_from_the_api() -> None:
+#: What each module under ``leadquali.api`` may call on the control-plane store, beyond
+#: :data:`_ALWAYS_PERMITTED`. Opt-in **by module filename**, so a module added tomorrow is
+#: scanned under the default and cannot inherit an exemption by sitting in the same package.
+#:
+#: There is exactly one entry, and the reason it exists is that #32 wrote this rule for the
+#: *tenant-facing* surface while #36 added a *control plane*. Those are different things.
+#: ``docs/tenant-isolation.md`` phrases the claim as "must never be reachable from an
+#: authenticated **tenant** context", and a staff session is not a tenant context: the admin
+#: is signed into by a member of staff who is global by design, and its tenant picker *is*
+#: ``list_tenants``. Forbidding it there would mean hardcoding slugs or inventing a second
+#: enumeration that returns less — and the admin already renders neither the config nor the
+#: secret reference, which ``tests/unit/test_api_admin.py`` asserts directly.
+#:
+#: The exemption is per method, not per module, which is the part that keeps it a rule. The
+#: admin still may not reach ``add_key``, ``revoke_key``, ``list_keys``, ``expire_key``,
+#: ``create_tenant`` or ``set_status`` — a web page has no business minting or revoking a
+#: customer's credentials, and #36's own scope says so.
+_CONTROL_PLANE_ACCESS: Final[Mapping[str, Mapping[str, str]]] = {
+    "admin.py": {
+        "list_tenants": (
+            "the staff console's tenant picker. Every screen begins by choosing a "
+            "customer, and a control plane that cannot enumerate its customers is not one. "
+            "Staff are global by design; this is not reachable from a tenant context."
+        ),
+        "get_tenant": (
+            "the rubric editor reads the tenant it is about to edit, by the slug already "
+            "in the path. Scoped to one tenant like every other read in this file."
+        ),
+    },
+}
+
+#: What every module may call, exempt or not: the rate limiter's allowance lookup, which is
+#: scoped to the tenant that authenticated, and the two constructors.
+_ALWAYS_PERMITTED: Final[frozenset[str]] = frozenset({"rate_limit_for", "from_url", "from_env"})
+
+
+def _api_modules() -> list[Path]:
+    """Every module under ``leadquali.api``, discovered rather than listed."""
+    return sorted(Path(api.__file__).parent.rglob("*.py"))
+
+
+def test_every_control_plane_exemption_names_a_module_and_a_method_that_exist() -> None:
+    """An exemption for something that moved is a hole nobody can see.
+
+    Same shape as :func:`test_no_exclusion_outlives_the_class_it_excuses`, and here for the
+    same reason: the entry above is the only thing standing between a control-plane method
+    and the rule, so it has to keep naming something real and keep saying why.
+    """
+    modules = {path.name for path in _api_modules()}
+    surface = set(_public_methods(PostgresTenantAdminStore))
+    for module, permitted in _CONTROL_PLANE_ACCESS.items():
+        assert module in modules, f"{module} is exempted and no longer exists; remove it"
+        for method, reason in permitted.items():
+            assert method in surface, f"{module} is exempted for {method}, which is gone"
+            assert len(reason) >= _MINIMUM_REASON_CHARS, f"{module}.{method}: give a reason"
+
+
+def test_the_tenant_facing_surface_is_the_one_being_scanned() -> None:
+    """The exemption must not be able to grow until it covers the thing under test.
+
+    ``main.py`` serves ``POST /leads`` for an authenticated *tenant* and ``feedback.py``
+    serves a link from a rep's inbox. Both are the reason this rule exists, so neither may
+    appear in the exemption table — and the assertion is by name, because "the list is
+    short" is not a property anything checks.
+    """
+    for module in ("main.py", "feedback.py"):
+        assert module not in _CONTROL_PLANE_ACCESS, (
+            f"{module} is tenant-facing and cannot be exempted from the control-plane rule"
+        )
+
+
+def test_the_control_planes_enumeration_is_not_reachable_from_a_tenant_context() -> None:
     """``list_tenants`` returns every tenant's config and signing-secret reference.
 
     It is on the allowlist because an operator running ``tenantctl`` needs it and a tenant
-    filter would make it meaningless. The exemption is only safe while nothing serving a
-    request can call it — and ``api/main.py`` *does* construct a
+    filter would make it meaningless. The exemption is only safe while nothing **serving a
+    tenant's request** can call it — and ``api/main.py`` *does* construct a
     :class:`~leadquali.adapters.store_tenants.PostgresTenantAdminStore`, for the rate
     limiter's allowance lookup, so the class is genuinely in reach of the request path.
 
+    The rule was written before #36 and said "no module under ``leadquali.api``". That was
+    right for every module that existed at the time and wrong the moment a control plane
+    arrived: the admin is signed into by staff, who are global by design, and listing
+    tenants is its front page. So the scope is now per module and per method
+    (:data:`_CONTROL_PLANE_ACCESS`), the default is still "forbidden", and a new module is
+    scanned under the default rather than inheriting anything.
+
     docs/tenant-isolation.md opens by promising every claim in it has a test behind it, so
-    this is that test: no module under ``leadquali.api`` names any method of the admin store
-    except the one the rate limiter needs. Static, because the alternative is a runtime
-    check that only fires on the code path that already went wrong.
+    this is that test. Static, because the alternative is a runtime check that only fires on
+    the code path that already went wrong.
     """
-    surface = set(_public_methods(PostgresTenantAdminStore)) - {"from_url", "from_env"}
-    permitted = {"rate_limit_for"}
-    forbidden = surface - permitted
-    assert "list_tenants" in forbidden, surface
+    surface = set(_public_methods(PostgresTenantAdminStore)) - _ALWAYS_PERMITTED
+    assert "list_tenants" in surface, surface
 
     offenders: list[str] = []
-    for path in sorted(Path(api.__file__).parent.rglob("*.py")):
+    for path in _api_modules():
+        permitted = _ALWAYS_PERMITTED | set(_CONTROL_PLANE_ACCESS.get(path.name, {}))
+        forbidden = surface - permitted
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in forbidden:
                 offenders.append(f"{path.name}:{node.lineno}: .{node.attr}()")
     assert not offenders, (
-        "the request path reaches a control-plane method it has no business calling:\n"
-        + "\n".join(offenders)
-        + f"\nOnly {sorted(permitted)} is permitted there. list_tenants returns every "
-        "tenant's icp_config and hmac_secret_ref, so anything that can reach it from an "
-        "authenticated request is a cross-tenant read."
+        "a module under leadquali.api reaches a control-plane method it has no business "
+        "calling:\n"
+        + "\n".join(sorted(offenders))
+        + "\nlist_tenants returns every tenant's icp_config and hmac_secret_ref, so "
+        "anything that can reach it while serving a tenant's request is a cross-tenant "
+        "read. If the caller is a control plane rather than a tenant surface, add the "
+        "module and the specific method to _CONTROL_PLANE_ACCESS with the reason — not "
+        "the whole module, and not the whole class."
     )
 
 

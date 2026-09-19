@@ -18,7 +18,7 @@
       <option value="">choose…</option>
       {% for tenant in tenants %}
       <option value="{{ tenant.slug }}"
-        {% if criteria and criteria.tenant_slug == tenant.slug %}selected{% endif %}>
+        {% if slug == tenant.slug %}selected{% endif %}>
         {{ tenant.slug }}</option>
       {% endfor %}
     </select></label>
@@ -57,7 +57,7 @@
     <td>{{ row.industry or '' }}</td>
     <td><code class="muted">{{ (row.contact_email_hash or '')[:12] }}</code></td>
     <td>{{ row.verdict.value if row.verdict else '' }}</td>
-    <td><a href="{{ admin_prefix }}/leads/{{ row.lead_id }}?tenant={{ criteria.tenant_slug }}"
+    <td><a href="{{ admin_prefix }}/leads/{{ row.lead_id }}?tenant={{ slug }}"
         >open</a></td>
   </tr>
   {% endfor %}

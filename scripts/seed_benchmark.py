@@ -293,7 +293,7 @@ def measure(sessions: sessionmaker[Session], slug: str) -> int:
     print("\n=== first page of the lead browser ===")
     started = time.monotonic()
     page = store.browse_leads(
-        criteria=LeadFilter(tenant_slug=slug, tier=Tier.HOT), cursor=None, limit=50
+        tenant_slug=slug, criteria=LeadFilter(tier=Tier.HOT), cursor=None, limit=50
     )
     print(f"{len(page.rows)} rows in {(time.monotonic() - started) * 1000:.0f} ms")
 
@@ -303,12 +303,12 @@ def measure(sessions: sessionmaker[Session], slug: str) -> int:
         if cursor is None:
             break
         page = store.browse_leads(
-            criteria=LeadFilter(tenant_slug=slug, tier=Tier.HOT), cursor=cursor, limit=50
+            tenant_slug=slug, criteria=LeadFilter(tier=Tier.HOT), cursor=cursor, limit=50
         )
         cursor = page.next_cursor
     started = time.monotonic()
     store.browse_leads(
-        criteria=LeadFilter(tenant_slug=slug, tier=Tier.HOT), cursor=cursor, limit=50
+        tenant_slug=slug, criteria=LeadFilter(tier=Tier.HOT), cursor=cursor, limit=50
     )
     print(f"page ~21 in {(time.monotonic() - started) * 1000:.0f} ms")
     return failures

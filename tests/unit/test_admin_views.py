@@ -95,7 +95,6 @@ def test_a_decoded_cursor_carries_a_row_id_the_adapter_can_use() -> None:
 
 def test_a_filter_accepts_a_sensible_range() -> None:
     criteria = LeadFilter(
-        tenant_slug="acme",
         tier=Tier.HOT,
         start=dt.date(2026, 9, 1),
         end=dt.date(2026, 9, 30),
@@ -109,12 +108,12 @@ def test_a_filter_accepts_a_sensible_range() -> None:
 def test_an_inverted_date_range_is_refused_rather_than_returning_nothing() -> None:
     """An operator who has typed the dates the wrong way round wants to be told."""
     with pytest.raises(ValueError, match="ends before it starts"):
-        LeadFilter(tenant_slug="acme", start=dt.date(2026, 9, 30), end=dt.date(2026, 9, 1))
+        LeadFilter(start=dt.date(2026, 9, 30), end=dt.date(2026, 9, 1))
 
 
 def test_an_inverted_confidence_range_is_refused() -> None:
     with pytest.raises(ValueError, match="ends before it starts"):
-        LeadFilter(tenant_slug="acme", min_confidence=Decimal("0.9"), max_confidence=Decimal("0.1"))
+        LeadFilter(min_confidence=Decimal("0.9"), max_confidence=Decimal("0.1"))
 
 
 # --------------------------------------------------------------------------- grouping
