@@ -26,6 +26,9 @@ dev = [
     # `anthropic` SDK depends on, so it arrives transitively and contract tests import
     # it directly to mock transports. Both exist; neither is a typo for the other.
     "httpx",
+    # The CI workflow is asserted against by tests/unit/test_ci_workflow.py.
+    "pyyaml",
+    "types-PyYAML",
 ]
 
 [build-system]
