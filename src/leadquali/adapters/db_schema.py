@@ -72,6 +72,7 @@ __all__ = [
     "ESCALATION_REASONS",
     "LEAD_STATUSES",
     "ROUTING_ACTIONS",
+    "STRIPE_EVENT_STATUSES",
     "TENANT_SLUG_SQL_PATTERN",
     "TENANT_STATUSES",
     "Assessment",
@@ -80,10 +81,12 @@ __all__ = [
     "GoldenPromotion",
     "Lead",
     "RoutingEvent",
+    "StripeEventRow",
     "Tenant",
     "TenantApiKey",
     "TenantConfigVersion",
     "UsageDaily",
+    "UsageReportRecord",
     "metadata",
 ]
 
@@ -134,6 +137,11 @@ TENANT_STATUSES: tuple[str, ...] = ("active", "suspended", "disabled")
 """Mirrors ``leadquali.api.signing.TENANT_STATUSES``. Only ``active`` may ingest; the
 difference between ``suspended`` (temporary, e.g. non-payment) and ``disabled`` (gone) is
 policy rather than mechanism, and the ingest path treats them the same."""
+
+STRIPE_EVENT_STATUSES: tuple[str, ...] = ("pending", "processed", "failed")
+"""Mirrors ``leadquali.app.billing.EventStatus``. ``failed`` is a terminal state that an
+operator has to clear: an event out of attempts is never retried automatically, because
+retrying something that has failed five times hides it rather than fixing it."""
 
 TENANT_SLUG_SQL_PATTERN: str = "^[a-z0-9][a-z0-9_-]{0,62}$"
 """``leadquali.domain.tenant_config.TENANT_ID_PATTERN``, restated as a SQL literal.
@@ -261,6 +269,20 @@ class Tenant(Base):
     quota_alert_fraction: Mapped[decimal.Decimal] = mapped_column(
         Numeric(3, 2), nullable=False, server_default=text(DEFAULT_QUOTA_ALERT_FRACTION)
     )
+    # The link to Stripe (#35). Both are NULL until a tenant is put on a plan, which is
+    # what distinguishes "not billed" from "billed and not paying", and both are UNIQUE:
+    # two tenants sharing a Stripe customer would cross-bill one of them for the other's
+    # leads, and the database is the only place that can make that impossible. A unique
+    # constraint on a nullable column is exactly right here — Postgres treats NULLs as
+    # distinct, so any number of tenants may have no customer.
+    stripe_customer_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # When a failed payment's grace period runs out. NULL means nothing is owed. The tenant
+    # stays `active` for the whole window — a card that expired on Friday must not stop a
+    # customer's leads on Friday — and a scheduled sweep suspends it once this passes.
+    dunning_until: Mapped[dt.datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[dt.datetime] = _created_at()
     # Touched by every admin write. "When did this tenant's rubric last change?" is the
     # first question after a routing surprise, and without this column the only answer is
@@ -277,6 +299,11 @@ class Tenant(Base):
         CheckConstraint(
             "rate_limit_per_minute > 0 AND rate_limit_burst > 0", name="rate_limits_are_positive"
         ),
+        # See the column comments: one Stripe customer, one tenant. Enforced here because
+        # a cross-billed invoice is not something an application-level check can be
+        # trusted with — it has to be impossible, not merely unlikely.
+        UniqueConstraint("stripe_customer_id", name="uq_tenants_stripe_customer_id"),
+        UniqueConstraint("stripe_subscription_id", name="uq_tenants_stripe_subscription_id"),
         # A quota of zero would mean "this customer may send no leads", which is not a
         # plan — it is a suspension, and there is a status column for that.
         CheckConstraint(
@@ -682,6 +709,124 @@ class Feedback(Base):
         # AND created_at >= now() - interval '1 month'.
         Index("ix_feedback_tenant_id_verdict_created_at", "tenant_id", "verdict", "created_at"),
         CheckConstraint("verdict IN ('good', 'bad', 'unsure')", name="verdict_known"),
+    )
+
+
+class StripeEventRow(Base):
+    """One webhook Stripe delivered to us, verified, stored, and applied later (#35).
+
+    Named ``...Row`` rather than ``StripeEvent`` because
+    :class:`leadquali.app.billing.StripeEvent` already owns the plain name — it is the
+    value type the service works in, and ``adapters/store_billing.py`` imports both.
+
+    **The primary key is Stripe's own ``evt_...``, and that is the whole idempotency
+    story.** Stripe retries a delivery it did not get a 200 for, so a retried event arrives
+    carrying the same id; the route's insert is ``ON CONFLICT (event_id) DO NOTHING``, and
+    a conflict means "we already hold this, do nothing else" — including when the copy we
+    hold has not been applied yet, which is precisely when a retry is most likely, because
+    a still-pending row means we were slow.
+
+    **``payload`` is stored verbatim.** It is the evidence of what Stripe actually said,
+    and the fields this build does not model today are exactly the ones an incident will
+    want tomorrow.
+
+    **``tenant_id`` is nullable, and it is the one deliberate exception to invariant 4.**
+    A webhook arrives before we know who it is about: the event names a Stripe customer,
+    and resolving that to a tenant is a database read the verifying route does not do.
+    Refusing to store an event we cannot attribute would mean discarding the only record
+    that it arrived. So the column is filled in by the handler once the customer resolves,
+    it is ``ON DELETE SET NULL`` so that deleting a tenant does not destroy the billing
+    history, and **every read that is about a tenant filters on it**. The exception is
+    written here, in :mod:`leadquali.app.billing` and in the migration, because an
+    unexplained exception to an invariant is how the invariant dies.
+    """
+
+    __tablename__ = "stripe_events"
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    received_at: Mapped[dt.datetime] = _created_at()
+    processed_at: Mapped[dt.datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'pending'")
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # An exception class and one short line. Never a traceback and never a payload dump:
+    # this column is queried by an operator and its contents reach CloudWatch, and a
+    # billing identifier in a log is the same mistake as an email address (invariant 5).
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(_sql_in("status", STRIPE_EVENT_STATUSES), name="status_known"),
+        CheckConstraint("attempts >= 0", name="attempts_is_non_negative"),
+        # The drain's only query: pending rows, oldest first. Partial, because the whole
+        # point of the index is to stay the size of the backlog rather than the size of
+        # every webhook we have ever received — which grows forever and is never scanned.
+        Index(
+            "ix_stripe_events_pending",
+            "received_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        # "What has this tenant's billing done lately?" — the read that must filter on
+        # tenant_id, and the reason the nullable column above is still indexed.
+        Index("ix_stripe_events_tenant_id_received_at", "tenant_id", "received_at"),
+    )
+
+
+class UsageReportRecord(Base):
+    """One tenant-day of usage that has been reported to Stripe (#35).
+
+    The table exists for exactly one reason: **double-reporting overbills a customer, and
+    that is worse than under-reporting.** The primary key is the natural key
+    ``(tenant_id, usage_date)``, so a day that has been reported cannot be reported twice
+    however many times the scheduled job runs, however it is retried, and whichever of
+    several containers runs it.
+
+    It is the *durable* half of a two-part guarantee. The other half is the deterministic
+    ``external_id`` sent to Stripe as a meter event identifier, which Stripe deduplicates
+    "within a rolling period of at least 24 hours" — a backstop against a job that ran
+    twice in an hour, not a ledger. See
+    :data:`leadquali.app.billing.STRIPE_IDENTIFIER_DEDUPE_NOTE`.
+
+    ``ON DELETE RESTRICT`` to ``tenants``, unlike the derived ``usage_daily`` next to it.
+    Nothing here can be recomputed: it is a record of something we told a payment processor
+    about a customer's money, and a tenant row deleted out from under it would let a
+    re-created tenant report the same days again. #37's purge deletes a tenant's leads
+    first and must delete these deliberately too, which is the point — it should be a
+    decision, not a cascade.
+    """
+
+    __tablename__ = "usage_reports"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="RESTRICT"), primary_key=True
+    )
+    usage_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    reported_at: Mapped[dt.datetime] = _created_at()
+    # `uuid5(USAGE_ID_NAMESPACE, "<tenant>:<date>")`. Stored rather than recomputed so that
+    # an operator reconciling an invoice can match a Stripe meter event to a row here
+    # without running Python, and so that a change to the derivation is visible as a
+    # difference between old rows and new ones rather than silently rewriting history.
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # `leads_billable` from the usage_daily rollup: distinct leads with at least one
+    # assessment attempt that cost input tokens. Never `leads_assessed`, which counts a
+    # redelivered lead once per attempt, and never `leads_ingested`, which includes the
+    # spam we filtered and do not charge for.
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        # A second, cheap guard on the same fact the primary key states, and the one that
+        # would catch a bug in the derivation rather than a bug at the call site: two days
+        # deriving the same identifier would mean Stripe deduplicating a day we meant to
+        # bill.
+        UniqueConstraint("external_id", name="uq_usage_reports_external_id"),
+        CheckConstraint("quantity >= 0", name="quantity_is_non_negative"),
     )
 
 

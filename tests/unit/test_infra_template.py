@@ -219,3 +219,117 @@ def test_the_ingest_function_may_read_every_tenants_signing_secret(
     assert "/tenant/" in str(resource)
     assert "${Stage}" in str(resource), "the grant must not cross environments"
     assert "secretsmanager:*" not in str(granted[0]["Action"])
+
+
+# ----------------------------------------------------------------------- billing (#35)
+
+
+BILLING_FUNCTIONS = (
+    "BillingApiFunction",
+    "BillingEventProcessorFunction",
+    "UsageReportFunction",
+    "DunningSweepFunction",
+)
+
+
+@pytest.mark.parametrize("name", BILLING_FUNCTIONS)
+def test_every_billing_function_is_conditional(template: dict[str, Any], name: str) -> None:
+    """A stack that is not billing anybody should not carry three scheduled functions
+    failing every minute on an empty API key."""
+    assert _resources(template)[name]["Condition"] == "BillingEnabled"
+
+
+def test_the_billing_condition_is_not_keyed_on_a_secret(template: dict[str, Any]) -> None:
+    """Every secret parameter here is a required ARN with no default — that is what stops a
+    deploy proceeding on a placeholder. So the switch has to be something that legitimately
+    defaults to empty, and "there is no plan yet" is the honest meaning of "not billing"."""
+    condition = template["Conditions"]["BillingEnabled"]
+    assert "StripePriceId" in str(condition)
+    assert "SecretArn" not in str(condition)
+
+
+def test_the_webhook_route_is_the_path_the_stripe_endpoint_is_configured_with(
+    template: dict[str, Any],
+) -> None:
+    """Stripe posts to a URL somebody typed into a dashboard. If this literal and the
+    route's constant drift apart, every delivery 404s and the only symptom is an invoice
+    that never changes."""
+    from leadquali.api.webhooks import PORTAL_PATH, WEBHOOK_PATH
+
+    events = _resources(template)["BillingApiFunction"]["Properties"]["Events"]
+    assert events["StripeWebhook"]["Properties"]["Path"] == WEBHOOK_PATH
+    assert events["StripeWebhook"]["Properties"]["Method"] == "post"
+    assert events["BillingPortal"]["Properties"]["Path"] == PORTAL_PATH
+
+
+def test_the_ingest_function_holds_no_stripe_secret(template: dict[str, Any]) -> None:
+    """The reason billing is a separate function at all. The Stripe API key and the whsec_
+    must not reach the function that serves a customer's web form."""
+    env = _resources(template)["IngestFunction"]["Properties"]["Environment"]["Variables"]
+    assert not [key for key in env if key.startswith("STRIPE_")]
+
+
+def test_the_billing_functions_hold_no_ingest_or_anthropic_secret(
+    template: dict[str, Any],
+) -> None:
+    """And the other direction: billing has no business reading the ingest credential map
+    or the model key, and a function that cannot read them cannot leak them."""
+    for name in BILLING_FUNCTIONS:
+        env = _resources(template)[name]["Properties"]["Environment"]["Variables"]
+        assert "INGEST_CREDENTIALS_SECRET_ARN" not in env, name
+        assert "ANTHROPIC_API_KEY_SECRET_ARN" not in env, name
+
+
+def test_only_the_billing_api_may_read_a_tenants_signing_secret(
+    template: dict[str, Any],
+) -> None:
+    """The portal endpoint authenticates a tenant with the same signed request ingest uses,
+    so it needs the per-tenant HMAC secrets. The three scheduled jobs authenticate nobody
+    and must not have them."""
+
+    def statements(name: str) -> str:
+        return str(_resources(template)[name]["Properties"]["Policies"])
+
+    assert "tenant/*" in statements("BillingApiFunction")
+    for name in ("BillingEventProcessorFunction", "UsageReportFunction", "DunningSweepFunction"):
+        assert "tenant/*" not in statements(name), name
+
+
+@pytest.mark.parametrize(
+    "name", ("BillingEventProcessorFunction", "UsageReportFunction", "DunningSweepFunction")
+)
+def test_every_scheduled_billing_job_runs_one_at_a_time(
+    template: dict[str, Any], name: str
+) -> None:
+    """The usage job is the one that matters: two concurrent runs would both read "not yet
+    reported" for the same tenant-day before either wrote the row. The unique constraint
+    and Stripe's identifier would both catch it, and the cheapest place to prevent
+    double-billing is still by not running the job twice."""
+    assert _resources(template)[name]["Properties"]["ReservedConcurrentExecutions"] == 1
+
+
+def test_the_event_drain_finishes_inside_its_own_schedule(template: dict[str, Any]) -> None:
+    """Two overlapping drains would be safe — every handler is idempotent on the event id —
+    but an overlap is a backlog, and a backlog should show up as a duration rather than be
+    absorbed silently."""
+    timeout = _resources(template)["BillingEventProcessorFunction"]["Properties"]["Timeout"]
+    assert timeout < 60
+
+
+def test_the_usage_report_runs_after_midnight_utc(template: dict[str, Any]) -> None:
+    """It bills yesterday, so it has to run once yesterday is over — and late enough that a
+    lead assessed at 23:59 has been written and rolled up."""
+    default = template["Parameters"]["UsageReportScheduleExpression"]["Default"]
+    assert default.startswith("cron(")
+    minute, hour = default[len("cron(") :].split(" ")[:2]
+    assert 0 < int(hour) < 6, default
+    assert 0 <= int(minute) < 60
+
+
+def test_the_webhook_endpoint_url_is_an_output(template: dict[str, Any]) -> None:
+    """Stripe's endpoint has to be created before its whsec_ exists, so the URL is the
+    thing an operator needs out of the stack first (#34's runbook)."""
+    outputs = template["Outputs"]
+    assert "StripeWebhookUrl" in outputs
+    assert outputs["StripeWebhookUrl"]["Condition"] == "BillingEnabled"
+    assert "/webhooks/stripe" in str(outputs["StripeWebhookUrl"]["Value"])

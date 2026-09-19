@@ -1,0 +1,21 @@
+{
+  "id": "evt_invoice_payment_succeeded",
+  "object": "event",
+  "api_version": "2026-08-26.dahlia",
+  "created": 1788000000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "type": "invoice.payment_succeeded",
+  "data": {
+    "object": {
+      "id": "in_acme",
+      "object": "invoice",
+      "customer": "cus_acme",
+      "status": "paid",
+      "attempt_count": 1,
+      "currency": "usd",
+      "amount_due": 29900,
+      "amount_paid": 29900
+    }
+  }
+}
