@@ -118,6 +118,95 @@ def test_the_offline_half_of_the_suite_is_substantial() -> None:
     assert len(offline) >= 6, sorted(modules)
 
 
+def _collapse_not(terms: list[str]) -> list[str]:
+    """Join ``not`` to the term it negates, so a bare term is visible as selection."""
+    collapsed: list[str] = []
+    index = 0
+    while index < len(terms):
+        if terms[index] == "not" and index + 1 < len(terms):
+            collapsed.append(f"not {terms[index + 1]}")
+            index += 2
+        else:
+            collapsed.append(terms[index])
+            index += 1
+    return collapsed
+
+
+def narrowing_arguments(arguments: list[str]) -> list[str]:
+    """The arguments in a ``pytest`` invocation that could drop this directory from a run.
+
+    A path argument, ``--ignore`` or ``-k`` can, and those are refused outright.
+
+    ``-m`` is the one that needs thought, and getting it wrong in either direction is a
+    real cost. Every module in this package is unmarked except the integration one, so a
+    purely *negative* expression — ``not live_api and not integration`` — cannot exclude
+    any of them, and it is the only way CI can skip the tests that need an Anthropic key or
+    a database. Refusing it would force CI to either spend money or go red. A *positive*
+    expression like ``-m unit`` is different: it selects, so every unmarked test in this
+    directory silently disappears. That is the case this refuses.
+
+    The earlier version of this check refused every ``-m``, which made it fire on #5's
+    perfectly correct workflow the moment that branch landed. A guard that cries wolf at
+    the right fix gets deleted by the next person, which would have cost the real
+    protection below.
+    """
+    narrowing: list[str] = []
+    skip_next = False
+    for index, argument in enumerate(arguments):
+        if skip_next:
+            skip_next = False
+            continue
+        if (
+            argument.startswith(("--ignore", "tests/"))
+            or argument == "-k"
+            or argument.startswith("-k")
+        ):
+            narrowing.append(argument)
+            continue
+        if argument == "-m" or argument.startswith("-m"):
+            if argument == "-m":
+                expression = arguments[index + 1] if index + 1 < len(arguments) else ""
+                skip_next = True
+            else:
+                expression = argument[2:]
+            terms = [
+                term
+                for term in expression.replace("(", " ").replace(")", " ").split()
+                if term not in {"and", "or"}
+            ]
+            if any(not term.startswith("not ") for term in _collapse_not(terms)):
+                narrowing.append(f"-m {expression}")
+    return narrowing
+
+
+@pytest.mark.parametrize(
+    ("invocation", "refused"),
+    [
+        ("tests/unit tests/contract", True),
+        ("--ignore=tests/isolation", True),
+        ('-k "not isolation"', True),
+        ('-m "unit"', True),
+        ('-m "integration or isolation"', True),
+        ('-m "not live_api and not integration"', False),
+        ('-m "not integration"', False),
+        ("-q --strict-markers", False),
+        ("", False),
+    ],
+)
+def test_the_narrowing_rule_refuses_selection_and_allows_exclusion(
+    invocation: str, refused: bool
+) -> None:
+    """The rule this file's workflow scan rests on, tested rather than trusted.
+
+    Both directions matter. Missing a narrowing argument silently drops this whole suite
+    out of CI, which is the acceptance criterion. Refusing a legitimate one is how the
+    check gets deleted by somebody whose correct workflow it rejected -- which is what
+    happened the moment #5 landed, and why the rule now distinguishes selection from
+    exclusion instead of refusing every ``-m``.
+    """
+    assert bool(narrowing_arguments(shlex.split(invocation))) is refused
+
+
 def test_no_workflow_runs_pytest_in_a_way_that_would_skip_this_directory() -> None:
     """Scan whatever CI configuration exists for a filtered ``pytest``.
 
@@ -135,12 +224,7 @@ def test_no_workflow_runs_pytest_in_a_way_that_would_skip_this_directory() -> No
                 if "pytest" not in stripped or stripped.startswith("#"):
                     continue
                 arguments = shlex.split(stripped[stripped.index("pytest") + len("pytest") :])
-                narrowing = [
-                    argument
-                    for argument in arguments
-                    if argument in {"-m", "-k"}
-                    or argument.startswith(("-m", "-k", "--ignore", "tests/"))
-                ]
+                narrowing = narrowing_arguments(arguments)
                 if narrowing:
                     offenders.append(f"{path.name}:{number}: pytest {' '.join(arguments)}")
     assert not offenders, (
