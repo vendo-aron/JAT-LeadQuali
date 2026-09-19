@@ -57,6 +57,7 @@ from tests.sqlcapture import CannedResult
 __all__ = [
     "ALLOWLIST",
     "DAY",
+    "EXCLUDED_REPOSITORIES",
     "FLEET_METHODS",
     "KEY_ID_A",
     "KEY_ID_B",
@@ -121,10 +122,17 @@ NOW: Final[dt.datetime] = dt.datetime(2026, 9, 3, 12, 0, tzinfo=dt.UTC)
 DAY: Final[dt.date] = dt.date(2026, 9, 3)
 SEPTEMBER: Final[BillingPeriod] = BillingPeriod.of_month(2026, 9)
 
-#: The parameter names that mean "this call is about one tenant". Two of them because the
-#: control plane addresses a tenant by its slug and the data plane by its port-level id;
-#: both become a tenant predicate in the statement that comes out the other end.
-TENANT_PARAMETERS: Final[tuple[str, ...]] = ("tenant_id", "slug")
+#: The parameter names that mean "this call is about one tenant", most specific first. Three
+#: of them because the control plane addresses a tenant by its slug and the data plane by its
+#: port-level id, and #36's admin queries spell the slug ``tenant_slug``.
+#:
+#: The bare ``slug`` entry carries an assumption worth naming: it holds only while ``slug``
+#: means *tenant* slug everywhere in the adapters. The moment something grows a slug of its
+#: own — a saved view, a config version, a golden-set name — a method taking it would be
+#: read as tenant-scoped and swept with the wrong argument. That shows up as a recipe whose
+#: cross-tenant call does not behave, not as a silent pass, but the cheaper fix is to rename
+#: the parameter or add it here explicitly.
+TENANT_PARAMETERS: Final[tuple[str, ...]] = ("tenant_id", "tenant_slug", "slug")
 
 
 class DictSecretResolver:
@@ -264,25 +272,44 @@ REPOSITORIES: Final[tuple[Repository, ...]] = (
 )
 
 
+#: Concrete adapter classes that take a ``sessionmaker`` and are deliberately *not* swept,
+#: each with the reason. Empty, and it should stay that way: a class that reaches the
+#: database on behalf of a tenant belongs in :data:`REPOSITORIES` with recipes, not here.
+#: ``test_every_adapter_over_a_session_factory_is_swept`` fails naming anything missing from
+#: both, which is how a whole repository class stops being able to go uncovered.
+EXCLUDED_REPOSITORIES: Final[Mapping[str, str]] = {}
+
+#: The two constructor exemptions, written out once. They are the only entries on
+#: :data:`ALLOWLIST` that repeat, and a reason short enough to repeat is a reason short
+#: enough to be a rubber stamp — so they say what makes the exemption safe rather than
+#: naming the category.
+_FROM_URL: Final[str] = (
+    "constructor: takes a database URL, builds a session factory and issues no statement"
+)
+_FROM_ENV: Final[str] = (
+    "constructor: reads DATABASE_URL through Settings and issues no statement of its own"
+)
+
+
 #: Public methods that legitimately take no tenant, each with the reason it is allowed to.
 #: Short by construction: anything that is not a constructor or a deliberate fleet-wide
 #: operator tool does not belong here, it belongs in :data:`RECIPES`.
 ALLOWLIST: Final[Mapping[type, Mapping[str, str]]] = {
     PostgresLeadStore: {
-        "from_url": "constructor: takes a database URL and issues no statement",
-        "from_env": "constructor: reads DATABASE_URL and issues no statement",
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
     },
     PostgresFeedbackStore: {
-        "from_url": "constructor",
-        "from_env": "constructor",
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
     },
     PostgresTenantConfigSource: {
-        "from_url": "constructor",
-        "from_env": "constructor",
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
     },
     PostgresTenantAdminStore: {
-        "from_url": "constructor",
-        "from_env": "constructor",
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
         "list_tenants": (
             "the control plane's own enumeration. It answers 'who are our customers?' for "
             "an operator running tenantctl, it is on no request path, and a tenant filter "
@@ -291,8 +318,8 @@ ALLOWLIST: Final[Mapping[type, Mapping[str, str]]] = {
         ),
     },
     PostgresMeteringStore: {
-        "from_url": "constructor",
-        "from_env": "constructor",
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
     },
     PostgresIngestCredentials: {},
 }
