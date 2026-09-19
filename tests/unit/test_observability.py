@@ -241,6 +241,52 @@ def test_redaction_replaces_addresses_and_keeps_the_rest() -> None:
     assert redact_emails("no address here") == "no address here"
 
 
+@pytest.mark.parametrize(
+    "address",
+    [
+        "ada@example.com",
+        "ada.lovelace+tag@sub.example.co.uk",
+        # An accented domain. The ASCII-only pattern this replaced matched **none** of the
+        # four below — not partially, not badly, but not at all — so a German or Russian
+        # lead's address went straight through the formatter's last-resort net. #37 widened
+        # it, because the same function is what redacts `assessments.reasoning` when a
+        # lead's payload is purged, and an erasure that silently misses a non-ASCII address
+        # is a contractual failure rather than a cosmetic one.
+        "anna@müller-logistik.de",
+        # An all-Cyrillic domain and TLD.
+        "olga@почта.рф",
+        # A full-width dot, which a CJK or mobile keyboard produces and a browser resolves.
+        "priya@northstar\uff0ecom",  # the point of the case
+        "søren@blåbær.example.dk",
+    ],
+)
+def test_an_address_in_any_alphabet_is_redacted(address: str) -> None:
+    """One definition of "what an address looks like", and it knows about the alphabet."""
+    redacted = redact_emails(f"the bounce quoted {address} verbatim")
+
+    assert address not in redacted
+    assert EMAIL_REDACTION in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "no address here",
+        "version 1.2.3 released",
+        "tenant_id=acme lead_id=3a5c9e10",
+        "see file_a.py and module.submodule",
+        "the ratio was 4.5 to 1",
+    ],
+)
+def test_ordinary_log_text_is_not_mangled_by_the_widened_pattern(text: str) -> None:
+    """Over-matching is the safe direction, and it still has to be bounded.
+
+    A redactor that replaced every dotted token would make the logs unreadable and would
+    hide the identifiers an operator navigates by — which is its own outage, at 3am.
+    """
+    assert redact_emails(text) == text
+
+
 def test_an_address_in_a_log_message_never_reaches_the_line() -> None:
     buffer = configured()
 

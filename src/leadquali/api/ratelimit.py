@@ -39,6 +39,7 @@ from math import ceil
 from typing import Final, Protocol, runtime_checkable
 
 from leadquali.app.tenants import TenantRateLimit
+from leadquali.observability.logs import log_event
 
 LOGGER: Final = logging.getLogger(__name__)
 
@@ -217,9 +218,11 @@ class TenantRateLimiter:
             # Serve the last value we had, or the default, and re-stamp so the failing
             # source is retried in LIMIT_STALE_RETRY_SECONDS rather than on every single
             # request — otherwise a struggling database gets hammered by the whole fleet.
-            LOGGER.warning(
+            log_event(
+                LOGGER,
                 "ratelimit.limits_unavailable",
-                extra={"event": "ratelimit.limits_unavailable", "tenant_id": tenant_id},
+                level=logging.WARNING,
+                tenant_id=tenant_id,
             )
             served = cached[0] if cached is not None else self._default
             self._remember(

@@ -40,20 +40,24 @@ to remember; `tests/isolation/test_suite_is_collected.py` asserts that the direc
 inside `testpaths`, that nothing filters it back out, and that no workflow narrows its
 `pytest` command line.
 
-**178 of the suite's 204 tests run with no database** — 177 pass and one is skipped, the
+**204 of the suite's 241 tests run with no database** — 203 pass and one is skipped, the
 one covering the single method whose tenant check is a comparison in Python rather than a
 `WHERE` clause, and whose behaviour is asserted elsewhere in the same sweep. **The remaining
-26 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
+37 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
 per axis below, because a property asserted only by a test that skips is a property that is
 not asserted — see [The negative control](#the-negative-control).
 
+*(Counts updated by #37, which added `PostgresRetentionStore` — the only module in the
+codebase that issues a `DELETE` — to the sweep. Its eleven tenant-scoped methods are
+enumerated and checked like every other repository's.)*
+
 ### 1. Data isolation — every repository method
 
-`tests/isolation/test_repository_isolation.py` (78 tests, no database)
-`tests/isolation/test_repository_isolation_integration.py` (26 tests, PostgreSQL)
+`tests/isolation/test_repository_isolation.py` (104 tests, no database)
+`tests/isolation/test_repository_isolation_integration.py` (37 tests, PostgreSQL)
 
-Not a hand-written test per method. The sweep enumerates the six concrete repository classes
-by introspection and fails in three ways, none of which is a skip:
+Not a hand-written test per method. The sweep enumerates the seven concrete repository
+classes by introspection and fails in three ways, none of which is a skip:
 
 - a **new public method that names no tenant** fails the enumeration test by name, unless it
   is added to a short allowlist (constructors, and three deliberately fleet-wide operator
@@ -63,7 +67,7 @@ by introspection and fails in three ways, none of which is a skip:
   a generic harness produces a test that passes because the call errored;
 - a method **whose statement loses its tenant predicate** fails the SQL check.
 
-For each of the 26 swept methods the test builds the statement the method would execute,
+For each of the 33 swept methods the test builds the statement the method would execute,
 compiles it against the real `postgresql` dialect, and asserts two things: the SQL contains a
 tenant column being compared to a value (or, for an `INSERT`, writes the tenant column), and
 the value bound to it is the tenant the caller named. A third test calls each method as
@@ -240,7 +244,8 @@ A decision rather than a test. See [the next section](#row-level-security-the-de
 Four methods do not carry a tenant predicate. Each is enforced as an exception by the sweep —
 the tests fail if one of them quietly changes shape — rather than merely tolerated.
 
-**`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`.** Reconciling our
+**`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`,
+`fleet_retention_policies`.** Reconciling our
 usage against Anthropic's invoice, and allocating shared infrastructure cost, are questions
 about the whole workspace and cannot be answered one tenant at a time. Three rules contain
 them: the name carries `fleet_` so it is visible at every call site; the method takes no
@@ -256,6 +261,11 @@ a two-tenant fleet the other tenant's billable count is one subtraction away fro
 is acceptable only because the margin report is an internal operator tool run by us and is
 never rendered to a customer. **If that report is ever put in front of a customer, this field
 has to go.**
+
+`fleet_retention_policies` (#37) is the fourth and is the same argument from a different
+direction: the nightly purge has to know which tenants to run for, and a version of it that
+took a tenant would simply never run for the tenant somebody forgot to list. It returns each
+tenant's slug and its two retention windows — a worklist, not any customer's data.
 
 **`PostgresTenantAdminStore.list_tenants`.** The control plane's own enumeration, for an
 operator running `tenantctl`. It is on no request path and must never be reachable from an
@@ -331,7 +341,8 @@ change was reverted. It was **not** committed.
                      RoutingEvent.dispatched_at.is_not(None),
 ```
 
-**The rest of the test suite stayed completely green: 1989 passed, 197 skipped.** That is the
+**The rest of the test suite stayed completely green: 1989 passed, 197 skipped** (the counts
+at the commit that added this section). That is the
 point of this exercise. Removing a cross-tenant filter from the code that runs in production
 was, until this suite existed, invisible.
 
@@ -353,6 +364,9 @@ anyway (CLAUDE.md invariant 4).
 
 1 failed, 176 passed, 27 skipped
 ```
+
+*(That run predates #37's additions to the sweep; the mechanism is unchanged and the failure
+message is what it still prints.)*
 
 A second, subtler mutation was run and reverted the same way: the predicate was left in place
 but made vacuous, `RoutingEvent.tenant_id == RoutingEvent.tenant_id`. A check that only looked
@@ -476,10 +490,10 @@ issue #29's per-rep identity work and a product decision rather than an infrastr
 ## Reproducing this
 
 ```bash
-pytest tests/isolation                 # 177 passed, 27 skipped, no database needed
+pytest tests/isolation                 # 203 passed, 38 skipped, no database needed
 docker compose up -d                   # see docs/local-database.md
 export DATABASE_URL=...
-pytest tests/isolation -m integration   # the 26 that need PostgreSQL
+pytest tests/isolation -m integration   # the 37 that need PostgreSQL
 ```
 
 Without a database the `integration` tests skip with the reason printed; they never fail for

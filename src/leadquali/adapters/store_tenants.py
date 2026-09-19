@@ -531,10 +531,7 @@ class PostgresIngestCredentials:
                     .values(last_used_at=now)
                 )
         except Exception:  # see the docstring: recording use must never fail a lead
-            LOGGER.warning(
-                "ingest.last_used_not_recorded",
-                extra={"event": "ingest.last_used_not_recorded", "key_id": key_id},
-            )
+            log_event(LOGGER, "ingest.last_used_not_recorded", level=logging.WARNING, key_id=key_id)
 
     def __repr__(self) -> str:
         """Render the shape, never a secret."""
