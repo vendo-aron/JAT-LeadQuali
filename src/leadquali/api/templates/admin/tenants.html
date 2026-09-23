@@ -1,0 +1,25 @@
+{# The way in to everything else. No key material here: see docs/admin.md. #}
+{% extends "admin/base.html" %}
+{% block title %}Tenants — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Tenants</h1>
+<table>
+  <tr><th>Slug</th><th>Name</th><th>Status</th><th>Rubric last changed</th><th></th></tr>
+  {% for tenant in tenants %}
+  <tr>
+    <td><a href="{{ admin_prefix }}/tenants/{{ tenant.slug }}">{{ tenant.slug }}</a></td>
+    <td>{{ tenant.name }}</td>
+    <td>{{ tenant.status.value }}</td>
+    <td>{{ tenant.updated_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td>
+      <a href="{{ admin_prefix }}/tenants/{{ tenant.slug }}/config">Edit rubric</a> ·
+      <a href="{{ admin_prefix }}/tenants/{{ tenant.slug }}/config/history">History</a> ·
+      <a href="{{ admin_prefix }}/leads?tenant={{ tenant.slug }}">Leads</a>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">No tenants yet. Onboard one with
+      <code>python -m leadquali.tenantctl create</code>.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

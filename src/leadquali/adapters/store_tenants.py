@@ -48,6 +48,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from leadquali.adapters.db_schema import Tenant, TenantApiKey
+from leadquali.adapters.unit_of_work import session_scope
 from leadquali.app.api_keys import parse_api_key
 from leadquali.app.credentials import (
     AuthFailure,
@@ -153,6 +154,15 @@ class PostgresTenantAdminStore:
     invariant 4 is only worth anything if there is no code path where the tenant predicate
     is optional. A support tool that passed the wrong tenant gets "no such key", not
     somebody else's key.
+
+    Every statement resolves its session through
+    :func:`~leadquali.adapters.unit_of_work.session_scope` rather than opening one
+    directly. On its own that is identical to what it replaced — a transaction per call —
+    but inside a :meth:`~leadquali.adapters.unit_of_work.PostgresUnitOfWork.atomic` block
+    these statements join that transaction instead. #36's config editor needs
+    :meth:`update_config` and its ``tenant_config_versions`` row to commit together or not
+    at all, and the reads use the same helper so that a read inside such a block sees the
+    block's own uncommitted writes rather than the state before it.
     """
 
     def __init__(self, sessions: sessionmaker[Session]) -> None:
@@ -206,7 +216,7 @@ class PostgresTenantAdminStore:
             .returning(*_TENANT_COLUMNS)
         )
         try:
-            with self._sessions.begin() as session:
+            with session_scope(self._sessions) as session:
                 row = session.execute(statement).one()
         except IntegrityError as error:
             raise TenantAlreadyExistsError(f"tenant '{slug}' already exists") from error
@@ -215,14 +225,14 @@ class PostgresTenantAdminStore:
     def get_tenant(self, *, slug: str) -> TenantRecord | None:
         """Return one tenant, or ``None``."""
         statement = select(*_TENANT_COLUMNS).where(Tenant.slug == slug)
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             row = session.execute(statement).one_or_none()
         return None if row is None else _record_from_row(row)
 
     def list_tenants(self) -> Sequence[TenantRecord]:
         """Every tenant, oldest first."""
         statement = select(*_TENANT_COLUMNS).order_by(Tenant.created_at, Tenant.slug)
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             rows = session.execute(statement).all()
         return [_record_from_row(row) for row in rows]
 
@@ -245,7 +255,7 @@ class PostgresTenantAdminStore:
         statement = select(Tenant.rate_limit_per_minute, Tenant.rate_limit_burst).where(
             Tenant.slug == tenant_id
         )
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             row = session.execute(statement).one_or_none()
         if row is None:
             return None
@@ -262,7 +272,7 @@ class PostgresTenantAdminStore:
         from the slug in Python, so that issuing a key to a tenant that does not exist is a
         missing row rather than a foreign key violation against a plausible-looking UUID.
         """
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             tenant = session.execute(select(Tenant.id).where(Tenant.slug == slug)).one_or_none()
             if tenant is None:
                 raise UnknownTenantError(f"no tenant '{slug}'")
@@ -292,7 +302,7 @@ class PostgresTenantAdminStore:
             .where(Tenant.slug == slug)
             .order_by(TenantApiKey.created_at.desc())
         )
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             rows = session.execute(statement).all()
         return [_key_from_row(row) for row in rows]
 
@@ -307,7 +317,7 @@ class PostgresTenantAdminStore:
         the one that matters, and overwriting it would erase when the key actually stopped
         working — which is the only thing an incident review wants from this column.
         """
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             statement = (
                 update(TenantApiKey)
                 .where(
@@ -339,7 +349,7 @@ class PostgresTenantAdminStore:
             .values(**values, updated_at=func.now())
             .returning(*_TENANT_COLUMNS)
         )
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             row = session.execute(statement).one_or_none()
         if row is None:
             raise UnknownTenantError(f"no tenant '{slug}'")
@@ -355,7 +365,7 @@ class PostgresTenantAdminStore:
             .values(**values)
             .returning(*_KEY_COLUMNS)
         )
-        with self._sessions.begin() as session:
+        with session_scope(self._sessions) as session:
             row = session.execute(statement).one_or_none()
         if row is None:
             raise UnknownApiKeyError(f"tenant '{slug}' has no key {key_id!r}")

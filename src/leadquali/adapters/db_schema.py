@@ -77,10 +77,12 @@ __all__ = [
     "Assessment",
     "Base",
     "Feedback",
+    "GoldenPromotion",
     "Lead",
     "RoutingEvent",
     "Tenant",
     "TenantApiKey",
+    "TenantConfigVersion",
     "UsageDaily",
     "metadata",
 ]
@@ -680,4 +682,135 @@ class Feedback(Base):
         # AND created_at >= now() - interval '1 month'.
         Index("ix_feedback_tenant_id_verdict_created_at", "tenant_id", "verdict", "created_at"),
         CheckConstraint("verdict IN ('good', 'bad', 'unsure')", name="verdict_known"),
+    )
+
+
+class TenantConfigVersion(Base):
+    """One edit to one tenant's rubric: the whole config after it, and who made it (#36).
+
+    Invariant 1 makes the rubric configuration rather than code, which is what lets a
+    customer be onboarded without a deploy — and which also means the single
+    highest-risk action in the product has no build, no code review and no ``git revert``
+    behind it. This table is all three.
+
+    **Full snapshots, not patches.** ``config`` is the complete document as it stood after
+    this change. A chain of patches is one bad apply away from being unreplayable, and the
+    entire point of the table is that a bad rubric can be undone at 3am by somebody who is
+    not the person who wrote it. The storage cost is a few kilobytes per edit of a document
+    that changes a handful of times a year.
+
+    **``version`` is allocated from this table, inside the writing transaction**, against
+    ``UNIQUE (tenant_id, version)``. A counter held in Python would hand the same number to
+    two admin processes; the constraint is what settles the race.
+
+    **Nothing ever deletes or updates a row here.** Reverting appends a new version whose
+    ``config`` is an old one's — the history only answers "who changed this, and to what?"
+    if it is append-only, and a revert is itself a change somebody made and should have to
+    account for.
+
+    ``ON DELETE CASCADE`` to ``tenants``, like ``tenant_api_keys`` and unlike ``leads``:
+    this is a record *about* the customer's configuration and it is meaningless without
+    them, so #37's deliberate erasure takes it along rather than being blocked by it.
+    """
+
+    __tablename__ = "tenant_config_versions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # Monotonic per tenant, starting at 1. The migration seeds version 1 for every existing
+    # tenant from its current `icp_config`, so the first real edit has something to diff
+    # against rather than a blank page.
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The **full** config after this change. Same shape as `tenants.icp_config`, and
+    # validated by the same `TenantConfig` before it is written.
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # The staff subject from the admin session — an opaque username, never an address
+    # (invariant 5), and never blank: an audit row with no author is not an audit row.
+    # `'migration'` on the rows the seeding migration writes, so the answer to "who did
+    # this?" is visibly not a person rather than absent.
+    changed_by: Mapped[str] = mapped_column(Text, nullable=False)
+    changed_at: Mapped[dt.datetime] = _created_at()
+    # Why, in the operator's words. Optional: refusing to save a rubric fix during an
+    # incident over a missing note is the sort of friction that gets worked around by
+    # editing the row in psql, which is the one outcome this table exists to prevent.
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        # The identity of a version, and the conflict target that settles two operators
+        # saving at once: one of them gets a constraint violation and retries against the
+        # number the other took.
+        UniqueConstraint(
+            "tenant_id", "version", name="uq_tenant_config_versions_tenant_id_version"
+        ),
+        # The history screen: WHERE tenant_id = ? ORDER BY version DESC. The unique
+        # constraint above already serves it, leading column first, so there is no second
+        # index here.
+        CheckConstraint("version > 0", name="version_is_positive"),
+        CheckConstraint("changed_by <> ''", name="changed_by_not_blank"),
+    )
+
+
+class GoldenPromotion(Base):
+    """One lead promoted into the eval golden set (#22), recorded so it happens once (#36).
+
+    The golden set itself is ``tests/evals/golden_leads.jsonl`` — a file in a git
+    repository, appended to by a human, because the labels in it are human judgements and
+    because a Lambda's filesystem is read-only. So this table does not hold the golden
+    case: it holds the **decision** to promote, plus the human label that goes with it, and
+    the admin renders the JSONL line from those and the lead on demand.
+
+    That split is deliberate rather than incidental. A copy of the (pseudonymised) payload
+    here would be a second home for data derived from ``leads.raw_payload``, which
+    invariant 5 says is the one place personal data lives and which #37's retention job
+    purges. Rendering on demand means the promoted case is always derived from the row the
+    retention policy governs, and disappears with it.
+
+    ``UNIQUE (tenant_id, lead_id)`` is what makes promotion idempotent: a rep's second
+    click, a double-tap or a refreshed confirmation page must not add the same lead to the
+    golden set twice, because the eval harness would then weigh that one lead twice.
+    """
+
+    __tablename__ = "golden_promotions"
+
+    id: Mapped[uuid.UUID] = _pk()
+    tenant_id: Mapped[uuid.UUID] = _tenant_id()
+    lead_id: Mapped[uuid.UUID] = _lead_id()
+    # The stable slug the golden case is filed under, e.g. `real_acme_0f3c9a12`. Unique
+    # across every tenant because it is a case id in one shared file, and two cases
+    # answering to one id would make a failing eval unattributable.
+    case_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # The tier the human says this lead should have been. The label, not the model's answer
+    # — a golden case whose expectation came from the thing under test measures nothing.
+    expected_tier: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The staff subject who labelled it, used as #22's `labeler` handle. An opaque
+    # username, never an address: the golden set outlives the raw payload.
+    promoted_by: Mapped[str] = mapped_column(Text, nullable=False)
+    # Why this tier and not the adjacent one, in the labeller's words. #22 requires at
+    # least 20 characters and says why: in six months this sentence is what tells somebody
+    # whether the label or the model is at fault.
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    promoted_at: Mapped[dt.datetime] = _created_at()
+    created_at: Mapped[dt.datetime] = _created_at()
+
+    __table_args__ = (
+        _owned_lead_fk(),
+        # Idempotency. Promoting the same lead twice must not add it twice.
+        UniqueConstraint("tenant_id", "lead_id", name="uq_golden_promotions_tenant_id_lead_id"),
+        UniqueConstraint("case_id", name="uq_golden_promotions_case_id"),
+        # The review screen needs "has this lead already been promoted?" for a page of
+        # leads at a time, and the export needs this tenant's promotions newest first.
+        Index("ix_golden_promotions_tenant_id_promoted_at", "tenant_id", "promoted_at"),
+        CheckConstraint(
+            "expected_tier IN ('hot', 'warm', 'cold', 'disqualified')",
+            name="expected_tier_known",
+        ),
+        CheckConstraint("case_id <> '' AND promoted_by <> ''", name="promotion_fields_not_blank"),
+        # #22 refuses a label whose notes are shorter than this, and a promotion staged
+        # here would then be refused at the point it was appended to the file — after the
+        # operator had been told it worked.
+        CheckConstraint("length(note) >= 20", name="note_is_a_rationale"),
     )

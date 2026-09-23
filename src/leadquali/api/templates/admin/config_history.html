@@ -1,0 +1,39 @@
+{#
+  The audit trail. Append-only: reverting adds a version whose config is an older one's,
+  and nothing here can delete a row. "Who changed this tenant's rubric, when, and to what"
+  is only answerable if that stays true.
+#}
+{% extends "admin/base.html" %}
+{% block title %}{{ slug }}'s rubric history — LeadQuali admin{% endblock %}
+{% block content %}
+<h1>Rubric history for {{ slug }}</h1>
+<p class="muted"><a href="{{ admin_prefix }}/tenants/{{ slug }}/config">Edit the rubric</a></p>
+<table>
+  <tr><th>Version</th><th>Changed</th><th>By</th><th>Why</th><th>Config</th><th></th></tr>
+  {% for version in versions %}
+  <tr{% if version.version == current_version %} class="notice"{% endif %}>
+    <td class="num">{{ version.version }}{% if version.version == current_version %}
+        <span class="muted">(current)</span>{% endif %}</td>
+    <td>{{ version.changed_at.strftime('%Y-%m-%d %H:%M') }}</td>
+    <td>{{ version.changed_by }}</td>
+    <td>{{ version.note or '' }}</td>
+    <td><details><summary>show</summary><pre>{{ version.config | pretty_json }}</pre></details></td>
+    <td>
+      {% if version.version != current_version %}
+      <form class="inline" method="post"
+            action="{{ admin_prefix }}/tenants/{{ slug }}/config/revert">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf }}">
+        <input type="hidden" name="version" value="{{ version.version }}">
+        <button type="submit">Restore this</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="muted">No history for this tenant.</td></tr>
+  {% endfor %}
+</table>
+<p class="muted">
+  Restoring an earlier rubric appends a new version; it never removes one.
+</p>
+{% endblock %}

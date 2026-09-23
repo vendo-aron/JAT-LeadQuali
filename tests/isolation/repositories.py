@@ -30,12 +30,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.metering_postgres import PostgresMeteringStore
+from leadquali.adapters.store_admin import (
+    PostgresAdminQueryStore,
+    PostgresConfigVersionStore,
+    PostgresGoldenPromotionStore,
+)
 from leadquali.adapters.store_postgres import (
     PostgresFeedbackStore,
     PostgresLeadStore,
@@ -43,13 +48,14 @@ from leadquali.adapters.store_postgres import (
     tenant_uuid,
 )
 from leadquali.adapters.store_tenants import PostgresIngestCredentials, PostgresTenantAdminStore
+from leadquali.app.admin_views import LeadFilter
 from leadquali.app.api_keys import ApiKeyParts, KeyEnvironment
 from leadquali.app.assessment_result import AssessmentFailed
 from leadquali.app.feedback import Verdict
 from leadquali.app.metering import BillingPeriod
 from leadquali.app.ports import RoutingOutcome
 from leadquali.app.tenants import TenantStatus
-from leadquali.domain.models import Action, EscalationReason
+from leadquali.domain.models import Action, EscalationReason, Tier
 from leadquali.domain.routing import system_failure
 from leadquali.prompts.lead import LeadSubmission
 from tests.sqlcapture import CannedResult
@@ -269,6 +275,12 @@ REPOSITORIES: Final[tuple[Repository, ...]] = (
     Repository(PostgresTenantAdminStore, PostgresTenantAdminStore),
     Repository(PostgresMeteringStore, PostgresMeteringStore),
     Repository(PostgresIngestCredentials, _ingest_credentials),
+    # #36's staff console. Three classes, and the first of them is the read surface over
+    # every tenant's leads, assessments and feedback — the one the completeness test was
+    # written after finding it unswept on this branch.
+    Repository(PostgresAdminQueryStore, PostgresAdminQueryStore),
+    Repository(PostgresConfigVersionStore, PostgresConfigVersionStore),
+    Repository(PostgresGoldenPromotionStore, PostgresGoldenPromotionStore),
 )
 
 
@@ -277,7 +289,17 @@ REPOSITORIES: Final[tuple[Repository, ...]] = (
 #: database on behalf of a tenant belongs in :data:`REPOSITORIES` with recipes, not here.
 #: ``test_every_adapter_over_a_session_factory_is_swept`` fails naming anything missing from
 #: both, which is how a whole repository class stops being able to go uncovered.
-EXCLUDED_REPOSITORIES: Final[Mapping[str, str]] = {}
+EXCLUDED_REPOSITORIES: Final[Mapping[str, str]] = {
+    "PostgresUnitOfWork": (
+        "#36's ambient transaction. It takes a session factory and issues no statement of "
+        "its own: atomic() opens one session, binds it to a ContextVar and commits or "
+        "rolls back at the block's edge, so every statement inside it belongs to a store "
+        "that is swept here in its own right. There is no query to scope and no tenant to "
+        "scope it to — the config write and its audit row are each checked where they are "
+        "written. tests/unit/test_unit_of_work.py covers the transaction semantics against "
+        "a real engine."
+    ),
+}
 
 #: The two constructor exemptions, written out once. They are the only entries on
 #: :data:`ALLOWLIST` that repeat, and a reason short enough to repeat is a reason short
@@ -322,6 +344,18 @@ ALLOWLIST: Final[Mapping[type, Mapping[str, str]]] = {
         "from_env": _FROM_ENV,
     },
     PostgresIngestCredentials: {},
+    PostgresAdminQueryStore: {
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
+    },
+    PostgresConfigVersionStore: {
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
+    },
+    PostgresGoldenPromotionStore: {
+        "from_url": _FROM_URL,
+        "from_env": _FROM_ENV,
+    },
 }
 
 
@@ -344,6 +378,37 @@ FLEET_METHODS: Final[Mapping[type, frozenset[str]]] = {
         }
     ),
 }
+
+
+class _LeadRow(NamedTuple):
+    """The shape ``PostgresAdminQueryStore.lead_detail`` reads off its first ``SELECT``.
+
+    Named columns rather than a tuple, because that is how the adapter consumes the row —
+    and because a method that starts reading a column this does not have should fail by
+    name here rather than quietly receiving something plausible.
+    """
+
+    id: uuid.UUID
+    submission_id: str
+    source: str
+    received_at: dt.datetime
+    contact_email_hash: str | None
+    raw_payload: Mapping[str, Any]
+
+
+#: What the lead SELECT answers so the sweep reaches the three statements behind it. The
+#: payload is deliberately a probe's rather than a plausible lead's: nothing about this row
+#: is asserted on, and a realistic one would invite somebody to start asserting on it.
+_A_LEAD_ROW: Final[CannedResult] = CannedResult(
+    row=_LeadRow(
+        id=uuid.UUID(LEAD_A),
+        submission_id=SUBMISSION_A,
+        source="web_form",
+        received_at=NOW,
+        contact_email_hash="a" * 64,
+        raw_payload={"probe": "cross-tenant"},
+    )
+)
 
 
 _OUTCOME = AssessmentFailed(
@@ -548,6 +613,138 @@ RECIPES: Final[Mapping[type, Mapping[str, ArgumentRecipe]]] = {
                 "indistinguishable from a key that does not exist. test_auth_isolation.py "
                 "drives that decision directly, since #31's review fixes it is the "
                 "one place the rule is written. Recorded in docs/tenant-isolation.md."
+            ),
+        ),
+    },
+    PostgresAdminQueryStore: {
+        "browse_leads": ArgumentRecipe(
+            arguments={"criteria": LeadFilter(), "cursor": None, "limit": 25},
+            expected=CrossTenant.WRITES_NOTHING,
+            note=(
+                "The admin console's lead browser, and the method #32's completeness test "
+                "was written after finding this whole class unswept. The tenant is a "
+                "parameter of its own rather than a field of LeadFilter, which is what "
+                "lets the sweep see it at all: a method whose tenant arrives inside a "
+                "value object does not name its tenant, and invariant 4 asks it to. "
+                "WRITES_NOTHING rather than RETURNS_EMPTY because a page with no rows is "
+                "still a LeadPage and therefore truthy; the assertion that matters here is "
+                "the standing one, that none of A's identifiers appears in B's answer."
+            ),
+        ),
+        "lead_detail": ArgumentRecipe(
+            arguments={"lead_id": LEAD_A},
+            expected=CrossTenant.RETURNS_NONE,
+            results=(_A_LEAD_ROW, CannedResult(), CannedResult()),
+            note=(
+                "A's lead id asked for under B's name — a staff member following a stale "
+                "link, or a tenant id edited in a query string. Four statements, so the "
+                "first is answered with a canned row: otherwise the method returns None at "
+                "the first SELECT and the sweep never sees the three that read the "
+                "assessments, the routing events and the feedback."
+            ),
+        ),
+        "feedback_review": ArgumentRecipe(
+            arguments={
+                "tier": Tier.HOT,
+                "verdict": Verdict.BAD,
+                "start": dt.date(2026, 8, 4),
+                "end": DAY,
+                "limit": 50,
+            },
+            expected=CrossTenant.RETURNS_EMPTY,
+            note=(
+                "'Every lead scored hot last month that the rep marked bad' — the query "
+                "the storage design was made for. It joins assessments to feedback, so a "
+                "dropped predicate would hand B both halves of A's training signal."
+            ),
+        ),
+        "tier_mix": ArgumentRecipe(
+            arguments={"start": dt.date(2026, 8, 4), "end": DAY},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note="A dashboard aggregate. Unscoped it would report the fleet as one tenant.",
+        ),
+        "feedback_agreement": ArgumentRecipe(
+            arguments={"start": dt.date(2026, 8, 4), "end": DAY},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note=(
+                "Day-by-day verdict counts. The only admin read whose index leads on the "
+                "tenant and then filters rather than seeking, which is why it is worth "
+                "seeing the predicate rendered."
+            ),
+        ),
+        "rerun_candidates": ArgumentRecipe(
+            arguments={"limit": 25},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note=(
+                "The input to a rubric re-run, and it carries raw_payload. Unscoped, a "
+                "staff member previewing B's rubric would be sending A's leads to the "
+                "model — which is the one path in the admin that leaves the database."
+            ),
+        ),
+    },
+    PostgresConfigVersionStore: {
+        "append": ArgumentRecipe(
+            arguments={
+                "config": {"tenant_id": TENANT_A, "poisoned": True},
+                "changed_by": "probe",
+                "changed_at": NOW,
+                "note": "written across a tenant boundary",
+            },
+            expected=CrossTenant.WRITES_NOTHING,
+            note=(
+                "An INSERT ... SELECT, so the sweep checks both halves: the row carries "
+                "tenant_id, and the SELECT it is fed from is filtered on tenants.id. The "
+                "document claims to be A's and lands on B's history, which is the same "
+                "shape as update_config on the admin store above."
+            ),
+        ),
+        "list_versions": ArgumentRecipe(
+            expected=CrossTenant.RETURNS_EMPTY,
+            note=(
+                "The audit trail. Every row holds a whole icp_config, so this is the "
+                "history equivalent of list_tenants and it is emphatically not fleet-wide."
+            ),
+        ),
+        "get_version": ArgumentRecipe(
+            arguments={"version": 1},
+            expected=CrossTenant.RAISES,
+            note=(
+                "Version numbers restart at 1 per tenant, so 'version 1' names a different "
+                "row for every customer. B asking for it must get its own or nothing — "
+                "UnknownConfigVersionError here, since only A has history in the fixture."
+            ),
+        ),
+    },
+    PostgresGoldenPromotionStore: {
+        "record": ArgumentRecipe(
+            arguments={
+                "lead_id": LEAD_A,
+                "case_id": "real_probe_00000001",
+                "expected_tier": Tier.WARM,
+                "promoted_by": "probe",
+                "note": "promoted across a tenant boundary by a cross-tenant probe",
+                "promoted_at": NOW,
+            },
+            expected=CrossTenant.RAISES,
+            results=(CannedResult(),),
+            note=(
+                "The composite (tenant_id, lead_id) foreign key refuses it, exactly as it "
+                "refuses a cross-tenant assessment. The canned empty result is what makes "
+                "the sweep see the second statement: ON CONFLICT DO NOTHING returns no row "
+                "when it collides, and the method then reads the existing promotion back."
+            ),
+        ),
+        "list_promotions": ArgumentRecipe(
+            expected=CrossTenant.RETURNS_EMPTY,
+            note="Which of this tenant's leads are in the eval set. Never another's.",
+        ),
+        "promoted_lead_ids": ArgumentRecipe(
+            arguments={"lead_ids": [LEAD_A]},
+            expected=CrossTenant.RETURNS_EMPTY,
+            note=(
+                "Asked once per review page for a page of lead ids. Handed A's id under "
+                "B's name it must answer 'not promoted' rather than confirming that a lead "
+                "B cannot see exists at all."
             ),
         ),
     },

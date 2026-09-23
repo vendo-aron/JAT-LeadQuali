@@ -280,14 +280,33 @@ never rendered to a customer. **If that report is ever put in front of a custome
 has to go.**
 
 **`PostgresTenantAdminStore.list_tenants`.** The control plane's own enumeration, for an
-operator running `tenantctl`. It returns every tenant's row, including `icp_config` and the
-`hmac_secret_ref` that names their signing secret, so nothing serving a request may call it.
-That is not left as a prohibition: `api/main.py` *does* construct a
+operator running `tenantctl` or a member of staff using the admin console. It returns every
+tenant's row, including `icp_config` and the `hmac_secret_ref` that names their signing
+secret, so **nothing serving a tenant's request may call it**.
+
+"A tenant's request" rather than "a request" is the whole of the distinction, and it is
+worth stating precisely because the two surfaces sit in the same package. `POST /leads` and
+the feedback link are authenticated *as a tenant*: reaching this method from either would
+hand one customer another's configuration, which is the definition of a cross-tenant read.
+`/admin` is authenticated *as a member of staff*, who is global by design — the console's
+tenant picker **is** this method, and a control plane that cannot enumerate its customers is
+not one. What the admin does with the rows is bounded separately: it renders neither
+`icp_config` nor `hmac_secret_ref` on any page, which `tests/unit/test_api_admin.py` asserts
+directly, and its deps object carries no credential source at all.
+
+That is not left as a prohibition. `api/main.py` *does* construct a
 `PostgresTenantAdminStore`, for the rate limiter's allowance lookup, so the class is
 genuinely within reach of the request path — and
-`test_the_control_planes_enumeration_is_not_reachable_from_the_api` parses every module
-under `leadquali.api` and fails if any of them names an admin-store method other than
-`rate_limit_for`.
+`test_the_control_planes_enumeration_is_not_reachable_from_a_tenant_context` parses every
+module under `leadquali.api` and fails if any of them names an admin-store method it is not
+permitted. The permission is **per module and per method**: the default is `rate_limit_for`
+and nothing else, `api/admin.py` adds exactly `list_tenants` and `get_tenant` with the
+reason written beside each, and a module added later is scanned under the default rather
+than inheriting the exemption. The admin still may not reach `add_key`, `revoke_key`,
+`list_keys`, `expire_key`, `create_tenant` or `set_status`: a web page has no business
+minting or revoking a customer's credentials. Two further tests hold the exemption in place
+— one that every entry names a module and a method that still exist and carries a reason,
+and one that `main.py` and `feedback.py` can never appear in it.
 
 **`PostgresIngestCredentials.resolve`.** The one method whose tenant check is a comparison in
 Python rather than a `WHERE` clause. Its single indexed read is by `key_id` — which is what
