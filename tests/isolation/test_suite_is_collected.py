@@ -253,6 +253,13 @@ def test_the_narrowing_rule_refuses_selection_and_allows_exclusion(
 _ADDOPTS: Final[re.Pattern[str]] = re.compile(r"PYTEST_ADDOPTS\s*:\s*(.*)$")
 
 
+_RUN: Final[re.Pattern[str]] = re.compile(r"^run:\s*(.+)$")
+"""A workflow step's command. Anything else on a line is prose, however it reads."""
+
+_INVOKES_PYTEST: Final[re.Pattern[str]] = re.compile(r"(?:^|[\s;&|(])pytest(?:$|[\s;&|)])")
+"""``pytest`` as a word being run, not as a substring of a filename or a sentence."""
+
+
 def _pytest_invocations(text: str) -> Iterator[tuple[int, str, list[str]]]:
     """Every place a workflow file hands arguments to pytest, as ``(line, source, argv)``.
 
@@ -268,9 +275,19 @@ def _pytest_invocations(text: str) -> Iterator[tuple[int, str, list[str]]]:
             value = addopts.group(1).strip().strip("'\"")
             yield number, "PYTEST_ADDOPTS", shlex.split(value)
             continue
-        if "pytest" in stripped:
-            tail = stripped[stripped.index("pytest") + len("pytest") :]
-            yield number, "pytest", shlex.split(tail)
+        # Only a `run:` command counts. A line may mention pytest without invoking it —
+        # `- name: Test (pytest, offline suite only)` is the one that caught this out, and
+        # it scanned as `pytest , offline suite only)`, whose bare words then looked like
+        # path arguments. A guard that fails on a step's own label is a guard somebody
+        # deletes, which was the whole lesson of the -m over-strictness above.
+        command = _RUN.match(stripped)
+        if command is None:
+            continue
+        invocation = command.group(1).strip()
+        if not _INVOKES_PYTEST.search(invocation):
+            continue
+        tail = invocation[invocation.index("pytest") + len("pytest") :]
+        yield number, "pytest", shlex.split(tail)
 
 
 def test_no_workflow_runs_pytest_in_a_way_that_would_skip_this_directory() -> None:
@@ -315,9 +332,12 @@ jobs:
     env:
       PYTEST_ADDOPTS: -m unit
     steps:
-      - run: pytest tests/unit
+      - name: Test (pytest, offline suite only)
+        run: pytest tests/unit
       # - run: pytest tests/contract
-      - run: pytest
+      - name: Everything
+        run: pytest
+      - run: echo "we do not use pytest-xdist here"
 """
     found = list(_pytest_invocations(workflow))
     assert [(source, arguments) for _, source, arguments in found] == [
@@ -330,3 +350,23 @@ jobs:
         True,
         False,
     ]
+
+
+def test_a_step_that_merely_mentions_pytest_is_not_read_as_an_invocation() -> None:
+    """Prose is not a command, however much it looks like one after `.index("pytest")`.
+
+    The real CI step is named ``Test (pytest, offline suite only)``. Scanning every line
+    containing the word read that label as ``pytest , offline suite only)``, whose bare
+    words then looked exactly like path arguments — so the guard failed the merged trunk
+    over a step's own title. A guard that fires on correct configuration is one the next
+    person deletes, taking the real protection with it.
+    """
+    prose = """
+jobs:
+  test:
+    steps:
+      - name: Test (pytest, offline suite only)
+        uses: actions/checkout@v4
+      - run: echo "pytest is configured in pyproject.toml"
+"""
+    assert list(_pytest_invocations(prose)) == []
