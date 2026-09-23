@@ -24,6 +24,7 @@ Tenant scoping is not checked here. It is checked for every method at once by
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Any
 
 import pytest
@@ -258,88 +259,133 @@ def test_the_subject_lookup_goes_by_hash_and_never_by_address(capture: SqlCaptur
 # ------------------------------------------------------------------------------- erasure
 
 
+def _erase_statements(capture: SqlCapture, request: ErasureRequest) -> list[str]:
+    """Every statement one erasure builds, compiled, in order.
+
+    Five canned results: four child counts and the delete. The sixth — the audit insert —
+    finds an empty queue and stops the method, which is how the harness sees all of them.
+    """
+    statements = capture.run(
+        lambda: store(capture).erase(tenant_id=TENANT, request=request),
+        results=[
+            CannedResult(row=(1,)),
+            CannedResult(row=(1,)),
+            CannedResult(row=(0,)),
+            CannedResult(row=(0,)),
+            CannedResult(row=(LEAD_ID,)),
+        ],
+    )
+    return [sql_text(statement) for statement in statements]
+
+
+def _request(*, lead_ids: tuple[str, ...] = (LEAD_ID,)) -> ErasureRequest:
+    return ErasureRequest(
+        subject_hash=SUBJECT_HASH,
+        lead_ids=lead_ids,
+        matched_by_hash=len(lead_ids),
+        matched_by_payload_scan=0,
+        requested_by="SUP-4471",
+        completed_at=NOW,
+    )
+
+
 def test_an_erasure_counts_deletes_and_files_the_evidence_in_one_transaction(
     capture: SqlCapture,
 ) -> None:
-    """Three statements, in the only order that works, and they commit together.
+    """Six statements, in the only order that works, and they commit together.
 
     Counting after the delete is too late — the cascade happens inside the server and
     reports nothing back — and writing the audit row in a second transaction would allow a
     deletion nobody can prove, or a proof of one that did not happen.
     """
-    request = ErasureRequest(
-        subject_hash=SUBJECT_HASH,
-        lead_ids=(LEAD_ID,),
-        matched_by_hash=1,
-        matched_by_payload_scan=0,
-        requested_by="SUP-4471",
-        completed_at=NOW,
-    )
-    statements = capture.run(
-        lambda: store(capture).erase(tenant_id=TENANT, request=request),
-        results=[CannedResult(row=(1, 1, 0, 0)), CannedResult(row=(LEAD_ID,))],
-    )
-    kinds = [sql_text(statement) for statement in statements]
+    kinds = _erase_statements(capture, _request())
 
-    assert len(kinds) == 3
-    assert kinds[0].startswith("select")
-    for table in ("assessments", "routing_events", "feedback", "golden_promotions"):
-        assert table in kinds[0]
-    assert kinds[1].startswith("delete from leads")
-    assert kinds[2].startswith("insert into erasure_log")
+    assert len(kinds) == 6
+    assert kinds[4].startswith("delete from leads")
+    assert kinds[5].startswith("insert into erasure_log")
+
+
+def test_each_child_table_is_counted_by_its_own_scoped_statement(
+    capture: SqlCapture,
+) -> None:
+    """One statement per table, each carrying its own tenant predicate.
+
+    The shape this replaced was a single ``SELECT`` of four scalar sub-selects, which #32's
+    sweep will no longer accept: it walks the statement and requires a tenant term at the
+    **top level**, never descending into a subquery, because a filter one level down is not
+    something a reviewer can check by reading the statement. The failure it exists for is
+    four generated sub-selects where one has lost its tenant term — a receipt that is
+    internally plausible and counts somebody else's rows.
+    """
+    kinds = _erase_statements(capture, _request())[:4]
+    counted = [re.findall(r"\bfrom (\w+)", kind)[0] for kind in kinds]
+
+    assert counted == ["assessments", "routing_events", "feedback", "golden_promotions"]
+    for table, kind in zip(counted, kinds, strict=True):
+        assert kind.startswith("select count(*)"), table
+        assert f"where {table}.tenant_id =" in kind, table
+        assert f"{table}.lead_id in" in kind, table
 
 
 def test_the_audit_row_carries_the_hash_and_no_address(capture: SqlCapture) -> None:
     """The one place an erasure could put the address back into the database.
 
-    Asserted on the bound parameters rather than on the column list, because a value is
-    what actually reaches the server — and this table exists precisely so that a record of
-    a deletion is not itself a copy of what was deleted.
+    Asserted on the bound parameters rather than on the column list, because a value is what
+    actually reaches the server — and this table exists precisely so that a record of a
+    deletion is not itself a copy of what was deleted.
     """
-    request = ErasureRequest(
-        subject_hash=SUBJECT_HASH,
-        lead_ids=(LEAD_ID,),
-        matched_by_hash=1,
-        matched_by_payload_scan=0,
-        requested_by="SUP-4471",
-        completed_at=NOW,
-    )
     statements = capture.run(
-        lambda: store(capture).erase(tenant_id=TENANT, request=request),
-        results=[CannedResult(row=(1, 1, 0, 0)), CannedResult(row=(LEAD_ID,))],
+        lambda: store(capture).erase(tenant_id=TENANT, request=_request()),
+        results=[
+            CannedResult(row=(1,)),
+            CannedResult(row=(1,)),
+            CannedResult(row=(0,)),
+            CannedResult(row=(0,)),
+            CannedResult(row=(LEAD_ID,)),
+            CannedResult(row=()),
+        ],
     )
-    bound = {str(value) for value in parameters(statements[2]).values()}
+    bound = {str(value) for value in parameters(statements[5]).values()}
 
+    assert sql_text(statements[5]).startswith("insert into erasure_log")
     assert SUBJECT_HASH in bound
     assert not any("@" in value for value in bound), bound
 
 
 def test_an_erasure_that_finds_nothing_still_writes_the_audit_row(capture: SqlCapture) -> None:
-    """No delete is issued — there is nothing to delete — and the evidence is filed anyway."""
-    request = ErasureRequest(
-        subject_hash=SUBJECT_HASH,
-        lead_ids=(),
-        matched_by_hash=0,
-        matched_by_payload_scan=0,
-        requested_by="SUP-4471",
-        completed_at=NOW,
-    )
+    """No count and no delete are issued — there is nothing to look at — and the evidence
+    is filed anyway. "We checked on this date and held nothing" is only evidence if it was
+    written down at the time."""
     statements = capture.run(
-        lambda: store(capture).erase(tenant_id=TENANT, request=request),
-        results=[CannedResult(row=(0, 0, 0, 0))],
+        lambda: store(capture).erase(
+            tenant_id=TENANT,
+            request=ErasureRequest(
+                subject_hash=SUBJECT_HASH,
+                lead_ids=(),
+                matched_by_hash=0,
+                matched_by_payload_scan=0,
+                requested_by="SUP-4471",
+                completed_at=NOW,
+            ),
+        )
     )
     kinds = [sql_text(statement) for statement in statements]
 
-    assert len(kinds) == 2
+    assert len(kinds) == 1
     assert not any(kind.startswith("delete") for kind in kinds)
-    assert kinds[1].startswith("insert into erasure_log")
+    assert kinds[0].startswith("insert into erasure_log")
 
 
 # ------------------------------------------------------------------------------- policies
 
 
 def test_a_dry_run_reads_both_tiers_in_one_statement(capture: SqlCapture) -> None:
-    """So the two numbers an operator is shown describe the same instant."""
+    """So the two numbers an operator is shown describe the same instant.
+
+    Two ``FILTER`` aggregates over one scan of ``leads``, under a single top-level
+    ``WHERE tenant_id = …`` — rather than two scalar sub-selects, whose scoping would sit
+    one level down where neither a reviewer nor #32's sweep can check it.
+    """
     sql = sql_text(
         only(
             capture.run(

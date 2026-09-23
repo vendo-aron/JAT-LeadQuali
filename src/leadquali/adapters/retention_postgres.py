@@ -40,8 +40,23 @@ from the command somebody reaches for when the pager has gone off.
 The tenant predicate is repeated on the inner select and the outer statement. The inner one
 is the one that matters and the outer one is redundant against it; both are there because
 invariant 4 is "every statement filters on the tenant" with no exceptions for the ones that
-are provably safe, and ``tests/isolation`` reads the compiled SQL rather than taking the
+are provably safe, and ``tests/isolation`` walks the statement rather than taking the
 subquery's word for it.
+
+Counting, and why there are no scalar sub-selects here
+-------------------------------------------------------
+
+The two counting methods could each be one statement projecting several scalar sub-selects,
+and were, until #32's sweep stopped reading rendered SQL and started walking the statement.
+It requires a tenant term in a ``WHERE`` at the **top level**, and never descends into a
+subquery — because a tenant predicate one level down is not something a reviewer can check
+by reading the statement, and four generated sub-selects where one has lost its filter
+produce a result that is internally plausible and wrong. So :meth:`~PostgresRetentionStore.
+count_expired` is one scan of ``leads`` with ``FILTER`` aggregates under a single ``WHERE``,
+and :meth:`~PostgresRetentionStore.count_lead_children` is one statement per table. The
+second costs four round trips on a path that runs a handful of times a year, which is the
+cheapest price available for making every count on an erasure receipt individually
+reviewable.
 
 The tombstone predicate
 ------------------------
@@ -221,28 +236,31 @@ class PostgresRetentionStore:
     ) -> ExpiredCounts:
         """How much a run would touch, writing nothing.
 
-        One statement with two scalar sub-selects rather than two round trips, so the two
-        numbers a dry run prints are read at the same instant and cannot describe two
-        different states of the table.
+        One statement over ``leads`` with two ``FILTER`` aggregates, rather than one
+        ``SELECT`` of two scalar sub-selects. Both forms read the two numbers at the same
+        instant — which is the point, so that a dry run cannot print counts describing two
+        different states of the table — but only this one puts ``tenant_id = :tenant`` in a
+        ``WHERE`` at the **top level of the statement**, where a reviewer and
+        ``tests/isolation`` can both see it.
+
+        That is not a formatting preference. The sub-select form hid its scoping one level
+        down, inside clauses the sweep deliberately does not descend into, so a version of
+        it that filtered one aggregate and not the other would have compiled, rendered
+        plausibly, and produced a tenant's payload count beside the whole fleet's lead
+        count. This form cannot express that: there is one ``WHERE``, and both aggregates
+        are counted from the rows it admits.
         """
         tenant = tenant_uuid(tenant_id)
-        payloads = (
-            select(func.count())
-            .select_from(Lead)
-            .where(
-                Lead.tenant_id == tenant,
-                Lead.received_at < payload_cutoff,
-                ~Lead.raw_payload.contains(_TOMBSTONE_MATCH),
-            )
-            .scalar_subquery()
+        payloads = func.count().filter(
+            Lead.received_at < payload_cutoff,
+            ~Lead.raw_payload.contains(_TOMBSTONE_MATCH),
         )
-        leads = (
-            select(func.count())
+        leads = func.count().filter(Lead.received_at < lead_cutoff)
+        statement = (
+            select(payloads.label("payloads"), leads.label("leads"))
             .select_from(Lead)
-            .where(Lead.tenant_id == tenant, Lead.received_at < lead_cutoff)
-            .scalar_subquery()
+            .where(Lead.tenant_id == tenant)
         )
-        statement = select(payloads.label("payloads"), leads.label("leads"))
         with self._sessions.begin() as session:
             row = session.execute(statement).one()
         return ExpiredCounts(tenant_id=tenant_id, payloads=int(row[0]), leads=int(row[1]))
@@ -395,64 +413,62 @@ class PostgresRetentionStore:
     def count_lead_children(self, *, tenant_id: str, lead_ids: Sequence[str]) -> ChildCounts:
         """Rows that will cascade when these leads go, per table.
 
-        The four tables whose composite foreign key to ``leads`` is ``ON DELETE CASCADE``,
-        named one at a time rather than derived from the metadata: a table added later with
-        a different delete rule must show up as a missing count here, not as a silent zero.
+        **One statement per table**, in one transaction, rather than one statement of four
+        scalar sub-selects. The four counts are what an erasure receipt is made of, so each
+        one has to be individually reviewable — and a single statement whose scoping lived
+        inside four generated sub-selects is precisely the shape where one of them loses its
+        tenant term and the result stays internally plausible. Four round trips on a path
+        that runs a handful of times a year is the cheapest possible price for that.
+
+        The four tables are named rather than walked from the metadata: a table added later
+        with a different delete rule (#35's ``usage_reports`` is ``RESTRICT``) must show up
+        here as a missing count, not as a silent zero.
         """
         if not lead_ids:
             return ChildCounts()
-        tenant = tenant_uuid(tenant_id)
-        leads = _lead_uuids(lead_ids)
-        statement = select(
-            *(
-                select(func.count())
-                .select_from(model)
-                .where(model.tenant_id == tenant, model.lead_id.in_(leads))
-                .scalar_subquery()
-                .label(label)
-                for model, label in _CHILD_TABLES
-            )
-        )
         with self._sessions.begin() as session:
-            row = session.execute(statement).one()
-        return ChildCounts(
-            assessments=int(row[0]),
-            routing_events=int(row[1]),
-            feedback=int(row[2]),
-            golden_promotions=int(row[3]),
-        )
+            return self._count_children(session, tenant=tenant_uuid(tenant_id), lead_ids=lead_ids)
+
+    def _count_children(
+        self, session: Session, *, tenant: uuid.UUID, lead_ids: Sequence[str]
+    ) -> ChildCounts:
+        """The four counts, on a session the caller owns. See :meth:`count_lead_children`."""
+        leads = _lead_uuids(lead_ids)
+        counts = {
+            label: int(
+                session.execute(
+                    select(func.count())
+                    .select_from(model)
+                    .where(model.tenant_id == tenant, model.lead_id.in_(leads))
+                ).scalar_one()
+            )
+            for model, label in _CHILD_TABLES
+        }
+        return ChildCounts(**counts)
 
     def erase(self, *, tenant_id: str, request: ErasureRequest) -> ErasureReceipt:
         """Delete these leads and write the audit row, in one transaction.
 
-        Three statements, and the order is the argument for keeping them together: count
-        the children (the cascade reports nothing back, so afterwards is too late), delete
-        the leads, file the evidence. A failure anywhere rolls back all three, so there is
-        never a deletion nobody can prove or a proof of one that did not happen.
+        Six statements, and the order is the argument for keeping them together: count the
+        children one table at a time (the cascade reports nothing back, so afterwards is too
+        late), delete the leads, file the evidence. A failure anywhere rolls back all six, so
+        there is never a deletion nobody can prove or a proof of one that did not happen.
 
         Raises:
             RetentionError: the delete or the audit write was refused.
         """
         tenant = tenant_uuid(tenant_id)
         leads = _lead_uuids(request.lead_ids)
-        children_statement = select(
-            *(
-                select(func.count())
-                .select_from(model)
-                .where(model.tenant_id == tenant, model.lead_id.in_(leads))
-                .scalar_subquery()
-                .label(label)
-                for model, label in _CHILD_TABLES
-            )
-        )
         try:
             with self._sessions.begin() as session:
-                row = session.execute(children_statement).one()
-                children = ChildCounts(
-                    assessments=int(row[0]),
-                    routing_events=int(row[1]),
-                    feedback=int(row[2]),
-                    golden_promotions=int(row[3]),
+                # No leads means no children, and asking four times would be four round
+                # trips to learn a number we already know. It is also the common case: an
+                # erasure for somebody the retention job already removed finds nothing, and
+                # that path should be cheap as well as correct.
+                children = (
+                    self._count_children(session, tenant=tenant, lead_ids=request.lead_ids)
+                    if leads
+                    else ChildCounts()
                 )
                 deleted = (
                     len(

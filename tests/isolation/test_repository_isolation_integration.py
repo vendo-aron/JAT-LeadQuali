@@ -47,10 +47,12 @@ from leadquali.adapters.db_schema import (
     Tenant,
     TenantApiKey,
     UsageDaily,
+    UsageReportRecord,
 )
 from leadquali.adapters.keyhash_argon2 import Argon2KeyHasher
 from leadquali.adapters.store_tenants import PostgresIngestCredentials
 from leadquali.api.signing import ACTIVE_STATUS, AuthFailure, CredentialRejected, IngestCredential
+from leadquali.app.billing import usage_external_id
 from leadquali.app.feedback import Verdict
 from leadquali.domain.models import Action, Tier
 from leadquali.domain.tenant_config import TenantConfig
@@ -62,6 +64,8 @@ from tests.isolation.repositories import (
     KEY_SECRET_B,
     LEAD_A,
     SIGNING_SECRET_REF,
+    STRIPE_CUSTOMER_A,
+    STRIPE_SUBSCRIPTION_A,
     SUBMISSION_A,
     TENANT_A,
     TENANT_A_UUID,
@@ -101,12 +105,34 @@ OWNED_TABLES: Final[tuple[tuple[Any, Any], ...]] = (
     (RoutingEvent, RoutingEvent.tenant_id),
     (Feedback, Feedback.tenant_id),
     (UsageDaily, UsageDaily.tenant_id),
+    # #35's usage ledger: the row that says a customer has been billed for a day.
+    #
+    # ``stripe_events`` is deliberately **not** here. Its tenant_id is nullable by
+    # design — a webhook is stored before we know whose it is — so a snapshot keyed on
+    # a tenant would watch the attributed rows and miss the unattributed ones, which
+    # are the majority and the interesting ones. The two statements that could write
+    # across that table are addressed by Stripe's own primary key and are covered by
+    # name in ``tests/isolation/test_billing_isolation.py``.
+    (UsageReportRecord, UsageReportRecord.tenant_id),
 )
 
 #: Strings that, appearing anywhere in a result handed to tenant B, mean tenant A's data
 #: crossed the boundary.
 A_IDENTIFIERS: Final[frozenset[str]] = frozenset(
-    {TENANT_A, str(TENANT_A_UUID), LEAD_A, SUBMISSION_A, KEY_ID_A, str(QUOTA_A), str(TOKENS_A)}
+    {
+        TENANT_A,
+        str(TENANT_A_UUID),
+        LEAD_A,
+        SUBMISSION_A,
+        KEY_ID_A,
+        str(QUOTA_A),
+        str(TOKENS_A),
+        # #35: a Stripe customer id names the account that gets invoiced, so one of
+        # A's appearing in an answer handed to B is a billing identifier crossing the
+        # boundary — the same class of leak as a lead id.
+        STRIPE_CUSTOMER_A,
+        STRIPE_SUBSCRIPTION_A,
+    }
 )
 
 
@@ -136,9 +162,21 @@ def seeded(isolation_db: Connection) -> Connection:
     as a non-zero answer instead of as two matching zeroes.
     """
     connection = isolation_db
-    for slug, row_id, key_id, secret, quota in (
-        (TENANT_A, TENANT_A_UUID, KEY_ID_A, KEY_SECRET_A, QUOTA_A),
-        (TENANT_B, TENANT_B_UUID, KEY_ID_B, KEY_SECRET_B, 100),
+    # A carries #35's Stripe identifiers and B does not. The asymmetry is the point, as
+    # it is everywhere else in this fixture: a snapshot of two NULL columns before and
+    # after a cross-tenant write proves nothing, while a snapshot of A's real customer id
+    # proves that B's link_customer did not repoint A's billing at B's Stripe account.
+    for slug, row_id, key_id, secret, quota, customer, subscription in (
+        (
+            TENANT_A,
+            TENANT_A_UUID,
+            KEY_ID_A,
+            KEY_SECRET_A,
+            QUOTA_A,
+            STRIPE_CUSTOMER_A,
+            STRIPE_SUBSCRIPTION_A,
+        ),
+        (TENANT_B, TENANT_B_UUID, KEY_ID_B, KEY_SECRET_B, 100, None, None),
     ):
         connection.execute(
             insert(Tenant).values(
@@ -150,6 +188,8 @@ def seeded(isolation_db: Connection) -> Connection:
                 hmac_secret_ref=f"{SIGNING_SECRET_REF}-{slug}",
                 monthly_lead_quota=quota,
                 quota_alert_fraction=Decimal("0.80"),
+                stripe_customer_id=customer,
+                stripe_subscription_id=subscription,
             )
         )
         connection.execute(
@@ -232,6 +272,15 @@ def seeded(isolation_db: Connection) -> Connection:
             cache_creation_tokens=0,
             cost_usd=COST_A,
             computed_at=NOW,
+        )
+    )
+    connection.execute(
+        insert(UsageReportRecord).values(
+            tenant_id=TENANT_A_UUID,
+            usage_date=DAY,
+            reported_at=NOW,
+            external_id=usage_external_id(tenant_id=TENANT_A, usage_date=DAY),
+            quantity=1,
         )
     )
     return connection

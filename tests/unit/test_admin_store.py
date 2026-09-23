@@ -71,7 +71,7 @@ def walk(store: InMemoryAdminQueryStore, *, page_size: int, insert_after: int = 
     pages = 0
     while True:
         page = store.browse_leads(
-            criteria=LeadFilter(tenant_slug=SLUG), cursor=cursor, limit=page_size
+            tenant_slug=SLUG, criteria=LeadFilter(), cursor=cursor, limit=page_size
         )
         seen.extend(row.lead_id for row in page.rows)
         pages += 1
@@ -123,7 +123,7 @@ def test_rows_sharing_a_timestamp_are_still_paged_exactly_once() -> None:
 def test_the_last_page_has_no_cursor() -> None:
     store = InMemoryAdminQueryStore(lead(index) for index in range(4))
 
-    page = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=10)
+    page = store.browse_leads(tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=10)
 
     assert len(page.rows) == 4
     assert page.next_cursor is None
@@ -133,14 +133,14 @@ def test_a_full_page_with_nothing_after_it_still_has_no_cursor() -> None:
     """The off-by-one that makes a browser show an empty "next page"."""
     store = InMemoryAdminQueryStore(lead(index) for index in range(4))
 
-    page = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=4)
+    page = store.browse_leads(tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=4)
 
     assert page.next_cursor is None
 
 
 def test_an_empty_result_has_no_cursor_and_no_rows() -> None:
     page = InMemoryAdminQueryStore().browse_leads(
-        criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=10
+        tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=10
     )
 
     assert page.rows == ()
@@ -153,7 +153,7 @@ def test_an_empty_result_has_no_cursor_and_no_rows() -> None:
 def test_the_browser_is_scoped_to_one_tenant() -> None:
     store = InMemoryAdminQueryStore([lead(1), lead(2, tenant_slug="someone-else")])
 
-    page = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=10)
+    page = store.browse_leads(tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=10)
 
     assert [row.lead_id for row in page.rows] == ["lead-0001"]
 
@@ -168,7 +168,8 @@ def test_filtering_by_tier_and_confidence() -> None:
     )
 
     page = store.browse_leads(
-        criteria=LeadFilter(tenant_slug=SLUG, tier=Tier.HOT, min_confidence=Decimal("0.5")),
+        tenant_slug=SLUG,
+        criteria=LeadFilter(tier=Tier.HOT, min_confidence=Decimal("0.5")),
         cursor=None,
         limit=10,
     )
@@ -180,7 +181,7 @@ def test_a_listing_row_carries_the_hash_and_not_the_address() -> None:
     """The address belongs on the detail page, where a human is looking at one lead."""
     store = InMemoryAdminQueryStore([lead(1, raw_payload={"email": "ada@example.com"})])
 
-    row = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=10).rows[0]
+    row = store.browse_leads(tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=10).rows[0]
 
     assert isinstance(row, LeadRow)
     assert row.contact_email_hash is not None
@@ -387,9 +388,9 @@ def test_the_harness_really_runs_the_statements(two_tenants: Seeded) -> None:
 
     assert len(mine) == 2
     assert not set(mine) & set(theirs)
-    assert store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=10).rows, (
-        "the browser returned nothing at all, so a tenant check below proves nothing"
-    )
+    assert store.browse_leads(
+        tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=10
+    ).rows, "the browser returned nothing at all, so a tenant check below proves nothing"
 
 
 def test_the_browser_returns_only_this_tenants_rows(two_tenants: Seeded) -> None:
@@ -402,7 +403,7 @@ def test_the_browser_returns_only_this_tenants_rows(two_tenants: Seeded) -> None
     """
     store, mine, theirs = two_tenants
 
-    rows = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=None, limit=50).rows
+    rows = store.browse_leads(tenant_slug=SLUG, criteria=LeadFilter(), cursor=None, limit=50).rows
 
     assert {row.lead_id for row in rows} == {str(found) for found in mine}
     assert not {row.lead_id for row in rows} & {str(found) for found in theirs}
@@ -461,7 +462,7 @@ def test_the_keyset_cursor_pages_the_real_statement_exactly_once(
     seen: list[str] = []
     cursor = None
     while True:
-        page = store.browse_leads(criteria=LeadFilter(tenant_slug=SLUG), cursor=cursor, limit=3)
+        page = store.browse_leads(tenant_slug=SLUG, criteria=LeadFilter(), cursor=cursor, limit=3)
         seen.extend(row.lead_id for row in page.rows)
         if page.next_cursor is None:
             break

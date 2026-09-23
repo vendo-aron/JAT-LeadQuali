@@ -9,7 +9,8 @@ is **not** isolated, because a document that only lists its own strengths is not
 anything.
 
 Encryption, key management and secret rotation are deliberately not repeated here; they are
-in [`docs/security-overview.md`](security-overview.md) (issue #37).
+in [`docs/security-overview.md`](security-overview.md), which #37 has since written. The
+links to it below are documents you can read.
 
 ---
 
@@ -37,51 +38,94 @@ The tenant boundary is the database row, not the database instance. See
 The suite is `tests/isolation/`. It runs as part of the ordinary `pytest` invocation, which
 is what makes "it runs in CI on every push" true without depending on a CI job somebody has
 to remember; `tests/isolation/test_suite_is_collected.py` asserts that the directory is
-inside `testpaths`, that nothing filters it back out, and that no workflow narrows its
-`pytest` command line.
+inside `testpaths`, that `addopts` filters nothing back out, and that no workflow narrows
+its `pytest` run — by a path argument, `--ignore`, `--deselect`, `-k`, a selecting `-m`
+expression, or a `PYTEST_ADDOPTS` in an `env:` block. It has fired once for real, when #5's
+CI landed running `pytest tests/unit tests/contract`.
 
-**204 of the suite's 241 tests run with no database** — 203 pass and one is skipped, the
+**305 of the suite's 361 tests run with no database** — 304 pass and one is skipped, the
 one covering the single method whose tenant check is a comparison in Python rather than a
 `WHERE` clause, and whose behaviour is asserted elsewhere in the same sweep. **The remaining
-37 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
+56 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
 per axis below, because a property asserted only by a test that skips is a property that is
 not asserted — see [The negative control](#the-negative-control).
 
-*(Counts updated by #37, which added `PostgresRetentionStore` — the only module in the
-codebase that issues a `DELETE` — to the sweep. Its eleven tenant-scoped methods are
-enumerated and checked like every other repository's.)*
+Every number in this document was measured against a run at the commit that last changed
+it, and it has been re-measured three times as #35, #36 and #37 each added stores to the
+sweep. If a count here disagrees with what `pytest tests/isolation` prints, trust the run
+and fix the document: it is the kind of drift that makes a reviewer stop believing the
+paragraphs as well as the numbers.
 
 ### 1. Data isolation — every repository method
 
-`tests/isolation/test_repository_isolation.py` (104 tests, no database)
-`tests/isolation/test_repository_isolation_integration.py` (37 tests, PostgreSQL)
+`tests/isolation/test_repository_isolation.py` (166 tests, no database)
+`tests/isolation/test_repository_isolation_integration.py` (56 tests, PostgreSQL)
+`tests/isolation/test_billing_isolation.py` (17 tests, no database)
 
-Not a hand-written test per method. The sweep enumerates the seven concrete repository
-classes by introspection and fails in three ways, none of which is a skip:
+The third file is not an eighth axis. It exists to hold one documented exception to a
+boundary — #35's five methods over `stripe_events`, the one table whose `tenant_id` is
+nullable — and it is described with that exception rather than here; see
+[The documented exceptions](#the-documented-exceptions).
 
+Not a hand-written test per method. The sweep discovers the repository classes and their
+methods by introspection, and fails in four ways, none of which is a skip:
+
+- a **new adapter class** that takes a session factory and is not in the sweep's inventory
+  fails a completeness check, which reads the `leadquali.adapters` package rather than
+  trusting a hand-written list;
 - a **new public method that names no tenant** fails the enumeration test by name, unless it
-  is added to a short allowlist (constructors, and three deliberately fleet-wide operator
-  queries) with a written reason;
+  is added to a short allowlist (constructors, six deliberately fleet-wide operator
+  queries, the control plane's enumeration, and #35's five methods over the one table whose
+  `tenant_id` is nullable) with a written reason;
 - a **new tenant-scoped method with no argument recipe** fails the sweep with a message
   telling the author to write one — arguments are never synthesised from type hints, because
   a generic harness produces a test that passes because the call errored;
-- a method **whose statement loses its tenant predicate** fails the SQL check.
+- a method **whose statement stops constraining the tenant** fails the scoping check.
 
-For each of the 33 swept methods the test builds the statement the method would execute,
-compiles it against the real `postgresql` dialect, and asserts two things: the SQL contains a
-tenant column being compared to a value (or, for an `INSERT`, writes the tenant column), and
-the value bound to it is the tenant the caller named. A third test calls each method as
-tenant B while holding tenant A's row identifiers and asserts that tenant A's identity never
-reaches the database at all.
+For each of the 52 swept methods the test builds every statement the method would execute
+and inspects the SQLAlchemy construct — not the rendered SQL. The rule is that **every**
+filterable clause of a statement (its `WHERE`, the `WHERE` of an `ON CONFLICT DO UPDATE`,
+the `WHERE` of the select feeding an `INSERT ... FROM SELECT`) must have a top-level `AND`
+term comparing a tenant column *of that clause's own tables* to something that binds a
+value; and an `INSERT` must additionally write every tenant column of its target table,
+since an insert has no rows to filter and what makes it safe is that the tenant travels in
+the row for the composite foreign key to check. A second assertion requires the bound value
+to be the tenant the caller named, and a third calls each method as tenant B while holding
+tenant A's row identifiers and asserts that tenant A's identity never reaches the database.
+
+Reading the construct rather than the text is not fastidiousness. An earlier version of this
+rule was a regular expression asking whether *a* tenant column was compared to *something*,
+and a review demonstrated five shapes that satisfy it and constrain nothing — see
+[The negative control](#the-negative-control), where the worst of them is reproduced.
+
+*#37's `PostgresRetentionStore` was put through this rule after it had changed, and it
+objected to three statements — the two counting methods and the counting half of an erasure,
+each of which was one `SELECT` projecting several scalar sub-selects with the tenant
+predicate inside each one. The rule never descends into a subquery, deliberately, so it saw
+a statement with no `WHERE` at all. It was right to: four generated sub-selects where one
+has lost its tenant term produce a count that is internally plausible and belongs to the
+fleet. The adapter was changed rather than the rule — `count_expired` is now one scan of
+`leads` with `FILTER` aggregates under a single top-level `WHERE`, and `count_lead_children`
+is one statement per table, so every count on an erasure receipt is individually
+reviewable.*
 
 The integration half runs the same recipes against a real server with both tenants seeded
 and a full set of rows for tenant A. Every call is bracketed by a byte-for-byte snapshot of
-every row tenant A owns, across all seven tables, so "and nothing of A's changed" is checked
+every row tenant A owns, across all eight tables that carry tenant-owned rows, so "and
+nothing of A's changed" is checked
 for every method rather than being asserted method by method. It also writes a cross-tenant
 child row directly and confirms the server refuses it.
 
-**Result: pass.** No repository method reaches the database without a tenant predicate. Two
-exceptions are documented below and are enforced as exceptions rather than tolerated.
+**Result: pass.** Every method of the eleven repository classes on this branch is swept, and
+the thirteen documented exceptions below are enforced as exceptions rather than tolerated.
+
+The completeness check did what it was written for. When this section was first written it
+covered six classes and said it *expected to fail* on the branches adding #35's billing store
+and #36's admin-console read surface. Both have since landed, and it failed on both — four
+classes for #36 and one for #35 — each of which had to be swept or excused with a written
+reason before it could go green. #37's retention store went through the same gate. One class
+is excused: `PostgresUnitOfWork`, which takes a session factory and issues no statement of
+its own.
 
 *This axis was live-tested during development.* Issue #33 added two store methods
 (`compute_day` and `fleet_tenants_with_quota`) after the sweep was written, by a different
@@ -241,11 +285,13 @@ A decision rather than a test. See [the next section](#row-level-security-the-de
 
 ## The documented exceptions
 
-Four methods do not carry a tenant predicate. Each is enforced as an exception by the sweep —
-the tests fail if one of them quietly changes shape — rather than merely tolerated.
+Thirteen methods do not carry a tenant predicate: six fleet-wide queries, the control
+plane's enumeration, the credential lookup, and the five billing methods over
+`stripe_events` described last. Each is enforced as an exception by the sweep — the tests
+fail if one of them quietly changes shape — rather than merely tolerated.
 
-**`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`,
-`fleet_retention_policies`.** Reconciling our
+**`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`** (#33).
+Reconciling our
 usage against Anthropic's invoice, and allocating shared infrastructure cost, are questions
 about the whole workspace and cannot be answered one tenant at a time. Three rules contain
 them: the name carries `fleet_` so it is visible at every call site; the method takes no
@@ -253,6 +299,16 @@ tenant, so it cannot be mistaken for a query somebody forgot to filter; and it r
 per-tenant *breakdown* rather than an anonymous total that could be printed anywhere. Every
 per-tenant report produced by `usagectl` — human and JSON — is rendered in the test suite and
 searched for the other tenant's slug and figures.
+
+**`fleet_billable_tenants`, `fleet_tenants_in_expired_dunning`** (#35). The daily billing
+run's worklist and the dunning sweep's, and the same three rules contain them. Both answer
+*who should this scheduled job iterate over?* — the set of tenants with a Stripe customer,
+and the set whose grace period has run out — rather than handing anybody another tenant's
+figures, and neither is reachable from a request path. They were originally called
+`billable_tenants` and `tenants_in_expired_dunning`; putting the billing store through the
+sweep is what renamed them, and the renaming is the point: at a call site those two spellings
+look exactly like queries somebody forgot to filter, and `fleet_` says out loud that the
+absence is deliberate.
 
 One fleet-derived number does reach a single tenant's report: `fleet_billable_leads` on the
 margin report, the denominator of the pro-rata infrastructure allocation, carried so that a
@@ -262,14 +318,41 @@ is acceptable only because the margin report is an internal operator tool run by
 never rendered to a customer. **If that report is ever put in front of a customer, this field
 has to go.**
 
-`fleet_retention_policies` (#37) is the fourth and is the same argument from a different
-direction: the nightly purge has to know which tenants to run for, and a version of it that
-took a tenant would simply never run for the tenant somebody forgot to list. It returns each
-tenant's slug and its two retention windows — a worklist, not any customer's data.
+**`fleet_retention_policies`** (#37). The nightly purge's worklist, and the same three rules
+contain it. A version of it that took a tenant would simply never run for the tenant somebody
+forgot to list — which, for the one job in the system whose purpose is destroying customer
+data, fails in the direction that keeps data past its retention window rather than the one
+that deletes too much. It returns each tenant's slug and its two retention windows: a
+worklist, not any customer's data.
 
 **`PostgresTenantAdminStore.list_tenants`.** The control plane's own enumeration, for an
-operator running `tenantctl`. It is on no request path and must never be reachable from an
-authenticated tenant context.
+operator running `tenantctl` or a member of staff using the admin console. It returns every
+tenant's row, including `icp_config` and the `hmac_secret_ref` that names their signing
+secret, so **nothing serving a tenant's request may call it**.
+
+"A tenant's request" rather than "a request" is the whole of the distinction, and it is
+worth stating precisely because the two surfaces sit in the same package. `POST /leads` and
+the feedback link are authenticated *as a tenant*: reaching this method from either would
+hand one customer another's configuration, which is the definition of a cross-tenant read.
+`/admin` is authenticated *as a member of staff*, who is global by design — the console's
+tenant picker **is** this method, and a control plane that cannot enumerate its customers is
+not one. What the admin does with the rows is bounded separately: it renders neither
+`icp_config` nor `hmac_secret_ref` on any page, which `tests/unit/test_api_admin.py` asserts
+directly, and its deps object carries no credential source at all.
+
+That is not left as a prohibition. `api/main.py` *does* construct a
+`PostgresTenantAdminStore`, for the rate limiter's allowance lookup, so the class is
+genuinely within reach of the request path — and
+`test_the_control_planes_enumeration_is_not_reachable_from_a_tenant_context` parses every
+module under `leadquali.api` and fails if any of them names an admin-store method it is not
+permitted. The permission is **per module and per method**: the default is `rate_limit_for`
+and nothing else, `api/admin.py` adds exactly `list_tenants` and `get_tenant` with the
+reason written beside each, and a module added later is scanned under the default rather
+than inheriting the exemption. The admin still may not reach `add_key`, `revoke_key`,
+`list_keys`, `expire_key`, `create_tenant` or `set_status`: a web page has no business
+minting or revoking a customer's credentials. Two further tests hold the exemption in place
+— one that every entry names a module and a method that still exist and carries a reason,
+and one that `main.py` and `feedback.py` can never appear in it.
 
 **`PostgresIngestCredentials.resolve`.** The one method whose tenant check is a comparison in
 Python rather than a `WHERE` clause. Its single indexed read is by `key_id` — which is what
@@ -287,6 +370,55 @@ document listed it as a third exception on the grounds that it was provably safe
 review closed it, on the grounds that an exception is what a later reader copies.
 `tests/isolation/test_repository_isolation.py::test_the_last_used_write_is_tenant_scoped_like_every_other_write`
 holds it to that, and would have failed if the fix had not landed.
+
+**The five billing methods over `stripe_events`** (#35): `insert_event`,
+`pending_events`, `mark_event_attempt_failed`, `mark_event_processed` and
+`tenant_for_customer`. This is the one place in the schema where a `tenant_id` column is
+**nullable**, and it is the only exception to invariant 4 anywhere in this system.
+
+The reason is not convenience. A Stripe webhook names a *customer*, and which of our tenants
+that is can only be learned from a database read — one the verifying route deliberately does
+not make, because its whole contract is *verify the signature, insert, return 200 fast*.
+Doing more inline would mean a transient database problem turning into a 500, which Stripe
+reads as a failed delivery and retries, which is how an event gets half-applied twice.
+Refusing to store an event we cannot attribute would be worse still: it would throw away the
+only record that it arrived.
+
+So the event is stored unattributed, and a scheduled drain resolves the customer a minute
+later and writes the tenant onto the row. Four things bound the exception, and each is a
+test rather than a promise (`tests/isolation/test_billing_isolation.py`):
+
+1. **It covers only `stripe_events`.** Every exempt method is shown to touch that table and
+   no other. The allowlist is asserted as an *equality*, so widening it is a diff in two
+   files rather than one.
+2. **Pending means unattributed, structurally.** The only statement that writes `tenant_id`
+   is `mark_event_processed`, which sets `status = 'processed'` in the same `UPDATE`. A
+   pending row therefore *cannot* carry a tenant, which is why the drain's worklist has none
+   to filter on. A future method that attributed a row and left it pending fails the test
+   that states this.
+3. **The attribution write is addressed by Stripe's own primary key.** `mark_event_processed`
+   is the one exempt method that takes a `tenant_id`, and the argument is the value being
+   *written*, not a filter: the column is NULL until this statement sets it, so a `WHERE` on
+   the tenant would match zero rows and the attribution would silently not happen.
+4. **The lookup that resolves a customer can only return a slug.** `tenant_for_customer`
+   selects one column, so even unscoped it has no row of another tenant's to hand back.
+
+Everything on the *other* side of the line is swept normally. The seven methods that read or
+write a tenant-owned row — the `tenants` billing columns and the `usage_reports` ledger — are
+in the sweep with recipes, and `usage_reports` is in the integration half's snapshot, so a
+cross-tenant billing write is caught by the same machinery as a cross-tenant lead write. When
+the billing store was first put through the sweep the scoping rule objected to **none** of
+those seven statements; what it did object to was a *signature*. `record_usage_report` used
+to take a `UsageReport` value object, which carries the tenant as a field — so the method
+named no tenant, the enumeration would have waved it through as "takes no tenant", and the
+sweep could not have injected one. It now takes the row's columns. Invariant 4 says
+`tenant_id` on every table **and every repository method**, and a tenant that travels inside
+an argument does not satisfy the second half.
+
+`stripe_events` is deliberately *not* in the integration snapshot's `OWNED_TABLES`: a
+snapshot keyed on a tenant would watch the attributed rows and miss the unattributed ones,
+which are the majority and the interesting ones. The two statements that could write across
+that table are addressed by Stripe's own primary key and are covered by name instead.
 
 ---
 
@@ -323,10 +455,12 @@ name.
 
 ## The negative control
 
-"We tested our tests" is a claim, so here is the evidence.
+"We tested our tests" is a claim, so here is the evidence. Three mutations, each applied by
+hand, run, and reverted. **None of them is in the repository.**
 
-The tenant filter was removed from one repository method by hand, the suite was run, and the
-change was reverted. It was **not** committed.
+### 1. A deleted filter
+
+The tenant filter was removed from one repository method.
 
 ```diff
 --- a/src/leadquali/adapters/store_postgres.py
@@ -346,42 +480,75 @@ at the commit that added this section). That is the
 point of this exercise. Removing a cross-tenant filter from the code that runs in production
 was, until this suite existed, invisible.
 
-The isolation suite failed:
+The isolation suite failed (`1 failed, 204 passed, 27 skipped`):
 
 ```
 FAILED tests/isolation/test_repository_isolation.py::
   test_every_statement_is_scoped_to_the_tenant_it_was_given[PostgresLeadStore.already_routed]
 
-AssertionError: PostgresLeadStore.already_routed statement 1 of 1 has no tenant predicate
-and writes no tenant column.
+AssertionError: PostgresLeadStore.already_routed statement 1 of 1 is not scoped to one
+tenant: no top-level AND term of WHERE constrains a tenant column
+(routing_events.tenant_id) to a bound value.
   select routing_events.id
   from routing_events
   where routing_events.lead_id = %(lead_id_1)s::uuid and (routing_events.dispatched_at is
   not null or routing_events.action = %(action_1)s)
    limit %(param_1)s
-Every statement is filtered on the tenant, including the ones where the key is unique
-anyway (CLAUDE.md invariant 4).
-
-1 failed, 176 passed, 27 skipped
 ```
 
-*(That run predates #37's additions to the sweep; the mechanism is unchanged and the failure
-message is what it still prints.)*
+### 2. A filter that is there and means nothing
 
-A second, subtler mutation was run and reverted the same way: the predicate was left in place
-but made vacuous, `RoutingEvent.tenant_id == RoutingEvent.tenant_id`. A check that only looked
-for the column name in the SQL would have passed it. The suite failed on the second assertion:
+The predicate was left in place and made vacuous —
+`RoutingEvent.tenant_id == RoutingEvent.tenant_id`. The statement still names the column,
+still renders a `WHERE`, and matches every row in the table. Same result: the rest of the
+suite green at 1989, the isolation suite red.
 
 ```
-AssertionError: PostgresLeadStore.already_routed statement 1 mentions a tenant column but
-does not bind the tenant it was called with.
+AssertionError: PostgresLeadStore.already_routed statement 1 of 1 is not scoped to one
+tenant: no top-level AND term of WHERE constrains a tenant column
+(routing_events.tenant_id) to a bound value.
   where routing_events.tenant_id = routing_events.tenant_id and routing_events.lead_id = ...
-  bound: ['1', '3a5c9e10-0b47-4d2f-9c61-7e8a04b5d213', 'suppress']
 ```
 
-Neither mutation is in the repository. `tests/isolation/test_repository_isolation.py::test_a_deleted_filter_is_visible_to_the_evidence_rules`
-keeps the same two checks honest against synthetic SQL on every run, so the mechanism does not
-depend on anybody repeating this by hand.
+### 3. A filter that is there, binds the right tenant, and constrains nothing
+
+This one is not ours. An external review of this suite found it, and it is the reason the
+scoping rule reads the SQLAlchemy construct instead of the rendered SQL. In
+`PostgresTenantAdminStore._update_key`, the correlated subquery that ties a key to its owner
+is replaced by an uncorrelated `EXISTS`:
+
+```diff
+             .where(
+                 TenantApiKey.key_id == key_id,
+-                TenantApiKey.tenant_id.in_(select(Tenant.id).where(Tenant.slug == slug)),
++                select(Tenant.id).where(Tenant.slug == slug).exists(),
+             )
+```
+
+The SQL that comes out mentions `tenants.slug`, binds the caller's own slug, and reads
+perfectly. It is also true for *any* slug that exists, and `key_id` is globally unique — so
+**tenant B expires tenant A's live API key**. Under the regex rule this document previously
+described, the whole suite stayed green. Under the construct rule it does not:
+
+```
+AssertionError: PostgresTenantAdminStore.expire_key statement 1 of 1 is not scoped to one
+tenant: no top-level AND term of WHERE constrains a tenant column
+(tenant_api_keys.tenant_id) to a bound value.
+  update tenant_api_keys set expires_at=%(expires_at)s where tenant_api_keys.key_id =
+  %(key_id_1)s and (exists (select tenants.id from tenants where tenants.slug =
+  %(slug_1)s)) returning ...
+```
+
+Four more shapes of the same kind — an `OR true`, an unfiltered `IN (SELECT ...)`, a
+detached CTE, and an `INSERT` that stops writing its tenant column while keeping its
+`ON CONFLICT` predicate — are checked on every run by
+`test_the_scoping_rule_refuses_a_predicate_that_constrains_nothing` and
+`test_an_insert_must_write_the_tenant_and_filter_on_it_where_it_can`, so the mechanism does
+not depend on anybody repeating this by hand.
+
+The broader lesson is in the suite's favour and against its previous self: the rule was
+wrong, a mutation review found it, and the fix was to stop asking the text a question only
+the structure can answer.
 
 ---
 
@@ -490,10 +657,10 @@ issue #29's per-rep identity work and a product decision rather than an infrastr
 ## Reproducing this
 
 ```bash
-pytest tests/isolation                 # 203 passed, 38 skipped, no database needed
+pytest tests/isolation                 # 304 passed, 57 skipped, no database needed
 docker compose up -d                   # see docs/local-database.md
 export DATABASE_URL=...
-pytest tests/isolation -m integration   # the 37 that need PostgreSQL
+pytest tests/isolation -m integration   # the 56 that need PostgreSQL
 ```
 
 Without a database the `integration` tests skip with the reason printed; they never fail for

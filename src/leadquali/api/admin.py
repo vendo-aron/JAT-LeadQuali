@@ -870,6 +870,7 @@ def _register_pages(
                     "admin/leads.html",
                     {
                         "tenants": deps.tenants.list_tenants(),
+                        "slug": slug or None,
                         "criteria": None,
                         "page": None,
                         "params": dict(params),
@@ -879,7 +880,6 @@ def _register_pages(
                 )
             try:
                 criteria = LeadFilter(
-                    tenant_slug=slug,
                     tier=Tier(params["tier"]) if params.get("tier") else None,
                     start=_date(params.get("from")),
                     end=_date(params.get("to")),
@@ -891,6 +891,7 @@ def _register_pages(
                     "admin/leads.html",
                     {
                         "tenants": deps.tenants.list_tenants(),
+                        "slug": slug or None,
                         "criteria": None,
                         "page": None,
                         "params": dict(params),
@@ -900,6 +901,7 @@ def _register_pages(
                     request=request,
                 )
             found = deps.queries.browse_leads(
+                tenant_slug=slug,
                 criteria=criteria,
                 cursor=PageCursor.decode(params.get("cursor", "")),
                 limit=_page_size(params.get("limit")),
@@ -908,6 +910,7 @@ def _register_pages(
                 "admin/leads.html",
                 {
                     "tenants": deps.tenants.list_tenants(),
+                    "slug": slug,
                     "criteria": criteria,
                     "page": found,
                     "params": dict(params),

@@ -558,8 +558,13 @@ class BillingStorePort(Protocol):
         """One tenant's billing columns."""
         ...
 
-    def billable_tenants(self) -> Sequence[BillingTenant]:
+    def fleet_billable_tenants(self) -> Sequence[BillingTenant]:
         """Every tenant that has a Stripe customer, oldest first.
+
+        ``fleet_`` by #33's convention, and for #33's reason: this is a query with no tenant
+        predicate, and the way that stops being a hole is that the name says so at every
+        call site. It is the daily billing run's worklist — a list of *who to iterate over*
+        rather than any customer's data — and it is on no request path.
 
         Deliberately *not* filtered by status: a suspended tenant's usage from before it
         was suspended is still owed, and a job that skipped them would write off exactly
@@ -583,12 +588,33 @@ class BillingStorePort(Protocol):
         """Start, extend or clear a tenant's grace period."""
         ...
 
-    def tenants_in_expired_dunning(self, *, now: datetime) -> Sequence[BillingTenant]:
-        """Active tenants whose grace period has run out."""
+    def fleet_tenants_in_expired_dunning(self, *, now: datetime) -> Sequence[BillingTenant]:
+        """Active tenants whose grace period has run out, across every tenant.
+
+        ``fleet_`` for the same reason as :meth:`fleet_billable_tenants`: the sweep's
+        worklist genuinely has no tenant to be scoped to, so it says so in its name rather
+        than looking like a query somebody forgot to filter.
+        """
         ...
 
-    def record_usage_report(self, *, report: UsageReport, reported_at: datetime) -> bool:
+    def record_usage_report(
+        self,
+        *,
+        tenant_id: str,
+        usage_date: date,
+        quantity: int,
+        external_id: str,
+        reported_at: datetime,
+    ) -> bool:
         """Record that a tenant-day has been reported, and say whether it was new.
+
+        Takes the row's columns rather than a :class:`UsageReport`, so that ``tenant_id``
+        is a **named parameter of the method** and not a field of a value object. Invariant
+        4 asks every repository method to name its tenant, and a method whose tenant
+        arrives inside an argument does not — which also makes it invisible to the
+        isolation sweep, since the sweep injects the tenant by parameter name. The report
+        stays the unit the *processor* is handed (:meth:`BillingPort.report_usage`); a
+        store is handed a row.
 
         Must be unique on ``(tenant_id, usage_date)``. ``False`` means the day was already
         recorded and nothing further must be sent.
@@ -904,7 +930,7 @@ class BillingService:
         """
         now = self._clock.now()
         suspended: list[BillingTenant] = []
-        for tenant in self._store.tenants_in_expired_dunning(now=now):
+        for tenant in self._store.fleet_tenants_in_expired_dunning(now=now):
             if not tenant.dunning(now=now).expired:
                 # Defensive: the store's filter is the authority, and re-checking it here
                 # means a bug in a WHERE clause cannot suspend a paying customer.
@@ -969,13 +995,13 @@ class BillingService:
         if report.quantity == 0:
             # Recorded, not sent. A zero meter event is a line on an invoice that says
             # nothing, and Stripe aggregates server-side so there is nothing to establish.
-            self._store.record_usage_report(report=report, reported_at=self._clock.now())
+            self._record(report)
             return UsageReportOutcome.ZERO_USAGE
 
         self._billing.report_usage(
             tenant_id=tenant_id, customer_id=tenant.stripe_customer_id, report=report
         )
-        fresh = self._store.record_usage_report(report=report, reported_at=self._clock.now())
+        fresh = self._record(report)
         log_event(
             self._logger,
             "billing.usage_reported",
@@ -986,6 +1012,20 @@ class BillingService:
         )
         return UsageReportOutcome.REPORTED if fresh else UsageReportOutcome.ALREADY_REPORTED
 
+    def _record(self, report: UsageReport) -> bool:
+        """Write one report to ``usage_reports``, unpacked into the row's own columns.
+
+        The unpacking happens here, once, so that the store's signature can name its tenant
+        (invariant 4) without the service having to hold the four fields apart.
+        """
+        return self._store.record_usage_report(
+            tenant_id=report.tenant_id,
+            usage_date=report.usage_date,
+            quantity=report.quantity,
+            external_id=report.external_id,
+            reported_at=self._clock.now(),
+        )
+
     def report_usage_for_all(self, *, usage_date: date) -> Mapping[str, UsageReportOutcome]:
         """Report one day for every tenant that has a Stripe customer.
 
@@ -995,7 +1035,7 @@ class BillingService:
         slug sorts after a broken one.
         """
         outcomes: dict[str, UsageReportOutcome] = {}
-        for tenant in self._store.billable_tenants():
+        for tenant in self._store.fleet_billable_tenants():
             try:
                 outcomes[tenant.tenant_id] = self.report_usage_for_day(
                     tenant_id=tenant.tenant_id, usage_date=usage_date
