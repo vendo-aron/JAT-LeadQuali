@@ -8,9 +8,9 @@ this repository. The last section is the one to read if you are short of time: i
 is **not** isolated, because a document that only lists its own strengths is not evidence of
 anything.
 
-Encryption, key management and secret rotation are deliberately not repeated here. They
-belong in `docs/security-overview.md`, which is issue #37 and **is not written yet**; until
-it is, the links to it below are forward references rather than documents you can read.
+Encryption, key management and secret rotation are deliberately not repeated here; they are
+in [`docs/security-overview.md`](security-overview.md), which #37 has since written. The
+links to it below are documents you can read.
 
 ---
 
@@ -43,17 +43,29 @@ its `pytest` run — by a path argument, `--ignore`, `--deselect`, `-k`, a selec
 expression, or a `PYTEST_ADDOPTS` in an `env:` block. It has fired once for real, when #5's
 CI landed running `pytest tests/unit tests/contract`.
 
-**206 of the suite's 232 tests run with no database** — 205 pass and one is skipped, the
+**305 of the suite's 361 tests run with no database** — 304 pass and one is skipped, the
 one covering the single method whose tenant check is a comparison in Python rather than a
 `WHERE` clause, and whose behaviour is asserted elsewhere in the same sweep. **The remaining
-26 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
+56 need PostgreSQL** and are marked `integration`. Which tests need a database is called out
 per axis below, because a property asserted only by a test that skips is a property that is
 not asserted — see [The negative control](#the-negative-control).
 
+Every number in this document was measured against a run at the commit that last changed
+it, and it has been re-measured three times as #35, #36 and #37 each added stores to the
+sweep. If a count here disagrees with what `pytest tests/isolation` prints, trust the run
+and fix the document: it is the kind of drift that makes a reviewer stop believing the
+paragraphs as well as the numbers.
+
 ### 1. Data isolation — every repository method
 
-`tests/isolation/test_repository_isolation.py` (140 tests, no database)
-`tests/isolation/test_repository_isolation_integration.py` (45 tests, PostgreSQL)
+`tests/isolation/test_repository_isolation.py` (166 tests, no database)
+`tests/isolation/test_repository_isolation_integration.py` (56 tests, PostgreSQL)
+`tests/isolation/test_billing_isolation.py` (17 tests, no database)
+
+The third file is not an eighth axis. It exists to hold one documented exception to a
+boundary — #35's five methods over `stripe_events`, the one table whose `tenant_id` is
+nullable — and it is described with that exception rather than here; see
+[The documented exceptions](#the-documented-exceptions).
 
 Not a hand-written test per method. The sweep discovers the repository classes and their
 methods by introspection, and fails in four ways, none of which is a skip:
@@ -62,7 +74,7 @@ methods by introspection, and fails in four ways, none of which is a skip:
   fails a completeness check, which reads the `leadquali.adapters` package rather than
   trusting a hand-written list;
 - a **new public method that names no tenant** fails the enumeration test by name, unless it
-  is added to a short allowlist (constructors, five deliberately fleet-wide operator
+  is added to a short allowlist (constructors, six deliberately fleet-wide operator
   queries, the control plane's enumeration, and #35's five methods over the one table whose
   `tenant_id` is nullable) with a written reason;
 - a **new tenant-scoped method with no argument recipe** fails the sweep with a message
@@ -70,7 +82,7 @@ methods by introspection, and fails in four ways, none of which is a skip:
   a generic harness produces a test that passes because the call errored;
 - a method **whose statement stops constraining the tenant** fails the scoping check.
 
-For each of the 41 swept methods the test builds every statement the method would execute
+For each of the 52 swept methods the test builds every statement the method would execute
 and inspects the SQLAlchemy construct — not the rendered SQL. The rule is that **every**
 filterable clause of a statement (its `WHERE`, the `WHERE` of an `ON CONFLICT DO UPDATE`,
 the `WHERE` of the select feeding an `INSERT ... FROM SELECT`) must have a top-level `AND`
@@ -86,19 +98,34 @@ rule was a regular expression asking whether *a* tenant column was compared to *
 and a review demonstrated five shapes that satisfy it and constrain nothing — see
 [The negative control](#the-negative-control), where the worst of them is reproduced.
 
+*#37's `PostgresRetentionStore` was put through this rule after it had changed, and it
+objected to three statements — the two counting methods and the counting half of an erasure,
+each of which was one `SELECT` projecting several scalar sub-selects with the tenant
+predicate inside each one. The rule never descends into a subquery, deliberately, so it saw
+a statement with no `WHERE` at all. It was right to: four generated sub-selects where one
+has lost its tenant term produce a count that is internally plausible and belongs to the
+fleet. The adapter was changed rather than the rule — `count_expired` is now one scan of
+`leads` with `FILTER` aggregates under a single top-level `WHERE`, and `count_lead_children`
+is one statement per table, so every count on an erasure receipt is individually
+reviewable.*
+
 The integration half runs the same recipes against a real server with both tenants seeded
 and a full set of rows for tenant A. Every call is bracketed by a byte-for-byte snapshot of
-every row tenant A owns, across all seven tables, so "and nothing of A's changed" is checked
+every row tenant A owns, across all eight tables that carry tenant-owned rows, so "and
+nothing of A's changed" is checked
 for every method rather than being asserted method by method. It also writes a cross-tenant
 child row directly and confirms the server refuses it.
 
-**Result: pass**, with the scope stated plainly. Every method of the six repository classes
-that exist on this branch is swept, and five documented exceptions are enforced as exceptions
-rather than tolerated. The completeness check is what extends that to classes nobody has
-written yet: it passes here and is *expected to fail* on the branches that add #35's billing
-store and #36's admin-console read surface, which will have to add their classes and recipes
-before they can go green. Until those branches land and do so, this document makes no claim
-about them.
+**Result: pass.** Every method of the eleven repository classes on this branch is swept, and
+the thirteen documented exceptions below are enforced as exceptions rather than tolerated.
+
+The completeness check did what it was written for. When this section was first written it
+covered six classes and said it *expected to fail* on the branches adding #35's billing store
+and #36's admin-console read surface. Both have since landed, and it failed on both — four
+classes for #36 and one for #35 — each of which had to be swept or excused with a written
+reason before it could go green. #37's retention store went through the same gate. One class
+is excused: `PostgresUnitOfWork`, which takes a session factory and issues no statement of
+its own.
 
 *This axis was live-tested during development.* Issue #33 added two store methods
 (`compute_day` and `fleet_tenants_with_quota`) after the sweep was written, by a different
@@ -258,12 +285,13 @@ A decision rather than a test. See [the next section](#row-level-security-the-de
 
 ## The documented exceptions
 
-Twelve methods do not carry a tenant predicate: five fleet-wide queries, the control
+Thirteen methods do not carry a tenant predicate: six fleet-wide queries, the control
 plane's enumeration, the credential lookup, and the five billing methods over
 `stripe_events` described last. Each is enforced as an exception by the sweep — the tests
 fail if one of them quietly changes shape — rather than merely tolerated.
 
-**`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`.** Reconciling our
+**`fleet_billable_leads`, `fleet_daily_spend`, `fleet_tenants_with_quota`** (#33).
+Reconciling our
 usage against Anthropic's invoice, and allocating shared infrastructure cost, are questions
 about the whole workspace and cannot be answered one tenant at a time. Three rules contain
 them: the name carries `fleet_` so it is visible at every call site; the method takes no
@@ -289,6 +317,13 @@ a two-tenant fleet the other tenant's billable count is one subtraction away fro
 is acceptable only because the margin report is an internal operator tool run by us and is
 never rendered to a customer. **If that report is ever put in front of a customer, this field
 has to go.**
+
+**`fleet_retention_policies`** (#37). The nightly purge's worklist, and the same three rules
+contain it. A version of it that took a tenant would simply never run for the tenant somebody
+forgot to list — which, for the one job in the system whose purpose is destroying customer
+data, fails in the direction that keeps data past its retention window rather than the one
+that deletes too much. It returns each tenant's slug and its two retention windows: a
+worklist, not any customer's data.
 
 **`PostgresTenantAdminStore.list_tenants`.** The control plane's own enumeration, for an
 operator running `tenantctl` or a member of staff using the admin console. It returns every
@@ -440,7 +475,8 @@ The tenant filter was removed from one repository method.
                      RoutingEvent.dispatched_at.is_not(None),
 ```
 
-**The rest of the test suite stayed completely green: 1989 passed, 197 skipped.** That is the
+**The rest of the test suite stayed completely green: 1989 passed, 197 skipped** (the counts
+at the commit that added this section). That is the
 point of this exercise. Removing a cross-tenant filter from the code that runs in production
 was, until this suite existed, invisible.
 
@@ -596,8 +632,8 @@ operational metadata. No lead content, no email address and no free text is in t
 invariant 5, tested across the whole pipeline — but lead counts, tiers, latencies and cost
 are.
 
-*Mitigation:* access to the AWS account is the control; that will be
-`docs/security-overview.md` (#37, not yet written).
+*Mitigation:* access to the AWS account is the control; see
+[`docs/security-overview.md`](security-overview.md).
 
 *A dedicated tier would change:* a log group and metric namespace per tenant, and the option
 of delivering a tenant's own logs to their account.
@@ -621,10 +657,10 @@ issue #29's per-rep identity work and a product decision rather than an infrastr
 ## Reproducing this
 
 ```bash
-pytest tests/isolation                 # 205 passed, 27 skipped, no database needed
+pytest tests/isolation                 # 304 passed, 57 skipped, no database needed
 docker compose up -d                   # see docs/local-database.md
 export DATABASE_URL=...
-pytest tests/isolation -m integration   # the 26 that need PostgreSQL
+pytest tests/isolation -m integration   # the 56 that need PostgreSQL
 ```
 
 Without a database the `integration` tests skip with the reason printed; they never fail for

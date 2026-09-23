@@ -13,6 +13,7 @@ proves nothing about invariant 3.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -63,6 +64,17 @@ from leadquali.app.metering import (
     is_billable,
 )
 from leadquali.app.ports import RecordedFeedback, RoutingOutcome, StoredLead
+from leadquali.app.retention import (
+    DEFAULT_ASSESSMENT_RETENTION_DAYS,
+    DEFAULT_RAW_RETENTION_DAYS,
+    ChildCounts,
+    ErasureReceipt,
+    ErasureRequest,
+    ExpiredCounts,
+    RetentionPolicy,
+    is_tombstone,
+)
+from leadquali.app.retention import UnknownTenantError as RetentionUnknownTenantError
 from leadquali.app.tenant_ids import tenant_id_for
 from leadquali.app.tenants import (
     ApiKeyRecord,
@@ -1630,3 +1642,311 @@ class InMemoryAdminQueryStore:
                 )
             ),
         )
+
+
+# ------------------------------------------------------------------------------ retention
+
+
+@dataclass(slots=True)
+class RetainedLead:
+    """One row of ``leads``, reduced to what retention and erasure look at."""
+
+    tenant_id: str
+    lead_id: str
+    received_at: datetime
+    raw_payload: dict[str, Any]
+    contact_email_hash: str | None = None
+
+
+@dataclass(slots=True)
+class RetainedAssessment:
+    """One row of ``assessments``, reduced to the column that can quote a lead."""
+
+    tenant_id: str
+    lead_id: str
+    assessment_id: str
+    reasoning: str | None = None
+
+
+@dataclass(slots=True)
+class RetainedChild:
+    """One row of ``routing_events``, ``feedback`` or ``golden_promotions``."""
+
+    tenant_id: str
+    lead_id: str
+
+
+class InMemoryRetentionStore:
+    """A :class:`~leadquali.app.retention.RetentionStorePort` over four lists.
+
+    A real implementation of the contract rather than a canned answer, because the
+    properties worth proving are behavioural: the batch is a *bound* and the service loops
+    until it drains; a second run changes nothing because the tombstone filter excludes what
+    the first run wrote; the payload scan finds a lead the hash missed; the cascade counts
+    come from rows that really exist. Every one of those is a statement about the port's
+    semantics, and ``tests/integration/test_retention_postgres.py`` proves the SQL agrees.
+
+    Docker is not available in every environment this suite runs in (see
+    ``tests/sqlcapture.py``), so this double is what keeps those properties asserted rather
+    than skipped.
+    """
+
+    def __init__(self, *, policies: Mapping[str, tuple[int, int]] | None = None) -> None:
+        self.policies: dict[str, RetentionPolicy] = {
+            slug: RetentionPolicy(
+                tenant_id=slug,
+                raw_retention_days=windows[0],
+                assessment_retention_days=windows[1],
+            )
+            for slug, windows in (policies or {}).items()
+        }
+        self.leads: list[RetainedLead] = []
+        self.assessments: list[RetainedAssessment] = []
+        self.routing_events: list[RetainedChild] = []
+        self.feedback_rows: list[RetainedChild] = []
+        self.promotions: list[RetainedChild] = []
+        #: Every audit row written, in order. The ``erasure_log`` table.
+        self.erasures: list[ErasureReceipt] = []
+        #: Every batch size the service asked for, so a test can prove it loops rather
+        #: than asking for everything at once.
+        self.batches: list[int] = []
+        self._ids = 0
+
+    # ------------------------------------------------------------------------ seeding
+
+    def given_tenant(
+        self,
+        slug: str,
+        *,
+        raw_retention_days: int = DEFAULT_RAW_RETENTION_DAYS,
+        assessment_retention_days: int = DEFAULT_ASSESSMENT_RETENTION_DAYS,
+    ) -> None:
+        """Seed a tenant with its two windows, as a ``tenants`` row would have them."""
+        self.policies[slug] = RetentionPolicy(
+            tenant_id=slug,
+            raw_retention_days=raw_retention_days,
+            assessment_retention_days=assessment_retention_days,
+        )
+
+    def given_lead(
+        self,
+        *,
+        tenant_id: str,
+        received_at: datetime,
+        submission: Mapping[str, Any] | None = None,
+        email: str | None = None,
+        reasoning: str | None = None,
+        routed: bool = True,
+    ) -> str:
+        """Seed one lead with an assessment and a routing event. Returns its id.
+
+        ``email`` is hashed the way ingest hashes it, so a test that erases by address
+        exercises the real join rather than a fixture that happens to agree.
+        """
+        self._ids += 1
+        lead_id = f"lead-{self._ids:04d}"
+        payload = dict(submission or {})
+        if email is not None:
+            payload.setdefault("email", email)
+        self.leads.append(
+            RetainedLead(
+                tenant_id=tenant_id,
+                lead_id=lead_id,
+                received_at=received_at,
+                raw_payload=payload,
+                contact_email_hash=contact_email_hash(email),
+            )
+        )
+        self.assessments.append(
+            RetainedAssessment(
+                tenant_id=tenant_id,
+                lead_id=lead_id,
+                assessment_id=f"assessment-{self._ids:04d}",
+                reasoning=reasoning,
+            )
+        )
+        if routed:
+            self.routing_events.append(RetainedChild(tenant_id=tenant_id, lead_id=lead_id))
+        return lead_id
+
+    def lead(self, lead_id: str) -> RetainedLead:
+        """The seeded lead with this id, for an assertion about its payload."""
+        for row in self.leads:
+            if row.lead_id == lead_id:
+                return row
+        raise KeyError(lead_id)
+
+    def reasoning_of(self, lead_id: str) -> list[str | None]:
+        """Every stored ``reasoning`` for one lead, for a test that greps the row."""
+        return [row.reasoning for row in self.assessments if row.lead_id == lead_id]
+
+    # -------------------------------------------------------------------- the port
+
+    def fleet_retention_policies(self) -> Sequence[RetentionPolicy]:
+        """Every tenant's windows, in insertion order."""
+        return list(self.policies.values())
+
+    def retention_policy(self, *, tenant_id: str) -> RetentionPolicy:
+        """One tenant's windows."""
+        try:
+            return self.policies[tenant_id]
+        except KeyError as error:
+            raise RetentionUnknownTenantError(f"no such tenant: {tenant_id}") from error
+
+    def set_retention_policy(
+        self, *, tenant_id: str, raw_retention_days: int, assessment_retention_days: int
+    ) -> RetentionPolicy:
+        """Write one tenant's windows."""
+        self.retention_policy(tenant_id=tenant_id)
+        policy = RetentionPolicy(
+            tenant_id=tenant_id,
+            raw_retention_days=raw_retention_days,
+            assessment_retention_days=assessment_retention_days,
+        )
+        self.policies[tenant_id] = policy
+        return policy
+
+    def count_expired(
+        self, *, tenant_id: str, payload_cutoff: datetime, lead_cutoff: datetime
+    ) -> ExpiredCounts:
+        """How much a run would touch, writing nothing."""
+        return ExpiredCounts(
+            tenant_id=tenant_id,
+            payloads=len(self._expiring(tenant_id, payload_cutoff)),
+            leads=len(
+                [
+                    row
+                    for row in self.leads
+                    if row.tenant_id == tenant_id and row.received_at < lead_cutoff
+                ]
+            ),
+        )
+
+    def redact_expired_payloads(
+        self,
+        *,
+        tenant_id: str,
+        cutoff: datetime,
+        tombstone: Mapping[str, Any],
+        batch_size: int,
+    ) -> Sequence[str]:
+        """Tombstone at most ``batch_size`` expired payloads, oldest first."""
+        self.batches.append(batch_size)
+        batch = self._expiring(tenant_id, cutoff)[:batch_size]
+        for row in batch:
+            row.raw_payload = dict(tombstone)
+        return [row.lead_id for row in batch]
+
+    def reasoning_for_leads(self, *, tenant_id: str, lead_ids: Sequence[str]) -> Mapping[str, str]:
+        """Every non-empty ``reasoning`` for these leads, by assessment id."""
+        wanted = set(lead_ids)
+        return {
+            row.assessment_id: row.reasoning
+            for row in self.assessments
+            if row.tenant_id == tenant_id and row.lead_id in wanted and row.reasoning
+        }
+
+    def replace_reasoning(self, *, tenant_id: str, replacements: Mapping[str, str]) -> int:
+        """Overwrite the named assessments' ``reasoning``."""
+        changed = 0
+        for row in self.assessments:
+            if row.tenant_id == tenant_id and row.assessment_id in replacements:
+                row.reasoning = replacements[row.assessment_id]
+                changed += 1
+        return changed
+
+    def purge_expired_leads(self, *, tenant_id: str, cutoff: datetime, batch_size: int) -> int:
+        """Delete at most ``batch_size`` leads past tier 2, cascading to the children."""
+        self.batches.append(batch_size)
+        doomed = sorted(
+            (row for row in self.leads if row.tenant_id == tenant_id and row.received_at < cutoff),
+            key=lambda row: row.received_at,
+        )[:batch_size]
+        self._delete([row.lead_id for row in doomed], tenant_id=tenant_id)
+        return len(doomed)
+
+    def leads_for_subject(self, *, tenant_id: str, subject_hash: str) -> Sequence[str]:
+        """Lead ids whose stored hash is this subject."""
+        return [
+            row.lead_id
+            for row in self.leads
+            if row.tenant_id == tenant_id and row.contact_email_hash == subject_hash
+        ]
+
+    def leads_mentioning(self, *, tenant_id: str, needle: str) -> Sequence[str]:
+        """Lead ids whose payload contains ``needle`` anywhere, case-insensitively.
+
+        ``json.dumps`` of the payload rather than a walk of its values, because the adapter
+        casts the whole JSONB document to text — keys included — and a double that searched
+        only the values would pass a lead the real store would find.
+        """
+        return [
+            row.lead_id
+            for row in self.leads
+            if row.tenant_id == tenant_id and needle.lower() in json.dumps(row.raw_payload).lower()
+        ]
+
+    def count_lead_children(self, *, tenant_id: str, lead_ids: Sequence[str]) -> ChildCounts:
+        """Rows that will cascade when these leads go, per table."""
+        wanted = set(lead_ids)
+
+        def matching(rows: Sequence[Any]) -> int:
+            return len(
+                [row for row in rows if row.tenant_id == tenant_id and row.lead_id in wanted]
+            )
+
+        return ChildCounts(
+            assessments=matching(self.assessments),
+            routing_events=matching(self.routing_events),
+            feedback=matching(self.feedback_rows),
+            golden_promotions=matching(self.promotions),
+        )
+
+    def erase(self, *, tenant_id: str, request: ErasureRequest) -> ErasureReceipt:
+        """Delete these leads and file the audit row, as one act."""
+        children = self.count_lead_children(tenant_id=tenant_id, lead_ids=request.lead_ids)
+        deleted = self._delete(request.lead_ids, tenant_id=tenant_id)
+        receipt = ErasureReceipt(
+            tenant_id=tenant_id,
+            subject_hash=request.subject_hash,
+            leads_deleted=deleted,
+            children=children,
+            matched_by_hash=request.matched_by_hash,
+            matched_by_payload_scan=request.matched_by_payload_scan,
+            requested_by=request.requested_by,
+            completed_at=request.completed_at,
+        )
+        self.erasures.append(receipt)
+        return receipt
+
+    # ------------------------------------------------------------------------ internals
+
+    def _expiring(self, tenant_id: str, cutoff: datetime) -> list[RetainedLead]:
+        """Leads past tier 1 that are not already tombstones, oldest first."""
+        return sorted(
+            (
+                row
+                for row in self.leads
+                if row.tenant_id == tenant_id
+                and row.received_at < cutoff
+                and not is_tombstone(row.raw_payload)
+            ),
+            key=lambda row: row.received_at,
+        )
+
+    def _delete(self, lead_ids: Sequence[str], *, tenant_id: str) -> int:
+        """Remove these leads and everything that cascades from them."""
+        doomed = set(lead_ids)
+
+        def keep(rows: list[Any]) -> list[Any]:
+            return [
+                row for row in rows if not (row.tenant_id == tenant_id and row.lead_id in doomed)
+            ]
+
+        before = len(self.leads)
+        self.leads = keep(self.leads)
+        self.assessments = keep(self.assessments)
+        self.routing_events = keep(self.routing_events)
+        self.feedback_rows = keep(self.feedback_rows)
+        self.promotions = keep(self.promotions)
+        return before - len(self.leads)

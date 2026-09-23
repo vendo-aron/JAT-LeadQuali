@@ -14,7 +14,7 @@ a secret it cannot read. One direction alone passes a template that over-grants.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -52,9 +52,10 @@ SECRET_SOURCES = {
 
 
 #: How many functions in the application template carry a ``*_SECRET_ARN``: ingest, the
-#: worker, migrations, and #35's four billing functions. A literal, so that adding a
-#: function without deciding which secrets it may read fails here.
-FUNCTIONS_WITH_SECRETS = 7
+#: worker, migrations, #35's four billing functions and #37's retention purge. A literal,
+#: so that adding a function without deciding which secrets it may read fails here — the
+#: question "what may this one decrypt?" has to be answered before it ships, not after.
+FUNCTIONS_WITH_SECRETS: Final[int] = 8
 
 
 @pytest.fixture(scope="module")
@@ -259,7 +260,8 @@ def test_each_function_can_read_exactly_the_secrets_it_names(
         )
         checked += 1
     assert checked == FUNCTIONS_WITH_SECRETS, (
-        "expected ingest, the worker, migrations and #35's four billing functions"
+        "expected ingest, the worker, migrations, #35's four billing functions and #37's "
+        "retention purge"
     )
 
 

@@ -32,11 +32,26 @@ from typing import Final
 #: bug to fix and not a thing to be relieved about.
 EMAIL_REDACTION: Final[str] = "[redacted-email]"
 
+#: Dots an address can be written with. The ASCII one, and the three full-width and
+#: ideographic variants a CJK or mobile keyboard produces. A domain written with any of
+#: them resolves in a browser, so a redactor that only knows about ``.`` is a redactor that
+#: misses real addresses.
+_DOT: Final[str] = r".\uFF0E\u3002\uFF61"
+
 #: Addresses, matched loosely on purpose. Over-matching costs a redacted string in a log
 #: line; under-matching costs a customer's contact in a log aggregator, so every ambiguous
 #: case resolves towards redaction. Bounded quantifiers keep it linear on hostile input.
+#:
+#: **Unicode, not ASCII.** ``\w`` and ``[^\W\d_]`` are Unicode-aware on ``str`` patterns, so
+#: ``anna@müller-logistik.de`` and ``olga@почта.рф`` match. The ASCII-only version this
+#: replaced did not match either of them *at all* — not partially, not badly, but not at
+#: all — which meant that a German or Russian lead's address passed straight through the
+#: formatter's last-resort net and, after #37, through the redaction of
+#: ``assessments.reasoning`` as well. An erasure that silently misses a non-ASCII address
+#: is the contractual failure the retention work exists to prevent, so the one definition of
+#: "what an address looks like" had to learn about the rest of the alphabet.
 _EMAIL_RE: Final[re.Pattern[str]] = re.compile(
-    r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,255}\.[A-Za-z]{2,24}"
+    rf"[\w%+\-{_DOT}]{{1,64}}@[\w\-{_DOT}]{{1,255}}[{_DOT}][^\W\d_]{{2,24}}"
 )
 
 

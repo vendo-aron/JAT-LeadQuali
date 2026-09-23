@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import decimal
 from decimal import Decimal
+from typing import Any
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -26,12 +28,16 @@ from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 
 from leadquali.adapters.db_schema import (
     ASSESSMENT_STATUSES,
+    DEFAULT_ASSESSMENT_RETENTION_DAYS,
     DEFAULT_QUOTA_ALERT_FRACTION,
+    DEFAULT_RAW_RETENTION_DAYS,
     ESCALATION_REASONS,
     LEAD_STATUSES,
+    PERSONAL_DATA_COLUMNS,
     ROUTING_ACTIONS,
     Assessment,
     Base,
+    ErasureLog,
     Feedback,
     GoldenPromotion,
     Lead,
@@ -46,6 +52,15 @@ from leadquali.adapters.db_schema import (
 from leadquali.app.metering import (
     DEFAULT_QUOTA_ALERT_FRACTION as METERING_DEFAULT_ALERT_FRACTION,
 )
+from leadquali.app.retention import (
+    COLUMN_DISPOSITION,
+)
+from leadquali.app.retention import (
+    DEFAULT_ASSESSMENT_RETENTION_DAYS as SERVICE_ASSESSMENT_RETENTION_DAYS,
+)
+from leadquali.app.retention import (
+    DEFAULT_RAW_RETENTION_DAYS as SERVICE_RAW_RETENTION_DAYS,
+)
 
 EXPECTED_TABLES = {
     "tenants",
@@ -59,6 +74,7 @@ EXPECTED_TABLES = {
     "usage_reports",
     "tenant_config_versions",
     "golden_promotions",
+    "erasure_log",
 }
 
 CHILD_TABLES = ("assessments", "routing_events", "feedback", "golden_promotions")
@@ -66,9 +82,20 @@ CHILD_TABLES = ("assessments", "routing_events", "feedback", "golden_promotions"
 
 # Every column this schema has, and what class of personal data it is allowed to hold.
 #
-#   "none"   — cannot contain personal data at all (ids, enums, counters, timestamps).
-#   "hashed" — a one-way digest, safe to log and to keep after the raw data is purged.
-#   "raw"    — free-form content that may contain anything a form submitter typed.
+#   "none"    — cannot contain personal data at all (ids, enums, counters, timestamps).
+#   "hashed"  — a one-way digest, safe to log and to keep after the raw data is purged.
+#   "raw"     — a verbatim copy of what a form submitter typed.
+#   "derived" — free text written *about* a lead, by the model or by a member of staff.
+#               It is not a copy of the submission and it is not anonymous either: the
+#               model quotes the lead back (#13 found exactly that), and a rep writing
+#               "spoke to Priya, no budget" has named somebody. Classified apart from
+#               "raw" because #37's retention job treats the two differently — the raw
+#               payload is tombstoned at the end of tier 1, and derived text has
+#               addresses redacted out of it where the job can reach it and otherwise
+#               survives until tier 2 takes the whole row.
+#
+# "raw" and "derived" together are the set `db_schema.PERSONAL_DATA_COLUMNS` names, which
+# is what the retention policy, the DPA and the security overview all describe.
 #
 # Invariant 5 is a statement about *what is stored where*, so this is asserted as a
 # complete inventory rather than as a search for suspicious column names. A substring
@@ -89,6 +116,10 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     # customer's *account*, with nothing of any lead in it.
     ("tenants", "monthly_lead_quota"): "none",
     ("tenants", "quota_alert_fraction"): "none",
+    # The two retention windows (#37). Numbers of days: contractual policy about the
+    # customer's account, with nothing of any lead in them.
+    ("tenants", "raw_retention_days"): "none",
+    ("tenants", "assessment_retention_days"): "none",
     # The Stripe link (#35). Opaque processor identifiers and a grace-period deadline:
     # facts about the *account*, with nothing of any lead or any person in them.
     ("tenants", "stripe_customer_id"): "none",
@@ -135,7 +166,11 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     # Model-derived facts about the *company*, constrained by #7's ExtractedFacts schema —
     # not a copy of the submitter's contact details.
     ("assessments", "extracted"): "none",
-    ("assessments", "reasoning"): "none",
+    # The model's prose. Reclassified from "none" by #37: the assessment text routinely
+    # quotes the lead's own words and address back, which is why the CLI report had to
+    # start redacting it in #13 and why the retention job redacts this column when it
+    # tombstones the payload.
+    ("assessments", "reasoning"): "derived",
     ("assessments", "confidence"): "none",
     ("assessments", "missing_information"): "none",
     ("assessments", "model_id"): "none",
@@ -164,7 +199,11 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     # rep's email address or name. See the column comment in db_schema.py.
     ("feedback", "rater"): "none",
     ("feedback", "verdict"): "none",
-    ("feedback", "notes"): "none",
+    # A sales rep's free text about the lead. Reclassified from "none" by #37 for the
+    # same reason as `assessments.reasoning`: nothing stops it naming the person. It is
+    # deliberately *not* redacted — it is the product's only training signal — and it goes
+    # with its lead at tier 2.
+    ("feedback", "notes"): "derived",
     ("feedback", "created_at"): "none",
     # usage_daily (#33) is counters and money, derived from the tables above. There is
     # nothing here that came from a person: it is how many leads there were, not who they
@@ -233,9 +272,29 @@ COLUMN_PII_POLICY: dict[tuple[str, str], str] = {
     # the *judgement*, classified like `feedback.notes` and for the same reason: #22's
     # runbook is explicit that a rep's notes are summarised here rather than pasted, and
     # that a labeler handle is never a person's name.
-    ("golden_promotions", "note"): "none",
+    # The promoter's written rationale for one lead. Free text about a named
+    # individual's enquiry; reclassified from "none" by #37.
+    ("golden_promotions", "note"): "derived",
     ("golden_promotions", "promoted_at"): "none",
     ("golden_promotions", "created_at"): "none",
+    # erasure_log (#37) is the audit trail for carried-out deletion requests. The subject
+    # is a SHA-256 of their address and never the address: a table whose entire purpose is
+    # recording that somebody's personal data was destroyed must not be the last place it
+    # is kept. `requested_by` is an operator handle or a ticket reference — the same class
+    # of value as `feedback.rater` — not the subject's identity.
+    ("erasure_log", "id"): "none",
+    ("erasure_log", "tenant_id"): "none",
+    ("erasure_log", "subject_hash"): "hashed",
+    ("erasure_log", "leads_deleted"): "none",
+    ("erasure_log", "assessments_deleted"): "none",
+    ("erasure_log", "routing_events_deleted"): "none",
+    ("erasure_log", "feedback_deleted"): "none",
+    ("erasure_log", "golden_promotions_deleted"): "none",
+    ("erasure_log", "matched_by_hash"): "none",
+    ("erasure_log", "matched_by_payload_scan"): "none",
+    ("erasure_log", "requested_by"): "none",
+    ("erasure_log", "completed_at"): "none",
+    ("erasure_log", "created_at"): "none",
 }
 
 
@@ -421,19 +480,46 @@ def test_every_column_is_classified_against_the_pii_policy() -> None:
     )
 
 
-def test_the_columns_that_may_hold_personal_data_are_exactly_these_two() -> None:
-    """The inventory #37's retention job has to purge, stated as a closed set.
+def test_the_columns_that_may_hold_personal_data_are_the_ones_the_schema_declares() -> None:
+    """The inventory and the declaration are the same set, from opposite directions.
 
-    ``leads.raw_payload`` is the lead's own data and is what ``contact_email_hash`` exists
-    to replace everywhere else. ``stripe_events.payload`` joined it with #35: a Stripe
-    invoice object carries the billing contact's name, email and address, and the event is
-    stored verbatim on purpose — a payload pruned to the fields this build models is
-    missing the ones an incident will need. Two members, both deliberate, and a third
-    cannot appear without failing this test.
+    :data:`COLUMN_PII_POLICY` is built by classifying every column one at a time;
+    :data:`~leadquali.adapters.db_schema.PERSONAL_DATA_COLUMNS` is the schema's own
+    published statement of which columns hold personal data, and it is what
+    ``docs/data-retention-policy.md``, the DPA and #37's retention job are all written
+    against. Adding a column that can hold personal data therefore means one entry in each,
+    and forgetting either one fails here rather than silently leaving a column nobody
+    purges.
     """
-    raw = {key for key, policy in COLUMN_PII_POLICY.items() if policy == "raw"}
-    assert raw == {("leads", "raw_payload"), ("stripe_events", "payload")}
-    assert set(COLUMN_PII_POLICY.values()) <= {"none", "hashed", "raw"}
+    holding = {key for key, policy in COLUMN_PII_POLICY.items() if policy in {"raw", "derived"}}
+
+    assert holding == set(PERSONAL_DATA_COLUMNS), (
+        "the set of columns that may hold personal data changed; update "
+        "db_schema.PERSONAL_DATA_COLUMNS with a sentence saying why, and "
+        "app.retention.COLUMN_DISPOSITION with what retention does about it"
+    )
+    assert set(COLUMN_PII_POLICY.values()) <= {"none", "hashed", "raw", "derived"}
+    assert all(reason.strip() for reason in PERSONAL_DATA_COLUMNS.values())
+
+
+def test_there_are_exactly_two_verbatim_copies_and_they_are_of_different_people() -> None:
+    """``raw`` means "kept exactly as somebody outside this company sent it", and there are two.
+
+    They are not the same kind of record and #37 must not treat them as one.
+    ``leads.raw_payload`` is an **inbound lead's** own submission, held for our customer,
+    who is its controller: a policy *maximum*, 90 days, purged by the retention job.
+    ``stripe_events.payload`` (#35) is a verified webhook body whose subject is the
+    **customer's own billing contact**, and it is a financial record — which normally
+    carries a statutory *minimum* measured in years and is normally out of scope for an
+    erasure request, because it is the evidence of a transaction.
+
+    So the assertion worth making is not "there is one" — it is that there are two, that a
+    third cannot appear unnoticed, and that each one's retention answer is written down in
+    :data:`~leadquali.app.retention.COLUMN_DISPOSITION` rather than assumed from the other.
+    """
+    verbatim = {key for key, policy in COLUMN_PII_POLICY.items() if policy == "raw"}
+
+    assert verbatim == {("leads", "raw_payload"), ("stripe_events", "payload")}
 
 
 def test_the_rater_is_an_opaque_subject_id_not_a_contact() -> None:
@@ -808,3 +894,106 @@ def test_a_promotion_must_carry_a_rationale_long_enough_for_the_golden_set() -> 
         "golden_promotions"
     )
     assert not _table("golden_promotions").c["note"].nullable
+
+
+# --------------------------------------------------------------------- retention (#37)
+
+
+def _server_default(column: sa.Column[Any]) -> str:
+    """One column's server default, rendered. Blank when it has none."""
+    default = column.server_default
+    return str(getattr(default, "arg", "")) if default is not None else ""
+
+
+def test_the_retention_defaults_match_the_service() -> None:
+    """The server default and the application constant are the same number.
+
+    Two places have to agree because a tenant row created by ``psql`` gets the server's
+    default and one created by the service gets the module's. A drift between them would
+    mean two customers with the same contract kept their data for different lengths of
+    time, which is the kind of divergence nobody notices until an audit.
+    """
+    assert DEFAULT_RAW_RETENTION_DAYS == SERVICE_RAW_RETENTION_DAYS
+    assert DEFAULT_ASSESSMENT_RETENTION_DAYS == SERVICE_ASSESSMENT_RETENTION_DAYS
+
+
+def test_the_tenant_carries_both_retention_windows_with_the_documented_defaults() -> None:
+    columns = _table("tenants").c
+
+    assert not columns["raw_retention_days"].nullable
+    assert not columns["assessment_retention_days"].nullable
+    assert str(DEFAULT_RAW_RETENTION_DAYS) in _server_default(columns["raw_retention_days"])
+    assert str(DEFAULT_ASSESSMENT_RETENTION_DAYS) in _server_default(
+        columns["assessment_retention_days"]
+    )
+
+
+def test_the_retention_windows_are_checked_in_the_database() -> None:
+    """Both positive, and the raw window inside the assessment window.
+
+    In the database and not only in :class:`~leadquali.app.retention.RetentionPolicy`,
+    because a row written by hand during an incident has to be as well-formed as one
+    written by the service — and a zero here would have the next purge redact every lead
+    the tenant has.
+    """
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in _table("tenants").constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert "ck_tenants_retention_windows_are_positive" in checks
+    assert "ck_tenants_raw_retention_within_assessment_retention" in checks
+    assert (
+        "raw_retention_days <= assessment_retention_days"
+        in (checks["ck_tenants_raw_retention_within_assessment_retention"])
+    )
+
+
+def test_every_column_that_can_hold_personal_data_has_a_retention_disposition() -> None:
+    """The schema says which columns hold personal data; retention says what happens to it.
+
+    Joined here rather than asserted in either module, because neither may import the
+    other: ``app`` cannot reach into ``adapters`` (CLAUDE.md's layering rule). A column
+    added to one inventory and not the other is a column the retention policy does not
+    describe, which is precisely the gap a security reviewer is looking for.
+    """
+    assert set(PERSONAL_DATA_COLUMNS) == set(COLUMN_DISPOSITION), (
+        "db_schema.PERSONAL_DATA_COLUMNS and app.retention.COLUMN_DISPOSITION disagree; "
+        "every column that may hold personal data needs a written answer to 'and when "
+        "does it go?'"
+    )
+    assert all(disposition.strip() for disposition in COLUMN_DISPOSITION.values())
+
+
+def test_the_erasure_log_survives_its_tenant() -> None:
+    """``RESTRICT``, unlike every other table hanging off ``tenants``.
+
+    ``tenant_api_keys`` and ``tenant_config_versions`` cascade because they are the
+    customer's configuration. This is evidence about a *third party's* rights and has to
+    outlive the customer's account, which is exactly when somebody asks whether an erasure
+    really happened.
+    """
+    foreign_keys = {(key.parent.name, key.ondelete) for key in _table("erasure_log").foreign_keys}
+
+    assert ("tenant_id", "RESTRICT") in foreign_keys
+
+
+def test_the_erasure_log_identifies_the_subject_by_hash_only() -> None:
+    """No column of this table may hold an address, and the digest's shape is checked.
+
+    A truncated or upper-cased digest would silently fail to match
+    ``leads.contact_email_hash``, which would make the audit row unverifiable by the one
+    check a controller can perform on it.
+    """
+    columns = _table("erasure_log").c
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in _table("erasure_log").constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert "subject_hash" in columns
+    assert not any("email" in column.name for column in columns)
+    assert "^[0-9a-f]{64}$" in checks["ck_erasure_log_subject_hash_is_a_sha256"]
+    assert ErasureLog.__tablename__ == "erasure_log"

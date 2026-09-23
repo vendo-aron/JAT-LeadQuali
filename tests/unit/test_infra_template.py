@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from tests.unit.cfn import APPLICATION_TEMPLATE_PATH, load_template
+from tests.unit.cfn import parameters as _parameters
 from tests.unit.cfn import resources as _resources
 
 
@@ -219,6 +220,71 @@ def test_the_ingest_function_may_read_every_tenants_signing_secret(
     assert "/tenant/" in str(resource)
     assert "${Stage}" in str(resource), "the grant must not cross environments"
     assert "secretsmanager:*" not in str(granted[0]["Action"])
+
+
+# ------------------------------------------------------------------ retention (#37)
+
+
+def test_the_retention_job_is_on_a_schedule(template: dict[str, Any]) -> None:
+    """A retention policy nobody runs is a document, not a control.
+
+    The acceptance criterion is "runs on schedule", and the only thing in this repository
+    that can make that true is this event. Asserted as a reference to the parameter rather
+    than to a literal expression, because the hour is an operational decision.
+    """
+    events = _resources(template)["RetentionFunction"]["Properties"]["Events"]
+
+    assert [event["Type"] for event in events.values()] == ["Schedule"]
+    assert events["Daily"]["Properties"]["Schedule"] == {"Fn::Ref": "RetentionSchedule"}
+    assert events["Daily"]["Properties"]["Enabled"] is True
+
+
+def test_the_retention_schedule_runs_before_the_backup_window(template: dict[str, Any]) -> None:
+    """02:30 UTC, ahead of the database's 03:10 window in infra/network.yaml.
+
+    The ordering is the point: deletions made at 02:30 are inside the snapshot taken at
+    03:10, so the backup a restore would come from does not carry data the purge removed.
+    The other order would mean every night's purge is undone for seven days in whichever
+    backup somebody restores.
+    """
+    default = _parameters(template)["RetentionSchedule"]["Default"]
+
+    assert default == "cron(30 2 * * ? *)"
+
+
+def test_the_retention_function_can_read_the_database_secret_and_nothing_else(
+    template: dict[str, Any],
+) -> None:
+    """The narrowest policy in the stack, on the function that can do the most damage.
+
+    No Anthropic key, no SES, no feedback signing key. A retention job that could send mail
+    or call a model has grown capabilities nobody asked it for, and it is the one function
+    whose compromise means deleted customer data.
+    """
+    policies = _resources(template)["RetentionFunction"]["Properties"]["Policies"]
+    secrets = [
+        policy["AWSSecretsManagerGetSecretValuePolicy"]["SecretArn"]
+        for policy in policies
+        if isinstance(policy, dict) and "AWSSecretsManagerGetSecretValuePolicy" in policy
+    ]
+
+    assert secrets == [{"Fn::Ref": "DatabaseSecretArn"}]
+    assert not any("SESCrudPolicy" in policy for policy in policies if isinstance(policy, dict))
+
+
+def test_only_one_retention_run_can_be_in_flight(template: dict[str, Any]) -> None:
+    """Not for correctness — every batch is SKIP LOCKED — but for the connection budget,
+    and so that "how many of these are running?" has a one-word answer."""
+    assert (
+        _resources(template)["RetentionFunction"]["Properties"]["ReservedConcurrentExecutions"] == 1
+    )
+
+
+def test_the_retention_function_is_in_the_vpc_like_everything_that_talks_to_postgres(
+    template: dict[str, Any],
+) -> None:
+    """There is no public database address, so a function outside the VPC cannot connect."""
+    assert "VpcConfig" in _resources(template)["RetentionFunction"]["Properties"]
 
 
 # ----------------------------------------------------------------------- billing (#35)

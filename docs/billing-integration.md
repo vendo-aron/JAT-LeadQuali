@@ -187,7 +187,16 @@ address: a customer's accounts-payable person, not a lead, but personal data all
 
 It is therefore the **second** column in the schema classified as able to hold personal data,
 alongside `leads.raw_payload`. `tests/unit/test_db_schema.py` pins that set at exactly two.
-**#37's retention job must cover `stripe_events.payload` as it covers `leads.raw_payload`.**
+
+**Its retention answer is not the lead one**, and the difference matters. An earlier version
+of this paragraph said #37's job must purge it "as it covers `leads.raw_payload`"; that was
+written before anybody had noticed that the two constraints point in opposite directions. A
+lead payload has a policy *maximum* of 90 days. An invoice record is a financial record with
+a statutory *minimum* measured in years, about a different data subject under a different
+lawful basis — so applying the lead window to it would destroy evidence we are required to
+keep. It is retained indefinitely today and no code path deletes it. See
+[`docs/data-retention-policy.md`](data-retention-policy.md) for the worked-out position and
+for the three questions a lawyer has to settle.
 
 `stripe_events.last_error` holds an exception class and one short line — never a traceback
 and never a payload — because that column is read by operators and reaches CloudWatch.

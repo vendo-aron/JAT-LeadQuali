@@ -75,6 +75,8 @@ from typing import Final
 from argon2 import PasswordHasher
 from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 
+from leadquali.observability.logs import log_event
+
 LOGGER: Final = logging.getLogger(__name__)
 
 __all__ = [
@@ -254,10 +256,7 @@ class Argon2KeyHasher:
             # hand-edited row, not an attack. Logged loudly because no key will ever work
             # against this row until a human fixes it, and refused rather than raised
             # because a 500 here would tell a stranger that this key_id exists.
-            LOGGER.error(
-                "keyhash.unreadable_stored_hash",
-                extra={"event": "keyhash.unreadable_stored_hash", "key_id": key_id},
-            )
+            log_event(LOGGER, "keyhash.unreadable_stored_hash", level=logging.ERROR, key_id=key_id)
             self._record_failure(key_id)
             return False
 

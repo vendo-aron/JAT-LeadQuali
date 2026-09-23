@@ -27,7 +27,7 @@ from typing import Any, Final
 
 from leadquali.app.ingest import QueuedLead
 from leadquali.app.qualify import QualificationRequest
-from leadquali.observability.logs import configure_logging
+from leadquali.observability.logs import configure_logging, log_event
 
 # Lambda reuses containers, so this runs once per container rather than per invocation.
 # `configure_logging` is idempotent by design (#21) — calling it twice would otherwise
@@ -63,9 +63,11 @@ def handle(event: dict[str, Any], context: object, *, pipeline: Any) -> dict[str
         queued = _parse(record)
         if queued is None:
             # Undecodable: retrying cannot help, and the lead row already exists.
-            LOGGER.error(
+            log_event(
+                LOGGER,
                 "queue.undecodable_message",
-                extra={"event": "queue.undecodable_message", "message_id": message_id},
+                level=logging.ERROR,
+                message_id=message_id,
             )
             continue
         try:
@@ -83,9 +85,12 @@ def handle(event: dict[str, Any], context: object, *, pipeline: Any) -> dict[str
             )
         except Exception:
             # Transient by assumption: let SQS redeliver this one message.
-            LOGGER.exception(
+            log_event(
+                LOGGER,
                 "queue.qualify_failed",
-                extra={"event": "queue.qualify_failed", "message_id": message_id},
+                level=logging.ERROR,
+                exc_info=True,
+                message_id=message_id,
             )
             failures.append({"itemIdentifier": message_id})
     return {"batchItemFailures": failures}

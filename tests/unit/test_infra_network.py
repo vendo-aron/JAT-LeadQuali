@@ -20,7 +20,7 @@ comparison against a remembered number.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -399,11 +399,12 @@ def test_the_connection_budget_is_not_oversubscribed(
 
 
 #: How many functions in the application template hold ``DATABASE_SECRET_ARN``, and so
-#: hold a Postgres connection: ingest, the worker, migrations, and #35's four billing
-#: functions. A literal rather than a length, so that adding a function without thinking
-#: about the connection budget fails here — which is the entire point of the two tests
-#: below.
-POSTGRES_FUNCTIONS = 7
+#: hold a Postgres connection: ingest, the worker, migrations, #35's four billing functions
+#: and #37's retention purge. A literal rather than a length, so that adding a function
+#: without thinking about the connection budget fails here — which is the entire point of
+#: the two tests below. Every one of them draws on the budget #27's arithmetic is built on,
+#: so raising this number is a deliberate change to that budget rather than bookkeeping.
+POSTGRES_FUNCTIONS: Final[int] = 8
 
 
 def test_every_function_that_touches_postgres_has_a_concurrency_cap(
