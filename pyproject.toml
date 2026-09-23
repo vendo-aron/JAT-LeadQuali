@@ -17,6 +17,13 @@ dependencies = [
     "alembic>=1.16",
     "boto3",
     "mangum",
+    # Stripe billing (#35). A runtime dependency of the billing jobs and the portal
+    # endpoint only: the webhook endpoint verifies signatures with the standard
+    # library, so a Lambda that only receives webhooks never imports this.
+    # Pinned to a major version because Stripe has already moved metered billing once
+    # (usage records -> meter events) and an unattended bump would change which API
+    # exists, not merely how it is spelled.
+    "stripe>=15,<16",
     # The staff admin UI (#36) is server-rendered HTML in the same Lambda as everything
     # else: Jinja2 renders the templates, python-multipart lets FastAPI parse the form
     # posts they submit. Both are runtime dependencies of the API, not dev tools.

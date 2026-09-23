@@ -1,0 +1,16 @@
+{
+  "id": "evt_unhandled",
+  "object": "event",
+  "api_version": "2026-08-26.dahlia",
+  "created": 1788000000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "type": "charge.succeeded",
+  "data": {
+    "object": {
+      "id": "ch_acme",
+      "object": "charge",
+      "customer": "cus_acme"
+    }
+  }
+}

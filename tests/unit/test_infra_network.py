@@ -398,6 +398,14 @@ def test_the_connection_budget_is_not_oversubscribed(
         )
 
 
+#: How many functions in the application template hold ``DATABASE_SECRET_ARN``, and so
+#: hold a Postgres connection: ingest, the worker, migrations, and #35's four billing
+#: functions. A literal rather than a length, so that adding a function without thinking
+#: about the connection budget fails here — which is the entire point of the two tests
+#: below.
+POSTGRES_FUNCTIONS = 7
+
+
 def test_every_function_that_touches_postgres_has_a_concurrency_cap(
     application: dict[str, Any],
 ) -> None:
@@ -419,9 +427,10 @@ def test_every_function_that_touches_postgres_has_a_concurrency_cap(
         assert "ReservedConcurrentExecutions" in properties, (
             f"{logical_id} connects to Postgres with no cap on how many of it exist"
         )
-    assert checked == 3, (
-        "no function matched: the marker this loop selects on has been renamed, and the "
-        "test is passing by examining nothing"
+    assert checked == POSTGRES_FUNCTIONS, (
+        "no function matched, or a function was added without updating the count: the "
+        "marker this loop selects on may have been renamed, and the test would then be "
+        "passing by examining nothing"
     )
 
 
@@ -447,7 +456,7 @@ def test_every_function_that_touches_postgres_is_in_the_vpc(
         assert vpc is not None, f"{logical_id} reads Postgres from outside the VPC"
         assert vpc["Fn::If"][0] == "InVpc"
         assert vpc["Fn::If"][1]["SubnetIds"] == {"Fn::Ref": "VpcSubnetIds"}
-    assert checked == 3, "no function matched; see the note in the test above"
+    assert checked == POSTGRES_FUNCTIONS, "see the note in the test above"
 
 
 def test_migrations_run_one_at_a_time(application: dict[str, Any]) -> None:

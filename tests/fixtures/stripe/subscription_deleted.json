@@ -1,0 +1,34 @@
+{
+  "id": "evt_subscription_deleted",
+  "object": "event",
+  "api_version": "2026-08-26.dahlia",
+  "created": 1788000000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "type": "customer.subscription.deleted",
+  "data": {
+    "object": {
+      "id": "sub_acme",
+      "object": "subscription",
+      "customer": "cus_acme",
+      "status": "canceled",
+      "cancel_at_period_end": false,
+      "items": {
+        "object": "list",
+        "data": [
+          {
+            "id": "si_acme",
+            "object": "subscription_item",
+            "price": {
+              "id": "price_leads_monthly",
+              "object": "price"
+            }
+          }
+        ]
+      },
+      "metadata": {
+        "tenant_id": "acme-demo"
+      }
+    }
+  }
+}
